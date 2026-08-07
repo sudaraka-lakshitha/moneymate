@@ -14,8 +14,26 @@ Visit `http://localhost:5173`.
 
 ## 2. Environment Configuration
 
-The app is already pre-configured to point to your Supabase instance:
-- `src/lib/supabase.ts` handles the client initialization with persistent authentication state.
+The app ships pre-configured to point at the MoneyMate Supabase project, so it runs
+with no extra setup. `src/lib/supabase.ts` initializes the client with persistent
+authentication state.
+
+To point it at a different project, copy `.env.example` to `.env` and fill in:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Where to find it |
+| --- | --- |
+| `VITE_SUPABASE_URL` | Supabase → Project Settings → API → Project URL |
+| `VITE_SUPABASE_ANON_KEY` | Supabase → Project Settings → API → `anon` `public` key |
+
+Both are safe to expose in the browser — the anon key only grants what your Row Level
+Security policies allow. Never put the `service_role` key in a `VITE_` variable; Vite
+inlines those into the client bundle.
+
+On Vercel, set the same two variables under Project Settings → Environment Variables.
 
 ## 3. Free Hosting Deployment (Vercel)
 
