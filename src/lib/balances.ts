@@ -1,0 +1,115 @@
+import { FriendBalance, User } from '../types';
+import { simplifyDebts } from './debtSimplifier';
+import { roundMoney } from './currency';
+
+export interface GroupLedger {
+  groupId: string;
+  groupName: string;
+  /** userId -> net position in this group (positive = is owed). */
+  balances: Record<string, number>;
+  members: Record<string, User>;
+}
+
+/** Per-group split of a friend balance, so settling knows which group to post to. */
+export interface FriendGroupBalance {
+  groupId: string;
+  groupName: string;
+  /** Positive: they owe you. Negative: you owe them. */
+  net: number;
+}
+
+export interface FriendBalanceDetail extends FriendBalance {
+  perGroup: FriendGroupBalance[];
+}
+
+/**
+ * Nets out what each friend owes *you* specifically.
+ *
+ * The previous version summed each friend's own group-wide balance, which
+ * answers "how is Bob doing in this group" — not "what is between Bob and me".
+ * A friend who is square with you but owed money by a third member showed up as
+ * owing you. This runs the same per-group debt simplification the group screen
+ * shows and keeps only the edges you are part of, so the two screens agree.
+ */
+export const computeFriendBalances = (groups: GroupLedger[], meId: string): FriendBalanceDetail[] => {
+  const accumulator = new Map<
+    string,
+    {
+      friend: User;
+      net: number;
+      owedToMe: number;
+      owedByMe: number;
+      groups: Set<string>;
+      perGroup: Map<string, FriendGroupBalance>;
+    }
+  >();
+
+  const ensure = (user: User) => {
+    let entry = accumulator.get(user.id);
+    if (!entry) {
+      entry = { friend: user, net: 0, owedToMe: 0, owedByMe: 0, groups: new Set(), perGroup: new Map() };
+      accumulator.set(user.id, entry);
+    }
+    return entry;
+  };
+
+  const addGroupEdge = (
+    entry: ReturnType<typeof ensure>,
+    group: GroupLedger,
+    delta: number
+  ) => {
+    const existing = entry.perGroup.get(group.groupId);
+    if (existing) {
+      existing.net = roundMoney(existing.net + delta);
+    } else {
+      entry.perGroup.set(group.groupId, {
+        groupId: group.groupId,
+        groupName: group.groupName,
+        net: roundMoney(delta),
+      });
+    }
+  };
+
+  for (const group of groups) {
+    // Everyone you share a group with is a friend, settled or not.
+    for (const [userId, user] of Object.entries(group.members)) {
+      if (userId === meId) continue;
+      ensure(user).groups.add(group.groupId);
+    }
+
+    for (const edge of simplifyDebts(group.balances, group.members)) {
+      if (edge.from.id === meId && edge.to.id !== meId) {
+        const entry = ensure(edge.to);
+        entry.net -= edge.amount;
+        entry.owedByMe += edge.amount;
+        addGroupEdge(entry, group, -edge.amount);
+      } else if (edge.to.id === meId && edge.from.id !== meId) {
+        const entry = ensure(edge.from);
+        entry.net += edge.amount;
+        entry.owedToMe += edge.amount;
+        addGroupEdge(entry, group, edge.amount);
+      }
+    }
+  }
+
+  return Array.from(accumulator.values())
+    .map<FriendBalanceDetail>((entry) => ({
+      friend: entry.friend,
+      net_balance: roundMoney(entry.net),
+      total_they_owe_me: roundMoney(entry.owedToMe),
+      total_i_owe_them: roundMoney(entry.owedByMe),
+      shared_group_count: entry.groups.size,
+      perGroup: Array.from(entry.perGroup.values()).filter((g) => Math.abs(g.net) > 0.005),
+    }))
+    // Live balances first, largest magnitude at the top; settled friends after.
+    .sort((a, b) => Math.abs(b.net_balance) - Math.abs(a.net_balance));
+};
+
+/** Reduces raw ledger rows to a userId -> net map. */
+export const netByUser = (rows: { user_id: string; amount: number | string }[]): Record<string, number> => {
+  const balances: Record<string, number> = {};
+  for (const row of rows) {
+    balances[row.user_id] = (balances[row.user_id] || 0) + Number(row.amount);
+  }
+  return balances;
+};

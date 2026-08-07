@@ -1,7 +1,11 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { Group, User } from '../types';
-import { Plus, QrCode } from 'lucide-react';
+import { Group, InviteLookup, User } from '../types';
+import { formatLKRSigned } from '../lib/currency';
+import { friendlyDbError } from '../lib/authErrors';
+import { Alert, EmptyState, Sheet, SkeletonRows, Spinner } from '../components/ui';
+import { useToast } from '../components/Toast';
+import { Plus, Search, Users2 } from 'lucide-react';
 
 interface GroupsPageProps {
   user: User;
@@ -10,24 +14,35 @@ interface GroupsPageProps {
 
 const EMOJIS = ['💰', '🏠', '🎉', '✈️', '🍔', '🚗', '🎓', '💼', '🏖️', '🎮', '🛍️', '💊'];
 
+const randomCode = () => {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no I/O/0/1 — easier to read aloud
+  return Array.from({ length: 6 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
+};
+
 export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
+  const toast = useToast();
+
   const [groups, setGroups] = useState<Group[]>([]);
-  const [showCreateModal, setShowCreateModal] = useState(false);
-  const [showJoinModal, setShowJoinModal] = useState(false);
+  const [balances, setBalances] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
+
+  const [showCreate, setShowCreate] = useState(false);
+  const [showJoin, setShowJoin] = useState(false);
 
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
-  const [selectedEmoji, setSelectedEmoji] = useState('💰');
+  const [emoji, setEmoji] = useState('💰');
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+
   const [inviteCode, setInviteCode] = useState('');
-  const [error, setError] = useState<string | null>(null);
-  const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [lookup, setLookup] = useState<InviteLookup | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [joining, setJoining] = useState(false);
+  const [joinError, setJoinError] = useState<string | null>(null);
+  const [joinNotice, setJoinNotice] = useState<string | null>(null);
 
-  useEffect(() => {
-    loadGroups();
-  }, [user.id]);
-
-  const loadGroups = async () => {
+  const loadGroups = useCallback(async () => {
     try {
       const { data, error } = await supabase
         .from('group_members')
@@ -35,235 +50,353 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
         .eq('user_id', user.id);
 
       if (error) throw error;
-      if (data) {
-        const groupList = data.map((m: any) => m.groups).filter(Boolean);
-        setGroups(groupList);
+
+      const list = (data ?? []).map((row: any) => row.groups).filter(Boolean) as Group[];
+      list.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+      setGroups(list);
+
+      if (list.length > 0) {
+        const { data: ledger } = await supabase
+          .from('ledger_entries')
+          .select('group_id, user_id, amount')
+          .eq('user_id', user.id)
+          .in('group_id', list.map((g) => g.id));
+
+        const perGroup: Record<string, number> = {};
+        for (const row of ledger ?? []) {
+          perGroup[row.group_id] = (perGroup[row.group_id] || 0) + Number(row.amount);
+        }
+        setBalances(perGroup);
       }
-    } catch (err: any) {
-      console.error(err);
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not load your groups.'));
     } finally {
       setLoading(false);
     }
-  };
+  }, [user.id, toast]);
 
-  const handleCreateGroup = async (e: React.FormEvent) => {
+  useEffect(() => {
+    void loadGroups();
+  }, [loadGroups]);
+
+  const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
-    setError(null);
-    try {
-      const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-      const expiresAt = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
+    setCreateError(null);
+    setCreating(true);
 
-      const { data: newGroup, error: groupErr } = await supabase
+    try {
+      const { data: group, error } = await supabase
         .from('groups')
         .insert({
-          name,
-          description,
-          icon_emoji: selectedEmoji,
+          name: name.trim(),
+          description: description.trim(),
+          icon_emoji: emoji,
           created_by: user.id,
-          invite_code: code,
-          invite_code_expires_at: expiresAt,
+          invite_code: randomCode(),
+          invite_code_expires_at: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString(),
         })
         .select()
         .single();
 
-      if (groupErr) throw groupErr;
+      if (error) throw error;
 
-      await supabase.from('group_members').insert({
-        group_id: newGroup.id,
-        user_id: user.id,
-        role: 'ADMIN',
-      });
+      const { error: memberError } = await supabase
+        .from('group_members')
+        .insert({ group_id: group.id, user_id: user.id, role: 'ADMIN' });
 
-      setShowCreateModal(false);
+      // Without a membership row the creator cannot even read their own group
+      // back (RLS is membership-based), so clean up rather than orphan it.
+      if (memberError) {
+        await supabase.from('groups').delete().eq('id', group.id);
+        throw memberError;
+      }
+
+      toast.success(`"${group.name}" created.`);
+      setShowCreate(false);
       setName('');
       setDescription('');
-      loadGroups();
-    } catch (err: any) {
-      setError(err.message || 'Failed to create group');
+      setEmoji('💰');
+      await loadGroups();
+      onNavigate(`group-detail/${group.id}`);
+    } catch (error) {
+      setCreateError(friendlyDbError(error, 'Could not create the group.'));
+    } finally {
+      setCreating(false);
     }
   };
 
-  const handleJoinGroup = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError(null);
-    setSuccessMsg(null);
+  /** Looks the code up through the RPC — a direct select is blocked by RLS. */
+  const handleCheckCode = async () => {
+    const code = inviteCode.trim().toUpperCase();
+    if (code.length < 4) return;
+
+    setChecking(true);
+    setJoinError(null);
+    setJoinNotice(null);
+    setLookup(null);
+
     try {
-      const code = inviteCode.toUpperCase().trim();
-      const { data: group, error: groupErr } = await supabase
-        .from('groups')
-        .select('*')
-        .eq('invite_code', code)
-        .single();
+      const { data, error } = await supabase.rpc('find_group_by_invite_code', { p_code: code });
+      if (error) throw error;
 
-      if (groupErr || !group) {
-        setError('Invalid or expired invite code');
+      const match = (data as InviteLookup[])?.[0];
+      if (!match) {
+        setJoinError('No group uses that code. Double-check it with the group admin.');
         return;
       }
-
-      const { data: member } = await supabase
-        .from('group_members')
-        .select('*')
-        .eq('group_id', group.id)
-        .eq('user_id', user.id)
-        .single();
-
-      if (member) {
-        setError('You are already a member of this group');
+      if (match.is_expired) {
+        setJoinError(`"${match.name}" has an expired invite code. Ask an admin to generate a new one.`);
         return;
       }
+      if (match.already_member) {
+        setJoinError(`You are already a member of "${match.name}".`);
+        return;
+      }
+      if (match.has_pending_request) {
+        setJoinNotice(`Your request to join "${match.name}" is already waiting for admin approval.`);
+        return;
+      }
+      setLookup(match);
+    } catch (error) {
+      setJoinError(friendlyDbError(error, 'Could not check that code.'));
+    } finally {
+      setChecking(false);
+    }
+  };
 
-      const { error: reqErr } = await supabase.from('group_join_requests').insert({
-        group_id: group.id,
-        user_id: user.id,
-        status: 'PENDING',
+  const handleJoin = async () => {
+    setJoining(true);
+    setJoinError(null);
+
+    try {
+      const { data, error } = await supabase.rpc('request_to_join_group', {
+        p_code: inviteCode.trim().toUpperCase(),
       });
+      if (error) throw error;
 
-      if (reqErr) throw reqErr;
-
-      setSuccessMsg(`Join request sent to "${group.name}" admin for approval!`);
-      setInviteCode('');
-    } catch (err: any) {
-      setError(err.message || 'Failed to submit join request');
+      const result = (data as { out_status: string; out_group_name: string }[])?.[0];
+      switch (result?.out_status) {
+        case 'REQUESTED':
+          setJoinNotice(`Request sent to the "${result.out_group_name}" admin for approval.`);
+          setLookup(null);
+          setInviteCode('');
+          break;
+        case 'ALREADY_MEMBER':
+          setJoinError(`You are already in "${result.out_group_name}".`);
+          break;
+        case 'ALREADY_PENDING':
+          setJoinNotice('Your request is already waiting for approval.');
+          break;
+        case 'EXPIRED':
+          setJoinError('That invite code has expired. Ask an admin for a new one.');
+          break;
+        default:
+          setJoinError('No group uses that code.');
+      }
+    } catch (error) {
+      setJoinError(friendlyDbError(error, 'Could not send the join request.'));
+    } finally {
+      setJoining(false);
     }
   };
 
   return (
-    <div style={{ padding: '20px 16px 100px' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
-        <h2 style={{ fontSize: '1.4rem', fontWeight: 800, color: 'var(--on-background)' }}>Groups</h2>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button onClick={() => setShowJoinModal(true)} className="btn-outline" style={{ padding: '8px 12px' }}>
-            <QrCode size={18} /> Join
+    <div className="page">
+      <header className="page-header">
+        <div>
+          <h1 className="page-title">Groups</h1>
+          <p className="page-subtitle">{groups.length} active</p>
+        </div>
+        <div className="row" style={{ gap: 'var(--sp-2)' }}>
+          <button type="button" className="btn btn-secondary btn-sm" onClick={() => setShowJoin(true)}>
+            <Search size={15} /> Join
           </button>
-          <button onClick={() => setShowCreateModal(true)} className="btn-primary" style={{ padding: '8px 14px' }}>
-            <Plus size={18} /> New
+          <button type="button" className="btn btn-primary btn-sm" onClick={() => setShowCreate(true)}>
+            <Plus size={15} /> New
           </button>
         </div>
-      </div>
+      </header>
 
-      {groups.length === 0 && !loading ? (
-        <div className="glass-card" style={{ padding: 36, textAlign: 'center' }}>
-          <span style={{ fontSize: 48 }}>👥</span>
-          <h3 style={{ marginTop: 12, fontSize: '1.1rem', color: 'var(--on-background)' }}>No groups yet</h3>
-          <p style={{ color: 'var(--on-surface-variant)', fontSize: '0.85rem', marginTop: 4, marginBottom: 20 }}>
-            Create a group or join with a 6-character code
-          </p>
-          <button onClick={() => setShowCreateModal(true)} className="btn-primary">
-            Create First Group
-          </button>
-        </div>
+      {loading ? (
+        <SkeletonRows count={3} height={82} />
+      ) : groups.length === 0 ? (
+        <EmptyState
+          icon="👥"
+          title="No groups yet"
+          text="Create one for your trip, flat or team — or join an existing one with a 6-character code."
+          action={
+            <div className="row" style={{ justifyContent: 'center' }}>
+              <button type="button" className="btn btn-secondary" onClick={() => setShowJoin(true)}>
+                Join with code
+              </button>
+              <button type="button" className="btn btn-primary" onClick={() => setShowCreate(true)}>
+                Create a group
+              </button>
+            </div>
+          }
+        />
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {groups.map((group) => (
-            <div
-              key={group.id}
-              onClick={() => onNavigate(`group-detail/${group.id}`)}
-              className="glass-card"
-              style={{ padding: 18, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-                <div style={{
-                  width: 52, height: 52, borderRadius: 16,
-                  background: 'var(--primary-container)', display: 'flex',
-                  alignItems: 'center', justifyContent: 'center', fontSize: 26
-                }}>
+        <div className="stack">
+          {groups.map((group) => {
+            const balance = balances[group.id] ?? 0;
+            const settled = Math.abs(balance) < 0.01;
+            return (
+              <button
+                key={group.id}
+                type="button"
+                className="card card-interactive row"
+                onClick={() => onNavigate(`group-detail/${group.id}`)}
+              >
+                <span
+                  className="icon-tile"
+                  style={{ width: 50, height: 50, fontSize: 24, background: 'var(--primary-container)' }}
+                >
                   {group.icon_emoji}
-                </div>
-                <div>
-                  <div style={{ fontWeight: 700, fontSize: '1rem', color: 'var(--on-background)' }}>{group.name}</div>
-                  <div style={{ fontSize: '0.8rem', color: 'var(--on-surface-variant)' }}>
-                    Code: <strong style={{ color: 'var(--primary-light)' }}>{group.invite_code}</strong>
-                  </div>
-                </div>
-              </div>
+                </span>
+                <span className="grow" style={{ minWidth: 0 }}>
+                  <span className="truncate" style={{ display: 'block', fontWeight: 700, fontSize: '0.98rem' }}>
+                    {group.name}
+                  </span>
+                  <span className="hint">
+                    Code <strong style={{ color: 'var(--primary-light)', letterSpacing: 1 }}>{group.invite_code}</strong>
+                  </span>
+                </span>
+                <span style={{ textAlign: 'right', flexShrink: 0 }}>
+                  <span
+                    className={`amount-md tabular ${settled ? 'text-neutral' : balance > 0 ? 'text-positive' : 'text-negative'}`}
+                    style={{ display: 'block' }}
+                  >
+                    {settled ? 'Settled' : formatLKRSigned(balance)}
+                  </span>
+                  <span className="hint">{settled ? 'all square' : balance > 0 ? 'you are owed' : 'you owe'}</span>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      )}
 
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span className="badge badge-neutral">{group.status}</span>
+      {showCreate && (
+        <Sheet title="Create a group" onClose={() => setShowCreate(false)}>
+          <form onSubmit={handleCreate} className="stack">
+            <div className="field">
+              <span className="label label-block">Pick an icon</span>
+              <div className="row" style={{ flexWrap: 'wrap', gap: 'var(--sp-2)' }}>
+                {EMOJIS.map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    className={`emoji-btn ${emoji === option ? 'is-selected' : ''}`}
+                    onClick={() => setEmoji(option)}
+                    aria-label={`Icon ${option}`}
+                    aria-pressed={emoji === option}
+                  >
+                    {option}
+                  </button>
+                ))}
               </div>
             </div>
-          ))}
-        </div>
+
+            <input
+              type="text"
+              className="input"
+              placeholder="Group name (e.g. Galle Trip)"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              maxLength={60}
+              required
+              autoFocus
+            />
+            <input
+              type="text"
+              className="input"
+              placeholder="Description (optional)"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              maxLength={140}
+            />
+
+            {createError && <Alert variant="error">{createError}</Alert>}
+
+            <button type="submit" className="btn btn-primary btn-block btn-lg" disabled={creating}>
+              {creating && <Spinner />}
+              {creating ? 'Creating…' : 'Create group'}
+            </button>
+          </form>
+        </Sheet>
       )}
 
-      {showCreateModal && (
-        <div className="modal-overlay" onClick={() => setShowCreateModal(false)}>
-          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ fontSize: '1.2rem', fontWeight: 800, marginBottom: 16 }}>Create Group</h3>
-            <form onSubmit={handleCreateGroup} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-              <div>
-                <label style={{ fontSize: '0.8rem', color: 'var(--on-surface-variant)', marginBottom: 8, display: 'block' }}>Choose Icon</label>
-                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                  {EMOJIS.map((emoji) => (
-                    <button
-                      key={emoji}
-                      type="button"
-                      onClick={() => setSelectedEmoji(emoji)}
-                      style={{
-                        width: 42, height: 42, borderRadius: 12, border: selectedEmoji === emoji ? '2px solid var(--primary)' : '1px solid var(--card-border)',
-                        background: selectedEmoji === emoji ? 'var(--primary-container)' : 'var(--surface-variant)',
-                        fontSize: 20, cursor: 'pointer'
-                      }}
-                    >
-                      {emoji}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <input
-                type="text"
-                placeholder="Group Name (e.g. Galle Trip)"
-                className="input-field"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                required
-              />
-              <input
-                type="text"
-                placeholder="Description (optional)"
-                className="input-field"
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-              />
-
-              {error && <div style={{ color: 'var(--negative)', fontSize: '0.85rem' }}>{error}</div>}
-
-              <button type="submit" className="btn-primary" style={{ height: 50, marginTop: 8 }}>
-                Create Group
-              </button>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {showJoinModal && (
-        <div className="modal-overlay" onClick={() => setShowJoinModal(false)}>
-          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-            <h3 style={{ fontSize: '1.2rem', fontWeight: 800, marginBottom: 8 }}>Join Group</h3>
-            <p style={{ fontSize: '0.85rem', color: 'var(--on-surface-variant)', marginBottom: 16 }}>
-              Enter the 6-character invite code shared by the group admin.
+      {showJoin && (
+        <Sheet
+          title="Join a group"
+          onClose={() => {
+            setShowJoin(false);
+            setLookup(null);
+            setJoinError(null);
+            setJoinNotice(null);
+          }}
+        >
+          <div className="stack">
+            <p className="text-muted" style={{ fontSize: '0.87rem' }}>
+              Enter the 6-character code from the group admin. They will approve your request before you can
+              see any expenses.
             </p>
-            <form onSubmit={handleJoinGroup} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-              <input
-                type="text"
-                placeholder="INVITE CODE (e.g. AB3X9K)"
-                className="input-field"
-                value={inviteCode}
-                onChange={(e) => setInviteCode(e.target.value.toUpperCase())}
-                maxLength={6}
-                style={{ textAlign: 'center', letterSpacing: 4, fontWeight: 700, fontSize: '1.2rem' }}
-                required
-              />
 
-              {error && <div style={{ color: 'var(--negative)', fontSize: '0.85rem' }}>{error}</div>}
-              {successMsg && <div style={{ color: 'var(--positive)', fontSize: '0.85rem' }}>{successMsg}</div>}
+            <input
+              type="text"
+              className="input code-input"
+              placeholder="ABC123"
+              value={inviteCode}
+              onChange={(e) => {
+                setInviteCode(e.target.value.toUpperCase().slice(0, 6));
+                setLookup(null);
+                setJoinError(null);
+                setJoinNotice(null);
+              }}
+              maxLength={6}
+              autoCapitalize="characters"
+              autoCorrect="off"
+              spellCheck={false}
+              autoFocus
+            />
 
-              <button type="submit" className="btn-primary" style={{ height: 50, marginTop: 8 }}>
-                Request to Join
+            {joinError && <Alert variant="error">{joinError}</Alert>}
+            {joinNotice && <Alert variant="success">{joinNotice}</Alert>}
+
+            {lookup && (
+              <div className="card row">
+                <span className="icon-tile" style={{ width: 44, height: 44, fontSize: 22 }}>
+                  {lookup.icon_emoji}
+                </span>
+                <span className="grow" style={{ minWidth: 0 }}>
+                  <span className="truncate" style={{ display: 'block', fontWeight: 700 }}>
+                    {lookup.name}
+                  </span>
+                  <span className="hint row" style={{ gap: 4 }}>
+                    <Users2 size={12} /> {lookup.member_count} member{lookup.member_count === 1 ? '' : 's'}
+                  </span>
+                </span>
+              </div>
+            )}
+
+            {lookup ? (
+              <button type="button" className="btn btn-primary btn-block btn-lg" onClick={handleJoin} disabled={joining}>
+                {joining && <Spinner />}
+                {joining ? 'Sending…' : `Request to join ${lookup.name}`}
               </button>
-            </form>
+            ) : (
+              <button
+                type="button"
+                className="btn btn-primary btn-block btn-lg"
+                onClick={handleCheckCode}
+                disabled={checking || inviteCode.trim().length < 4}
+              >
+                {checking && <Spinner />}
+                {checking ? 'Checking…' : 'Find group'}
+              </button>
+            )}
           </div>
-        </div>
+        </Sheet>
       )}
     </div>
   );

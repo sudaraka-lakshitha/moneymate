@@ -1,7 +1,14 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { Group, Expense, User } from '../types';
-import { formatLKR, formatLKRSigned } from '../lib/currency';
+import { DailyExpense, Expense, Group, User } from '../types';
+import { formatLKR, formatLKRSigned, roundMoney } from '../lib/currency';
+import { computeFriendBalances, GroupLedger, netByUser } from '../lib/balances';
+import { categoryMeta } from '../lib/categories';
+import { friendlyDate, lastNDays, startOfMonthISO, toISODate } from '../lib/dates';
+import { friendlyDbError } from '../lib/authErrors';
+import { Alert, Avatar, EmptyState, Skeleton, SkeletonRows } from '../components/ui';
+import { Sparkline } from '../components/Charts';
+import { ChevronRight, Plus, Search, Users2, Wallet } from 'lucide-react';
 
 interface HomePageProps {
   user: User;
@@ -9,177 +16,310 @@ interface HomePageProps {
 }
 
 export const HomePage: React.FC<HomePageProps> = ({ user, onNavigate }) => {
-  const [netBalance, setNetBalance] = useState(0);
-  const [totalOwed, setTotalOwed] = useState(0);
-  const [totalOwing, setTotalOwing] = useState(0);
   const [groups, setGroups] = useState<Group[]>([]);
-  const [expenses, setExpenses] = useState<Expense[]>([]);
+  const [groupBalances, setGroupBalances] = useState<Record<string, number>>({});
+  const [recent, setRecent] = useState<Expense[]>([]);
+  const [dailyExpenses, setDailyExpenses] = useState<DailyExpense[]>([]);
+  const [owedToMe, setOwedToMe] = useState(0);
+  const [owedByMe, setOwedByMe] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    loadHomeData();
-  }, [user.id]);
-
-  const loadHomeData = async () => {
+  const load = useCallback(async () => {
+    setError(null);
     try {
-      const { data: memberData } = await supabase
+      const { data: memberships, error: membershipError } = await supabase
         .from('group_members')
         .select('group_id, groups(*)')
         .eq('user_id', user.id);
+      if (membershipError) throw membershipError;
 
-      if (memberData) {
-        const groupList = memberData.map((m: any) => m.groups).filter(Boolean);
-        setGroups(groupList);
+      const myGroups = (memberships ?? []).map((row: any) => row.groups).filter(Boolean) as Group[];
+      setGroups(myGroups);
+
+      const groupIds = myGroups.map((g) => g.id);
+
+      if (groupIds.length > 0) {
+        const [memberRes, ledgerRes, expenseRes] = await Promise.all([
+          supabase.from('group_members').select('group_id, user_id, users(*)').in('group_id', groupIds),
+          supabase.from('ledger_entries').select('group_id, user_id, amount').in('group_id', groupIds),
+          supabase
+            .from('expenses')
+            .select('*, paid_by_user:users!expenses_paid_by_fkey(*)')
+            .in('group_id', groupIds)
+            .eq('is_deleted', false)
+            .order('created_at', { ascending: false })
+            .limit(6),
+        ]);
+
+        if (ledgerRes.error) throw ledgerRes.error;
+        if (expenseRes.error) throw expenseRes.error;
+
+        setRecent((expenseRes.data ?? []) as Expense[]);
+
+        const perGroup: Record<string, number> = {};
+        for (const row of ledgerRes.data ?? []) {
+          if (row.user_id !== user.id) continue;
+          perGroup[row.group_id] = roundMoney((perGroup[row.group_id] ?? 0) + Number(row.amount));
+        }
+        setGroupBalances(perGroup);
+
+        // Headline figures come from pairwise friend balances so they agree
+        // with what the Friends screen shows.
+        const ledgers: GroupLedger[] = myGroups.map((group) => ({
+          groupId: group.id,
+          groupName: group.name,
+          balances: netByUser((ledgerRes.data ?? []).filter((row: any) => row.group_id === group.id)),
+          members: Object.fromEntries(
+            (memberRes.data ?? [])
+              .filter((row: any) => row.group_id === group.id && row.users)
+              .map((row: any) => [row.user_id, row.users as User])
+          ),
+        }));
+
+        let toMe = 0;
+        let byMe = 0;
+        for (const friend of computeFriendBalances(ledgers, user.id)) {
+          if (friend.net_balance > 0) toMe += friend.net_balance;
+          else byMe += Math.abs(friend.net_balance);
+        }
+        setOwedToMe(roundMoney(toMe));
+        setOwedByMe(roundMoney(byMe));
       }
 
-      const { data: ledgerData } = await supabase
-        .from('ledger_entries')
-        .select('amount')
-        .eq('user_id', user.id);
-
-      if (ledgerData) {
-        const net = ledgerData.reduce((acc, row) => acc + Number(row.amount), 0);
-        setNetBalance(net);
-        const owed = ledgerData.filter((r) => r.amount > 0).reduce((acc, row) => acc + Number(row.amount), 0);
-        const owing = ledgerData.filter((r) => r.amount < 0).reduce((acc, row) => acc + Math.abs(Number(row.amount)), 0);
-        setTotalOwed(owed);
-        setTotalOwing(owing);
-      }
-
-      const { data: expenseData } = await supabase
-        .from('expenses')
+      const { data: daily } = await supabase
+        .from('daily_expenses')
         .select('*')
+        .eq('user_id', user.id)
         .eq('is_deleted', false)
-        .order('created_at', { ascending: false })
-        .limit(10);
-
-      if (expenseData) setExpenses(expenseData);
+        .gte('date', toISODate(new Date(Date.now() - 13 * 24 * 3600 * 1000)))
+        .order('date', { ascending: true });
+      setDailyExpenses((daily ?? []) as DailyExpense[]);
     } catch (err) {
-      console.error('Home load error:', err);
+      setError(friendlyDbError(err, 'Could not load your dashboard.'));
     } finally {
       setLoading(false);
     }
-  };
+  }, [user.id]);
 
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const netBalance = roundMoney(owedToMe - owedByMe);
   const isPositive = netBalance >= 0;
+  const settled = Math.abs(netBalance) < 0.01;
+
+  const sparkValues = useMemo(() => {
+    const byDate: Record<string, number> = {};
+    for (const expense of dailyExpenses) {
+      byDate[expense.date] = (byDate[expense.date] ?? 0) + Number(expense.amount);
+    }
+    return lastNDays(14).map((date) => byDate[date] ?? 0);
+  }, [dailyExpenses]);
+
+  const monthSpend = useMemo(() => {
+    const start = startOfMonthISO();
+    return roundMoney(
+      dailyExpenses.filter((e) => e.date >= start).reduce((sum, e) => sum + Number(e.amount), 0)
+    );
+  }, [dailyExpenses]);
+
+  const quickActions = [
+    { icon: Plus, label: 'Add bill', route: 'groups' },
+    { icon: Users2, label: 'New group', route: 'groups' },
+    { icon: Search, label: 'Join code', route: 'groups' },
+    { icon: Wallet, label: 'Settle up', route: 'friends' },
+  ];
+
+  const firstName = user.display_name.split(' ')[0];
 
   return (
-    <div style={{ padding: '20px 16px 100px' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
-        <div>
-          <span style={{ fontSize: '0.85rem', color: 'var(--on-surface-variant)' }}>Welcome back,</span>
-          <h2 style={{ fontSize: '1.4rem', fontWeight: 800, color: 'var(--on-background)' }}>{user.display_name}</h2>
+    <div className="page">
+      <header className="row-between" style={{ marginBottom: 'var(--sp-5)' }}>
+        <div style={{ minWidth: 0 }}>
+          <span className="hint">Welcome back,</span>
+          <h1 className="page-title truncate">{firstName}</h1>
         </div>
-        <div style={{
-          width: 44, height: 44, borderRadius: '50%', background: 'var(--primary-container)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          color: 'var(--primary-light)', fontWeight: 700, fontSize: '1.1rem'
-        }}>
-          {user.display_name.charAt(0).toUpperCase()}
-        </div>
-      </div>
+        <button
+          type="button"
+          onClick={() => onNavigate('settings')}
+          aria-label="Open your profile"
+          style={{ display: 'flex' }}
+        >
+          <Avatar name={user.display_name} url={user.avatar_url} size={44} />
+        </button>
+      </header>
 
-      <div className={isPositive ? 'glass-card-positive' : 'glass-card-negative'} style={{ padding: 24, marginBottom: 24 }}>
-        <span style={{ fontSize: '0.85rem', color: 'var(--on-surface-variant)' }}>Overall Balance</span>
-        <h1 style={{
-          fontSize: '2.4rem', fontWeight: 800, margin: '8px 0 4px',
-          color: isPositive ? 'var(--positive)' : 'var(--negative)'
-        }}>
-          {formatLKRSigned(netBalance)}
-        </h1>
-        <p style={{ fontSize: '0.8rem', color: 'var(--on-surface-variant)', marginBottom: 20 }}>
-          {isPositive ? 'You are owed in total across all groups' : 'You owe in total across all groups'}
-        </p>
-        <div style={{ display: 'flex', gap: 24, borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: 16 }}>
-          <div>
-            <span style={{ fontSize: '0.75rem', color: 'var(--on-surface-variant)' }}>You are owed</span>
-            <div style={{ fontWeight: 700, color: 'var(--positive)', fontSize: '1rem' }}>{formatLKR(totalOwed)}</div>
-          </div>
-          <div>
-            <span style={{ fontSize: '0.75rem', color: 'var(--on-surface-variant)' }}>You owe</span>
-            <div style={{ fontWeight: 700, color: 'var(--negative)', fontSize: '1rem' }}>{formatLKR(totalOwing)}</div>
-          </div>
+      {error && (
+        <div style={{ marginBottom: 'var(--sp-4)' }}>
+          <Alert variant="error">{error}</Alert>
         </div>
-      </div>
+      )}
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10, marginBottom: 28 }}>
-        {[
-          { emoji: '➕', label: 'Add Bill', action: () => onNavigate('groups') },
-          { emoji: '👥', label: 'New Group', action: () => onNavigate('groups') },
-          { emoji: '🔗', label: 'Join Code', action: () => onNavigate('groups') },
-          { emoji: '💸', label: 'Settle Up', action: () => onNavigate('friends') },
-        ].map((item, i) => (
-          <button
-            key={i}
-            onClick={item.action}
-            className="glass-card"
-            style={{
-              padding: '14px 6px', display: 'flex', flexDirection: 'column', alignItems: 'center',
-              gap: 6, cursor: 'pointer', border: '1px solid var(--card-border)', background: 'var(--surface-variant)'
-            }}
+      {loading ? (
+        <Skeleton height={168} radius={24} />
+      ) : (
+        <section
+          className={`card-hero ${settled ? 'is-neutral' : isPositive ? 'is-positive' : 'is-negative'}`}
+          style={{ marginBottom: 'var(--sp-5)' }}
+        >
+          <span className="label">Overall balance</span>
+          <div
+            className={`amount-xl ${settled ? '' : isPositive ? 'text-positive' : 'text-negative'}`}
+            style={{ margin: '6px 0 4px' }}
           >
-            <span style={{ fontSize: 22 }}>{item.emoji}</span>
-            <span style={{ fontSize: '0.75rem', color: 'var(--on-surface)', fontWeight: 600 }}>{item.label}</span>
+            {formatLKRSigned(netBalance)}
+          </div>
+          <span className="hint">
+            {settled
+              ? 'You are all square with everyone'
+              : isPositive
+                ? 'You are owed across all your groups'
+                : 'You owe across all your groups'}
+          </span>
+
+          <div
+            className="row card-divider"
+            style={{ gap: 'var(--sp-6)', marginTop: 'var(--sp-4)', paddingTop: 'var(--sp-4)' }}
+          >
+            <div>
+              <div className="label">You are owed</div>
+              <div className="amount-md tabular text-positive">{formatLKR(owedToMe)}</div>
+            </div>
+            <div>
+              <div className="label">You owe</div>
+              <div className="amount-md tabular text-negative">{formatLKR(owedByMe)}</div>
+            </div>
+          </div>
+        </section>
+      )}
+
+      <div className="chip-grid" style={{ marginBottom: 'var(--sp-6)' }}>
+        {quickActions.map((action) => (
+          <button
+            key={action.label}
+            type="button"
+            className="card card-interactive"
+            style={{
+              padding: 'var(--sp-3) 4px',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: 6,
+            }}
+            onClick={() => onNavigate(action.route)}
+          >
+            <action.icon size={19} color="var(--primary-light)" />
+            <span style={{ fontSize: '0.72rem', fontWeight: 600 }}>{action.label}</span>
           </button>
         ))}
       </div>
 
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <h3 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--on-background)' }}>Active Groups</h3>
-        <button onClick={() => onNavigate('groups')} style={{ background: 'none', border: 'none', color: 'var(--primary-light)', fontSize: '0.85rem', cursor: 'pointer' }}>
-          See all
+      {monthSpend > 0 && (
+        <button
+          type="button"
+          className="card card-interactive row"
+          style={{ marginBottom: 'var(--sp-6)' }}
+          onClick={() => onNavigate('analytics')}
+        >
+          <span className="grow">
+            <span className="label">Your own spending this month</span>
+            <div className="amount-md tabular">{formatLKR(monthSpend)}</div>
+          </span>
+          <Sparkline values={sparkValues} />
+          <ChevronRight size={16} color="var(--on-surface-faint)" />
         </button>
+      )}
+
+      <div className="row-between" style={{ marginBottom: 'var(--sp-3)' }}>
+        <h2 className="section-title" style={{ margin: 0 }}>
+          Your groups
+        </h2>
+        {groups.length > 0 && (
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => onNavigate('groups')}>
+            See all
+          </button>
+        )}
       </div>
 
-      {groups.length === 0 ? (
-        <div className="glass-card" style={{ padding: 24, textAlign: 'center', marginBottom: 28 }}>
-          <span style={{ fontSize: 40 }}>👥</span>
-          <p style={{ marginTop: 8, color: 'var(--on-surface-variant)', fontSize: '0.9rem' }}>No groups yet. Create or join one!</p>
-        </div>
+      {loading ? (
+        <Skeleton height={96} radius={18} />
+      ) : groups.length === 0 ? (
+        <EmptyState
+          icon="👥"
+          title="No groups yet"
+          text="Create a group for your next trip or flat, or join one with an invite code."
+          action={
+            <button type="button" className="btn btn-primary" onClick={() => onNavigate('groups')}>
+              Get started
+            </button>
+          }
+        />
       ) : (
-        <div style={{ display: 'flex', gap: 12, overflowX: 'auto', paddingBottom: 8, marginBottom: 28 }}>
-          {groups.map((group) => (
-            <div
-              key={group.id}
-              onClick={() => onNavigate(`group-detail/${group.id}`)}
-              className="glass-card"
-              style={{
-                minWidth: 140, padding: 16, display: 'flex', flexDirection: 'column',
-                alignItems: 'center', cursor: 'pointer', flexShrink: 0
-              }}
-            >
-              <span style={{ fontSize: 32, marginBottom: 8 }}>{group.icon_emoji}</span>
-              <span style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--on-background)', marginBottom: 4 }}>{group.name}</span>
-              <span style={{ fontSize: '0.75rem', color: 'var(--on-surface-variant)' }}>Tap to view</span>
-            </div>
-          ))}
+        <div className="rail">
+          {groups.map((group) => {
+            const balance = groupBalances[group.id] ?? 0;
+            const groupSettled = Math.abs(balance) < 0.01;
+            return (
+              <button
+                key={group.id}
+                type="button"
+                className="card card-interactive"
+                style={{ width: 150, textAlign: 'left' }}
+                onClick={() => onNavigate(`group-detail/${group.id}`)}
+              >
+                <span style={{ fontSize: 26, display: 'block', marginBottom: 6 }}>{group.icon_emoji}</span>
+                <span
+                  className="truncate"
+                  style={{ display: 'block', fontWeight: 700, fontSize: '0.88rem', marginBottom: 2 }}
+                >
+                  {group.name}
+                </span>
+                <span
+                  className={`hint tabular ${groupSettled ? '' : balance > 0 ? 'text-positive' : 'text-negative'}`}
+                >
+                  {groupSettled ? 'Settled' : formatLKRSigned(balance)}
+                </span>
+              </button>
+            );
+          })}
         </div>
       )}
 
-      <h3 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--on-background)', marginBottom: 12 }}>Recent Activity</h3>
-      {expenses.length === 0 ? (
-        <div className="glass-card" style={{ padding: 24, textAlign: 'center' }}>
-          <span style={{ fontSize: 36 }}>📋</span>
-          <p style={{ marginTop: 8, color: 'var(--on-surface-variant)', fontSize: '0.9rem' }}>No recent activity</p>
-        </div>
+      <h2 className="section-title">Recent activity</h2>
+
+      {loading ? (
+        <SkeletonRows count={3} height={58} />
+      ) : recent.length === 0 ? (
+        <EmptyState icon="🧾" title="Nothing yet" text="Group expenses will show up here as they are added." />
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {expenses.map((expense) => (
-            <div key={expense.id} className="glass-card" style={{ padding: '14px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                <div style={{ width: 40, height: 40, borderRadius: 12, background: 'var(--surface-variant)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20 }}>
-                  📌
-                </div>
-                <div>
-                  <div style={{ fontWeight: 600, fontSize: '0.95rem', color: 'var(--on-background)' }}>{expense.title}</div>
-                  <div style={{ fontSize: '0.75rem', color: 'var(--on-surface-variant)' }}>{new Date(expense.created_at).toLocaleDateString()}</div>
-                </div>
-              </div>
-              <div style={{ fontWeight: 700, fontSize: '0.95rem', color: 'var(--on-background)' }}>
-                {formatLKR(expense.amount)}
-              </div>
-            </div>
-          ))}
+        <div className="card card-flush">
+          {recent.map((expense) => {
+            const meta = categoryMeta(expense.category);
+            return (
+              <button
+                key={expense.id}
+                type="button"
+                className="list-row list-row-interactive"
+                onClick={() => expense.group_id && onNavigate(`group-detail/${expense.group_id}`)}
+              >
+                <span className="icon-tile" style={{ width: 36, height: 36, fontSize: 17 }}>
+                  {meta.emoji}
+                </span>
+                <span className="grow" style={{ minWidth: 0 }}>
+                  <span className="truncate" style={{ display: 'block', fontSize: '0.89rem', fontWeight: 600 }}>
+                    {expense.title}
+                  </span>
+                  <span className="hint">
+                    {expense.paid_by === user.id ? 'You' : expense.paid_by_user?.display_name ?? 'Someone'} paid ·{' '}
+                    {friendlyDate(expense.created_at.slice(0, 10))}
+                  </span>
+                </span>
+                <span className="amount-md tabular">{formatLKR(expense.amount)}</span>
+              </button>
+            );
+          })}
         </div>
       )}
     </div>

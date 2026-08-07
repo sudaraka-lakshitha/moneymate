@@ -1,164 +1,268 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { LogIn, Sparkles, Shield, Users, BarChart3 } from 'lucide-react';
+import { friendlyAuthError } from '../lib/authErrors';
+import { Alert, GoogleIcon, Spinner } from '../components/ui';
+import { Eye, EyeOff, LogIn, Sparkles, Shield, Users, BarChart3 } from 'lucide-react';
 
-interface AuthPageProps {
-  onSignedIn: () => void;
-}
+type Mode = 'signIn' | 'signUp';
 
-export const AuthPage: React.FC<AuthPageProps> = ({ onSignedIn }) => {
+const FEATURES = [
+  { icon: Users, text: 'Split group bills four ways — equal, custom, % or shares' },
+  { icon: Sparkles, text: 'Everything in LKR, down to the last cent' },
+  { icon: BarChart3, text: 'Daily tracker, budgets and 30-day trends' },
+  { icon: Shield, text: 'Append-only ledger keeps balances honest' },
+];
+
+export const AuthPage: React.FC = () => {
+  const [mode, setMode] = useState<Mode>('signIn');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [isSignUp, setIsSignUp] = useState(false);
   const [displayName, setDisplayName] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+
+  const [submitting, setSubmitting] = useState(false);
+  const [googlePending, setGooglePending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
-  const handleAuth = async (e: React.FormEvent) => {
+  // App.tsx parks any OAuth callback error here before scrubbing the URL.
+  useEffect(() => {
+    const stored = sessionStorage.getItem('moneymate.authError');
+    if (stored) {
+      setError(stored);
+      sessionStorage.removeItem('moneymate.authError');
+    }
+  }, []);
+
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setLoading(true);
     setError(null);
+    setNotice(null);
 
+    if (mode === 'signUp' && password.length < 6) {
+      setError('Password must be at least 6 characters.');
+      return;
+    }
+
+    setSubmitting(true);
     try {
-      if (isSignUp) {
-        const { data, error } = await supabase.auth.signUp({
-          email,
+      if (mode === 'signUp') {
+        const { data, error: signUpError } = await supabase.auth.signUp({
+          email: email.trim(),
           password,
           options: {
-            data: { full_name: displayName || email.split('@')[0] }
-          }
+            data: { full_name: displayName.trim() || email.split('@')[0] },
+            emailRedirectTo: window.location.origin + window.location.pathname,
+          },
         });
-        if (error) throw error;
-        if (data.user) onSignedIn();
+        if (signUpError) throw signUpError;
+
+        // With email confirmation on, there is a user but no session yet.
+        // Without this branch the screen just sits there looking broken.
+        if (data.user && !data.session) {
+          setNotice(`Almost there — we sent a confirmation link to ${email.trim()}. Click it, then sign in.`);
+          setMode('signIn');
+          setPassword('');
+        }
       } else {
-        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-        if (error) throw error;
-        if (data.user) onSignedIn();
+        const { error: signInError } = await supabase.auth.signInWithPassword({
+          email: email.trim(),
+          password,
+        });
+        if (signInError) throw signInError;
       }
-    } catch (err: any) {
-      setError(err.message || 'Authentication failed');
+      // On success App's onAuthStateChange takes over and swaps this screen out.
+    } catch (err) {
+      setError(friendlyAuthError(err));
     } finally {
-      setLoading(false);
+      setSubmitting(false);
     }
   };
 
   const handleGoogleSignIn = async () => {
+    setError(null);
+    setNotice(null);
+    setGooglePending(true);
+
     try {
-      const { error } = await supabase.auth.signInWithOAuth({
+      const { error: oauthError } = await supabase.auth.signInWithOAuth({
         provider: 'google',
-        options: { redirectTo: window.location.origin }
+        options: {
+          // Include the pathname so the app still works when it is not served
+          // from the domain root.
+          redirectTo: window.location.origin + window.location.pathname,
+          queryParams: { prompt: 'select_account' },
+        },
       });
-      if (error) throw error;
-    } catch (err: any) {
-      setError(err.message || 'Google sign-in failed');
+      // A returned error means the redirect never happened.
+      if (oauthError) throw oauthError;
+    } catch (err) {
+      setError(friendlyAuthError(err));
+      setGooglePending(false);
     }
   };
 
+  const handleForgotPassword = async () => {
+    if (!email.trim()) {
+      setError('Enter your email address first, then tap "Forgot password".');
+      return;
+    }
+    setError(null);
+    try {
+      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        redirectTo: window.location.origin + window.location.pathname,
+      });
+      if (resetError) throw resetError;
+      setNotice(`Password reset link sent to ${email.trim()}.`);
+    } catch (err) {
+      setError(friendlyAuthError(err));
+    }
+  };
+
+  const isSignUp = mode === 'signUp';
+
   return (
-    <div style={{ padding: '40px 24px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '100vh' }}>
-      {/* Brand */}
-      <div style={{
-        width: 80, height: 80, borderRadius: 24,
-        background: 'linear-gradient(135deg, var(--primary), var(--secondary))',
-        display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 40,
-        boxShadow: '0 12px 30px rgba(108, 99, 255, 0.4)', marginBottom: 20
-      }}>
-        💰
-      </div>
+    <div style={{ padding: 'var(--sp-8) var(--sp-5) var(--sp-10)', minHeight: '100vh' }}>
+      <header style={{ textAlign: 'center', marginBottom: 'var(--sp-6)' }}>
+        <div
+          style={{
+            width: 76,
+            height: 76,
+            borderRadius: 24,
+            background: 'linear-gradient(135deg, var(--primary), var(--primary-dark))',
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontSize: 38,
+            boxShadow: 'var(--shadow-primary)',
+            marginBottom: 'var(--sp-4)',
+          }}
+        >
+          💰
+        </div>
+        <h1 style={{ fontSize: '1.9rem', fontWeight: 800, letterSpacing: '-0.03em' }}>MoneyMate</h1>
+        <p className="text-muted" style={{ fontSize: '0.92rem', marginTop: 4 }}>
+          Split smarter, settle faster.
+        </p>
+      </header>
 
-      <h1 style={{ fontSize: '2rem', fontWeight: 800, color: 'var(--on-background)', marginBottom: 6 }}>MoneyMate</h1>
-      <p style={{ color: 'var(--on-surface-variant)', fontSize: '0.95rem', textAlign: 'center', marginBottom: 36 }}>
-        Split bills · Track daily expenses · Settle in LKR
-      </p>
-
-      {/* Feature highlights */}
-      <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 32 }}>
-        {[
-          { icon: Sparkles, text: 'LKR Currency only (Rs.)' },
-          { icon: Users, text: 'Group & proxy expense splitting' },
-          { icon: BarChart3, text: 'Personal budget & analytics' },
-          { icon: Shield, text: 'Immutable ledger balance accuracy' },
-        ].map((f, i) => (
-          <div key={i} className="glass-card" style={{ padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12 }}>
-            <f.icon size={18} color="var(--primary)" />
-            <span style={{ fontSize: '0.9rem', color: 'var(--on-surface)' }}>{f.text}</span>
+      <div className="stack-sm" style={{ marginBottom: 'var(--sp-6)' }}>
+        {FEATURES.map((feature) => (
+          <div key={feature.text} className="card row" style={{ padding: 'var(--sp-3) var(--sp-4)' }}>
+            <feature.icon size={17} color="var(--primary-light)" style={{ flexShrink: 0 }} />
+            <span style={{ fontSize: '0.85rem', color: 'var(--on-surface)' }}>{feature.text}</span>
           </div>
         ))}
       </div>
 
-      {/* Error alert */}
       {error && (
-        <div style={{
-          width: '100%', padding: '12px 16px', borderRadius: 14,
-          background: 'rgba(255, 107, 107, 0.15)', border: '1px solid var(--negative)',
-          color: 'var(--negative)', fontSize: '0.85rem', marginBottom: 16
-        }}>
-          {error}
+        <div style={{ marginBottom: 'var(--sp-4)' }}>
+          <Alert variant="error">{error}</Alert>
+        </div>
+      )}
+      {notice && (
+        <div style={{ marginBottom: 'var(--sp-4)' }}>
+          <Alert variant="success">{notice}</Alert>
         </div>
       )}
 
-      {/* Form */}
-      <form onSubmit={handleAuth} style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: 14 }}>
+      {/* Google first: it is the fastest path and should not be buried. */}
+      <button
+        type="button"
+        onClick={handleGoogleSignIn}
+        className="btn btn-secondary btn-block btn-lg"
+        disabled={googlePending || submitting}
+      >
+        {googlePending ? <Spinner /> : <GoogleIcon size={18} />}
+        {googlePending ? 'Redirecting to Google…' : 'Continue with Google'}
+      </button>
+
+      <div className="row" style={{ margin: 'var(--sp-5) 0' }}>
+        <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
+        <span className="hint">or use email</span>
+        <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
+      </div>
+
+      <form onSubmit={handleSubmit} className="stack">
         {isSignUp && (
           <input
             type="text"
-            placeholder="Display Name"
-            className="input-field"
+            className="input"
+            placeholder="Display name"
+            autoComplete="name"
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
             required
           />
         )}
+
         <input
           type="email"
+          className="input"
           placeholder="Email address"
-          className="input-field"
+          autoComplete="email"
+          inputMode="email"
           value={email}
           onChange={(e) => setEmail(e.target.value)}
           required
         />
-        <input
-          type="password"
-          placeholder="Password"
-          className="input-field"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          required
-        />
 
-        <button type="submit" className="btn-primary" disabled={loading} style={{ height: 52, marginTop: 6 }}>
-          <LogIn size={20} />
-          {loading ? 'Processing…' : isSignUp ? 'Create Account' : 'Sign In'}
+        <div style={{ position: 'relative' }}>
+          <input
+            type={showPassword ? 'text' : 'password'}
+            className="input"
+            style={{ paddingRight: 48 }}
+            placeholder="Password"
+            autoComplete={isSignUp ? 'new-password' : 'current-password'}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required
+            minLength={isSignUp ? 6 : undefined}
+          />
+          <button
+            type="button"
+            onClick={() => setShowPassword((v) => !v)}
+            aria-label={showPassword ? 'Hide password' : 'Show password'}
+            style={{
+              position: 'absolute',
+              right: 12,
+              top: '50%',
+              transform: 'translateY(-50%)',
+              color: 'var(--on-surface-variant)',
+              display: 'flex',
+            }}
+          >
+            {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+          </button>
+        </div>
+
+        {isSignUp && <span className="hint">At least 6 characters.</span>}
+
+        <button type="submit" className="btn btn-primary btn-block btn-lg" disabled={submitting || googlePending}>
+          {submitting ? <Spinner /> : <LogIn size={18} />}
+          {submitting ? 'Please wait…' : isSignUp ? 'Create account' : 'Sign in'}
         </button>
       </form>
 
-      {/* Toggle Sign Up / Sign In */}
-      <button
-        onClick={() => setIsSignUp(!isSignUp)}
-        style={{ background: 'none', border: 'none', color: 'var(--primary-light)', marginTop: 16, cursor: 'pointer', fontSize: '0.9rem' }}
-      >
-        {isSignUp ? 'Already have an account? Sign In' : "Don't have an account? Sign Up"}
-      </button>
+      <div className="row-between" style={{ marginTop: 'var(--sp-4)' }}>
+        <button
+          type="button"
+          className="btn btn-ghost btn-sm"
+          onClick={() => {
+            setMode(isSignUp ? 'signIn' : 'signUp');
+            setError(null);
+            setNotice(null);
+          }}
+        >
+          {isSignUp ? 'Have an account? Sign in' : 'New here? Create an account'}
+        </button>
 
-      {/* Divider */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 16, width: '100%', margin: '24px 0 16px' }}>
-        <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
-        <span style={{ fontSize: '0.8rem', color: 'var(--on-surface-variant)' }}>OR</span>
-        <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
+        {!isSignUp && (
+          <button type="button" className="btn btn-ghost btn-sm" onClick={handleForgotPassword}>
+            Forgot password
+          </button>
+        )}
       </div>
-
-      {/* Google Button */}
-      <button
-        onClick={handleGoogleSignIn}
-        className="glass-card"
-        style={{
-          width: '100%', height: 50, display: 'flex', alignItems: 'center', justifyContent: 'center',
-          gap: 12, cursor: 'pointer', border: '1px solid var(--card-border)', color: 'var(--on-background)',
-          fontWeight: 600
-        }}
-      >
-        <span>🔵</span> Continue with Google
-      </button>
     </div>
   );
 };

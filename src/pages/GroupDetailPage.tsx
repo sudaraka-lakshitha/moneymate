@@ -1,10 +1,20 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { Group, GroupMember, Expense, User } from '../types';
+import { Expense, Group, GroupMember, GroupSettlement, User } from '../types';
 import { formatLKR, formatLKRSigned } from '../lib/currency';
 import { simplifyDebts } from '../lib/debtSimplifier';
-import { Plus, Share2, ArrowLeft, Check, UserCheck, Trash2, ArrowRight } from 'lucide-react';
+import { netByUser } from '../lib/balances';
+import { categoryMeta } from '../lib/categories';
+import { friendlyDate } from '../lib/dates';
+import { friendlyDbError } from '../lib/authErrors';
+import { Alert, Avatar, EmptyState, Sheet, SkeletonRows, Spinner } from '../components/ui';
+import { useToast } from '../components/Toast';
+import { useConfirm } from '../components/Confirm';
 import { AddExpenseModal } from './AddExpenseModal';
+import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
+import {
+  ArrowLeft, ArrowRight, Check, Copy, Pencil, Plus, RefreshCw, Share2, Trash2, UserCheck,
+} from 'lucide-react';
 
 interface GroupDetailPageProps {
   groupId: string;
@@ -12,251 +22,591 @@ interface GroupDetailPageProps {
   onBack: () => void;
 }
 
+type Tab = 'expenses' | 'balances' | 'activity';
+
+interface JoinRequest {
+  id: string;
+  user_id: string;
+  requested_at: string;
+  users?: User;
+}
+
 export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user, onBack }) => {
+  const toast = useToast();
+  const confirm = useConfirm();
+
   const [group, setGroup] = useState<Group | null>(null);
   const [members, setMembers] = useState<GroupMember[]>([]);
   const [expenses, setExpenses] = useState<Expense[]>([]);
+  const [settlements, setSettlements] = useState<GroupSettlement[]>([]);
   const [balances, setBalances] = useState<Record<string, number>>({});
-  const [pendingRequests, setPendingRequests] = useState<any[]>([]);
-  const [myBalance, setMyBalance] = useState(0);
+  const [requests, setRequests] = useState<JoinRequest[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
-  const [showAddExpense, setShowAddExpense] = useState(false);
-  const [showInviteModal, setShowInviteModal] = useState(false);
+  const [tab, setTab] = useState<Tab>('expenses');
+  const [showAdd, setShowAdd] = useState(false);
+  const [editing, setEditing] = useState<Expense | null>(null);
+  const [showInvite, setShowInvite] = useState(false);
+  const [settleTarget, setSettleTarget] = useState<SettleTarget | null>(null);
   const [copied, setCopied] = useState(false);
-  const [isAdmin, setIsAdmin] = useState(false);
+  const [regenerating, setRegenerating] = useState(false);
+  const [busyRequest, setBusyRequest] = useState<string | null>(null);
 
-  useEffect(() => {
-    loadGroupDetails();
-  }, [groupId, user.id]);
-
-  const loadGroupDetails = async () => {
+  const load = useCallback(async () => {
+    setLoadError(null);
     try {
-      const { data: gData } = await supabase.from('groups').select('*').eq('id', groupId).single();
-      if (gData) setGroup(gData);
+      const [groupRes, memberRes, expenseRes, ledgerRes, settlementRes] = await Promise.all([
+        supabase.from('groups').select('*').eq('id', groupId).single(),
+        supabase.from('group_members').select('*, users(*)').eq('group_id', groupId),
+        supabase
+          .from('expenses')
+          .select('*, paid_by_user:users!expenses_paid_by_fkey(*)')
+          .eq('group_id', groupId)
+          .order('created_at', { ascending: false }),
+        supabase.from('ledger_entries').select('user_id, amount').eq('group_id', groupId),
+        supabase
+          .from('group_settlements')
+          .select('*, payer:users!group_settlements_from_user_fkey(*), payee:users!group_settlements_to_user_fkey(*)')
+          .eq('group_id', groupId)
+          .order('created_at', { ascending: false }),
+      ]);
 
-      const { data: mData } = await supabase
-        .from('group_members')
-        .select('*, users(*)')
-        .eq('group_id', groupId);
+      if (groupRes.error) throw groupRes.error;
+      setGroup(groupRes.data as Group);
 
-      if (mData) {
-        const mList = mData.map((m: any) => ({ ...m, user: m.users }));
-        setMembers(mList);
-        const adminCheck = mList.some((m: any) => m.user_id === user.id && m.role === 'ADMIN');
-        setIsAdmin(adminCheck);
-      }
+      if (memberRes.error) throw memberRes.error;
+      setMembers((memberRes.data ?? []).map((m: any) => ({ ...m, user: m.users })));
 
-      const { data: eData } = await supabase
-        .from('expenses')
-        .select('*, paid_by_user:users!expenses_paid_by_fkey(*)')
-        .eq('group_id', groupId)
-        .order('created_at', { ascending: false });
+      if (expenseRes.error) throw expenseRes.error;
+      setExpenses((expenseRes.data ?? []) as Expense[]);
 
-      if (eData) setExpenses(eData);
+      if (ledgerRes.error) throw ledgerRes.error;
+      setBalances(netByUser(ledgerRes.data ?? []));
 
-      const { data: lData } = await supabase
-        .from('ledger_entries')
-        .select('user_id, amount')
-        .eq('group_id', groupId);
+      if (!settlementRes.error) setSettlements((settlementRes.data ?? []) as GroupSettlement[]);
 
-      if (lData) {
-        const bMap: Record<string, number> = {};
-        lData.forEach((row: any) => {
-          bMap[row.user_id] = (bMap[row.user_id] || 0) + Number(row.amount);
-        });
-        setBalances(bMap);
-        setMyBalance(bMap[user.id] || 0);
-      }
-
-      const { data: reqData } = await supabase
+      // Only admins can read these; a failure here is not worth surfacing.
+      const { data: requestData } = await supabase
         .from('group_join_requests')
-        .select('*, users(*)')
+        .select('id, user_id, requested_at, users(*)')
         .eq('group_id', groupId)
         .eq('status', 'PENDING');
+      setRequests((requestData ?? []) as unknown as JoinRequest[]);
+    } catch (error) {
+      setLoadError(friendlyDbError(error, 'Could not load this group.'));
+    } finally {
+      setLoading(false);
+    }
+  }, [groupId]);
 
-      if (reqData) setPendingRequests(reqData);
-    } catch (err) {
-      console.error('Group detail error:', err);
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const userMap = useMemo(() => {
+    const map: Record<string, User> = {};
+    for (const m of members) if (m.user) map[m.user_id] = m.user;
+    return map;
+  }, [members]);
+
+  const isAdmin = members.some((m) => m.user_id === user.id && m.role === 'ADMIN');
+  const myBalance = balances[user.id] ?? 0;
+  const simplified = useMemo(() => simplifyDebts(balances, userMap), [balances, userMap]);
+  const myDebts = simplified.filter((d) => d.from.id === user.id);
+  const activeExpenses = expenses.filter((e) => !e.is_deleted);
+
+  const handleApprove = async (request: JoinRequest) => {
+    setBusyRequest(request.id);
+    try {
+      const { error: memberError } = await supabase
+        .from('group_members')
+        .insert({ group_id: groupId, user_id: request.user_id, role: 'MEMBER' });
+      if (memberError) throw memberError;
+
+      const { error: updateError } = await supabase
+        .from('group_join_requests')
+        .update({ status: 'APPROVED', reviewed_by: user.id, reviewed_at: new Date().toISOString() })
+        .eq('id', request.id);
+      if (updateError) throw updateError;
+
+      toast.success(`${request.users?.display_name ?? 'Member'} joined the group.`);
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not approve the request.'));
+    } finally {
+      setBusyRequest(null);
     }
   };
 
-  const userMap: Record<string, User> = {};
-  members.forEach((m) => {
-    if (m.user) userMap[m.user_id] = m.user;
-  });
-
-  const simplified = simplifyDebts(balances, userMap);
-
-  const handleApproveRequest = async (requestId: string, requesterUserId: string) => {
-    await supabase.from('group_join_requests').update({ status: 'APPROVED', reviewed_by: user.id }).eq('id', requestId);
-    await supabase.from('group_members').insert({ group_id: groupId, user_id: requesterUserId, role: 'MEMBER' });
-    loadGroupDetails();
-  };
-
-  const handleRejectRequest = async (requestId: string) => {
-    await supabase.from('group_join_requests').update({ status: 'REJECTED', reviewed_by: user.id }).eq('id', requestId);
-    loadGroupDetails();
-  };
-
-  const handleDeleteExpense = async (expenseId: string) => {
-    if (!confirm('Delete expense? A reversal entry will be created to keep balance accurate.')) return;
-
-    await supabase.from('expenses').update({ is_deleted: true, deleted_by: user.id }).eq('id', expenseId);
-
-    const { data: existing } = await supabase.from('ledger_entries').select('*').eq('reference_id', expenseId);
-    if (existing) {
-      const reversals = existing.map((e: any) => ({
-        group_id: groupId,
-        user_id: e.user_id,
-        entry_type: 'DELETE_REVERSAL',
-        amount: -Number(e.amount),
-        reference_id: expenseId,
-        description: 'Reversal of deleted expense'
-      }));
-      await supabase.from('ledger_entries').insert(reversals);
+  const handleReject = async (request: JoinRequest) => {
+    setBusyRequest(request.id);
+    try {
+      const { error } = await supabase
+        .from('group_join_requests')
+        .update({ status: 'REJECTED', reviewed_by: user.id, reviewed_at: new Date().toISOString() })
+        .eq('id', request.id);
+      if (error) throw error;
+      toast.info('Request declined.');
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not decline the request.'));
+    } finally {
+      setBusyRequest(null);
     }
-
-    loadGroupDetails();
   };
+
+  const handleDeleteExpense = async (expense: Expense) => {
+    const ok = await confirm({
+      title: 'Delete this expense?',
+      message: `"${expense.title}" will be marked deleted and a reversal entry keeps everyone's balance correct. The ledger history is preserved.`,
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
+
+    try {
+      const { error } = await supabase.rpc('delete_expense', {
+        p_expense_id: expense.id,
+        p_reason: 'Deleted from the app',
+      });
+      if (error) throw error;
+      toast.success('Expense deleted and balances reversed.');
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not delete the expense.'));
+    }
+  };
+
+  const handleRegenerateCode = async () => {
+    setRegenerating(true);
+    try {
+      const { data, error } = await supabase.rpc('regenerate_invite_code', {
+        p_group_id: groupId,
+        p_days: 7,
+      });
+      if (error) throw error;
+      setGroup((current) => (current ? { ...current, invite_code: data as string } : current));
+      toast.success('New invite code generated.');
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not regenerate the code.'));
+    } finally {
+      setRegenerating(false);
+    }
+  };
+
+  const copyInvite = async () => {
+    if (!group) return;
+    try {
+      await navigator.clipboard.writeText(group.invite_code);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      toast.error('Could not copy — select the code and copy it manually.');
+    }
+  };
+
+  const codeExpired = group ? new Date(group.invite_code_expires_at).getTime() < Date.now() : false;
+
+  if (loading) {
+    return (
+      <div className="page">
+        <Skeletonish onBack={onBack} />
+      </div>
+    );
+  }
 
   return (
-    <div style={{ padding: '20px 16px 100px' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
-        <button onClick={onBack} className="btn-icon">
-          <ArrowLeft size={20} />
+    <div className="page">
+      <header className="row-between" style={{ marginBottom: 'var(--sp-4)' }}>
+        <button type="button" className="btn-icon" onClick={onBack} aria-label="Back to groups">
+          <ArrowLeft size={18} />
         </button>
-        <h2 style={{ fontSize: '1.2rem', fontWeight: 800, color: 'var(--on-background)' }}>{group?.name || 'Group'}</h2>
-        <button onClick={() => setShowInviteModal(true)} className="btn-icon">
-          <Share2 size={20} color="var(--primary-light)" />
-        </button>
-      </div>
-
-      <div className={myBalance >= 0 ? 'glass-card-primary' : 'glass-card-negative'} style={{ padding: 20, marginBottom: 20 }}>
-        <span style={{ fontSize: '0.8rem', color: 'var(--on-surface-variant)' }}>Your Balance in Group</span>
-        <h2 style={{ fontSize: '2rem', fontWeight: 800, color: myBalance >= 0 ? 'var(--positive)' : 'var(--negative)', margin: '6px 0 4px' }}>
-          {formatLKRSigned(myBalance)}
-        </h2>
-        <span style={{ fontSize: '0.8rem', color: 'var(--on-surface-variant)' }}>
-          {myBalance >= 0 ? 'You are owed in this group' : 'You owe in this group'}
-        </span>
-      </div>
-
-      {isAdmin && pendingRequests.length > 0 && (
-        <div className="glass-card" style={{ padding: 16, marginBottom: 20, border: '1px solid var(--warning)' }}>
-          <h4 style={{ color: 'var(--warning)', fontSize: '0.9rem', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-            <UserCheck size={18} /> Pending Join Requests ({pendingRequests.length})
-          </h4>
-          {pendingRequests.map((req) => (
-            <div key={req.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0', borderTop: '1px solid var(--divider)' }}>
-              <span style={{ fontSize: '0.85rem', color: 'var(--on-background)' }}>{req.users?.display_name || req.users?.email}</span>
-              <div style={{ display: 'flex', gap: 6 }}>
-                <button onClick={() => handleApproveRequest(req.id, req.user_id)} className="badge badge-positive" style={{ border: 'none', cursor: 'pointer' }}>Approve</button>
-                <button onClick={() => handleRejectRequest(req.id)} className="badge badge-negative" style={{ border: 'none', cursor: 'pointer' }}>Reject</button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {simplified.length > 0 && (
-        <div className="glass-card" style={{ padding: 16, marginBottom: 20 }}>
-          <h4 style={{ fontSize: '0.9rem', fontWeight: 700, color: 'var(--on-background)', marginBottom: 12 }}>Simplified Debts</h4>
-          {simplified.map((debt, i) => (
-            <div key={i} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '0.85rem', padding: '6px 0' }}>
-              <span style={{ color: 'var(--negative)' }}>{debt.from.display_name}</span>
-              <ArrowRight size={14} color="var(--on-surface-variant)" />
-              <span style={{ color: 'var(--positive)' }}>{debt.to.display_name}</span>
-              <span style={{ fontWeight: 700, color: 'var(--on-background)' }}>{formatLKR(debt.amount)}</span>
-            </div>
-          ))}
-        </div>
-      )}
-
-      <h3 style={{ fontSize: '1rem', fontWeight: 700, color: 'var(--on-background)', marginBottom: 12 }}>Members ({members.length})</h3>
-      <div style={{ display: 'flex', gap: 8, overflowX: 'auto', paddingBottom: 8, marginBottom: 24 }}>
-        {members.map((m) => (
-          <div key={m.id} className="glass-card" style={{ padding: '8px 14px', display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-            <div style={{ width: 28, height: 28, borderRadius: '50%', background: 'var(--primary-container)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.8rem', color: 'var(--primary-light)', fontWeight: 700 }}>
-              {m.user?.display_name?.charAt(0).toUpperCase() || '?'}
-            </div>
-            <span style={{ fontSize: '0.85rem', color: 'var(--on-background)' }}>{m.user?.display_name}</span>
-            {m.role === 'ADMIN' && <span className="badge badge-warning">Admin</span>}
+        <div style={{ textAlign: 'center', minWidth: 0 }}>
+          <div className="truncate" style={{ fontWeight: 800, fontSize: '1.05rem' }}>
+            {group?.icon_emoji} {group?.name ?? 'Group'}
           </div>
+          <div className="hint">{members.length} members</div>
+        </div>
+        <button type="button" className="btn-icon" onClick={() => setShowInvite(true)} aria-label="Invite members">
+          <Share2 size={18} color="var(--primary-light)" />
+        </button>
+      </header>
+
+      {loadError && (
+        <div style={{ marginBottom: 'var(--sp-4)' }}>
+          <Alert variant="error">{loadError}</Alert>
+        </div>
+      )}
+
+      <section
+        className={`card-hero ${Math.abs(myBalance) < 0.01 ? 'is-neutral' : myBalance > 0 ? 'is-positive' : 'is-negative'}`}
+        style={{ marginBottom: 'var(--sp-5)' }}
+      >
+        <span className="label">Your balance here</span>
+        <div
+          className={`amount-xl tabular ${Math.abs(myBalance) < 0.01 ? '' : myBalance > 0 ? 'text-positive' : 'text-negative'}`}
+          style={{ margin: '6px 0 4px' }}
+        >
+          {formatLKRSigned(myBalance)}
+        </div>
+        <span className="hint">
+          {Math.abs(myBalance) < 0.01
+            ? 'You are all square in this group'
+            : myBalance > 0
+              ? 'You are owed by the group'
+              : 'You owe the group'}
+        </span>
+
+        {myDebts.length > 0 && (
+          <div className="stack-sm card-divider" style={{ marginTop: 'var(--sp-4)', paddingTop: 'var(--sp-4)' }}>
+            {myDebts.map((debt) => (
+              <div key={debt.to.id} className="row-between">
+                <span className="row" style={{ gap: 8, minWidth: 0 }}>
+                  <Avatar name={debt.to.display_name} url={debt.to.avatar_url} size={26} />
+                  <span className="truncate" style={{ fontSize: '0.85rem' }}>
+                    Pay {debt.to.display_name}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  onClick={() =>
+                    setSettleTarget({
+                      groupId,
+                      groupName: group?.name,
+                      payee: debt.to,
+                      suggestedAmount: debt.amount,
+                    })
+                  }
+                >
+                  Settle {formatLKR(debt.amount)}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {isAdmin && requests.length > 0 && (
+        <section className="card" style={{ borderColor: 'var(--warning)', marginBottom: 'var(--sp-5)' }}>
+          <h2 className="row text-warning" style={{ fontSize: '0.9rem', fontWeight: 700, marginBottom: 'var(--sp-3)' }}>
+            <UserCheck size={16} /> {requests.length} pending join request{requests.length === 1 ? '' : 's'}
+          </h2>
+          <div className="stack-sm">
+            {requests.map((request) => (
+              <div key={request.id} className="row-between">
+                <span className="row" style={{ gap: 8, minWidth: 0 }}>
+                  <Avatar name={request.users?.display_name} url={request.users?.avatar_url} size={30} />
+                  <span className="truncate" style={{ fontSize: '0.87rem' }}>
+                    {request.users?.display_name ?? request.users?.email ?? 'Someone'}
+                  </span>
+                </span>
+                <span className="row" style={{ gap: 6, flexShrink: 0 }}>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => handleReject(request)}
+                    disabled={busyRequest === request.id}
+                  >
+                    Decline
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-sm"
+                    onClick={() => handleApprove(request)}
+                    disabled={busyRequest === request.id}
+                  >
+                    {busyRequest === request.id ? <Spinner /> : 'Approve'}
+                  </button>
+                </span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <div className="chip-grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)', marginBottom: 'var(--sp-4)' }}>
+        {(['expenses', 'balances', 'activity'] as Tab[]).map((id) => (
+          <button
+            key={id}
+            type="button"
+            className={`chip ${tab === id ? 'is-selected' : ''}`}
+            style={{ display: 'flex', justifyContent: 'center', textTransform: 'capitalize' }}
+            onClick={() => setTab(id)}
+          >
+            {id}
+          </button>
         ))}
       </div>
 
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <h3 style={{ fontSize: '1rem', fontWeight: 700, color: 'var(--on-background)' }}>Expenses</h3>
-        <button onClick={() => setShowAddExpense(true)} className="btn-primary" style={{ padding: '8px 14px', fontSize: '0.85rem' }}>
-          <Plus size={16} /> Add Expense
-        </button>
-      </div>
+      {tab === 'expenses' && (
+        <>
+          <div className="row-between" style={{ marginBottom: 'var(--sp-3)' }}>
+            <h2 className="section-title" style={{ margin: 0 }}>
+              {activeExpenses.length} expense{activeExpenses.length === 1 ? '' : 's'}
+            </h2>
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => setShowAdd(true)}>
+              <Plus size={15} /> Add
+            </button>
+          </div>
 
-      {expenses.length === 0 ? (
-        <div className="glass-card" style={{ padding: 28, textAlign: 'center' }}>
-          <span style={{ fontSize: 36 }}>📋</span>
-          <p style={{ marginTop: 8, color: 'var(--on-surface-variant)', fontSize: '0.85rem' }}>No expenses recorded yet.</p>
-        </div>
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {expenses.map((expense) => (
-            <div key={expense.id} className="glass-card" style={{ padding: 14, opacity: expense.is_deleted ? 0.5 : 1 }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <div>
-                  <div style={{ fontWeight: 600, fontSize: '0.95rem', color: 'var(--on-background)' }}>
-                    {expense.title} {expense.is_deleted && <span className="badge badge-negative">Deleted</span>}
+          {expenses.length === 0 ? (
+            <EmptyState
+              icon="🧾"
+              title="No expenses yet"
+              text="Add the first bill and MoneyMate will work out who owes what."
+              action={
+                <button type="button" className="btn btn-primary" onClick={() => setShowAdd(true)}>
+                  Add an expense
+                </button>
+              }
+            />
+          ) : (
+            <div className="stack-sm">
+              {expenses.map((expense) => {
+                const meta = categoryMeta(expense.category);
+                const canManage = expense.created_by === user.id || isAdmin;
+                return (
+                  <div
+                    key={expense.id}
+                    className="card row"
+                    style={{ opacity: expense.is_deleted ? 0.5 : 1, gap: 'var(--sp-3)' }}
+                  >
+                    <span className="icon-tile" style={{ width: 40, height: 40, fontSize: 19 }}>
+                      {meta.emoji}
+                    </span>
+                    <span className="grow" style={{ minWidth: 0 }}>
+                      <span className="row" style={{ gap: 6 }}>
+                        <span className="truncate" style={{ fontWeight: 600, fontSize: '0.92rem' }}>
+                          {expense.title}
+                        </span>
+                        {expense.is_deleted && <span className="badge badge-negative">Deleted</span>}
+                        {expense.split_method === 'ITEMIZED' && !expense.is_deleted && (
+                          <span className="badge badge-primary">Itemized</span>
+                        )}
+                      </span>
+                      <span className="hint">
+                        {expense.paid_by_user?.display_name ?? 'Someone'} paid ·{' '}
+                        {friendlyDate(expense.created_at.slice(0, 10))}
+                        {expense.updated_at && expense.updated_at !== expense.created_at ? ' · edited' : ''}
+                      </span>
+                    </span>
+                    <span className="row" style={{ gap: 'var(--sp-2)', flexShrink: 0 }}>
+                      <span className="amount-md tabular">{formatLKR(expense.amount)}</span>
+                      {canManage && !expense.is_deleted && (
+                        <>
+                          <button
+                            type="button"
+                            className="btn-icon"
+                            style={{ width: 30, height: 30 }}
+                            onClick={() => setEditing(expense)}
+                            aria-label={`Edit ${expense.title}`}
+                          >
+                            <Pencil size={13} />
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-icon"
+                            style={{ width: 30, height: 30 }}
+                            onClick={() => handleDeleteExpense(expense)}
+                            aria-label={`Delete ${expense.title}`}
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </>
+                      )}
+                    </span>
                   </div>
-                  <div style={{ fontSize: '0.75rem', color: 'var(--on-surface-variant)' }}>
-                    Paid by {expense.paid_by_user?.display_name || 'Member'} · {new Date(expense.created_at).toLocaleDateString()}
-                  </div>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                  <span style={{ fontWeight: 700, color: 'var(--on-background)' }}>{formatLKR(expense.amount)}</span>
-                  {!expense.is_deleted && (
-                    <button onClick={() => handleDeleteExpense(expense.id)} style={{ background: 'none', border: 'none', color: 'var(--on-surface-variant)', cursor: 'pointer' }}>
-                      <Trash2 size={16} />
-                    </button>
-                  )}
-                </div>
-              </div>
+                );
+              })}
             </div>
-          ))}
-        </div>
+          )}
+        </>
       )}
 
-      {showAddExpense && (
+      {tab === 'balances' && (
+        <>
+          <h2 className="section-title" style={{ marginTop: 0 }}>Who owes whom</h2>
+          {simplified.length === 0 ? (
+            <EmptyState icon="✅" title="Everyone is square" text="No outstanding balances in this group." />
+          ) : (
+            <div className="stack-sm">
+              {simplified.map((debt, index) => (
+                <div key={`${debt.from.id}-${debt.to.id}-${index}`} className="card row">
+                  <Avatar name={debt.from.display_name} url={debt.from.avatar_url} size={30} />
+                  <span className="truncate" style={{ fontSize: '0.85rem', maxWidth: 84 }}>
+                    {debt.from.id === user.id ? 'You' : debt.from.display_name}
+                  </span>
+                  <ArrowRight size={14} color="var(--on-surface-faint)" style={{ flexShrink: 0 }} />
+                  <Avatar name={debt.to.display_name} url={debt.to.avatar_url} size={30} />
+                  <span className="truncate grow" style={{ fontSize: '0.85rem' }}>
+                    {debt.to.id === user.id ? 'You' : debt.to.display_name}
+                  </span>
+                  <span className="amount-md tabular" style={{ flexShrink: 0 }}>
+                    {formatLKR(debt.amount)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <h2 className="section-title">Members</h2>
+          <div className="card card-flush">
+            {members.map((member) => {
+              const balance = balances[member.user_id] ?? 0;
+              return (
+                <div key={member.id} className="list-row">
+                  <Avatar name={member.user?.display_name} url={member.user?.avatar_url} size={34} />
+                  <span className="grow truncate" style={{ fontSize: '0.9rem' }}>
+                    {member.user_id === user.id ? 'You' : member.user?.display_name ?? 'Member'}
+                  </span>
+                  {member.role === 'ADMIN' && <span className="badge badge-warning">Admin</span>}
+                  <span
+                    className={`tabular ${Math.abs(balance) < 0.01 ? 'text-neutral' : balance > 0 ? 'text-positive' : 'text-negative'}`}
+                    style={{ fontSize: '0.85rem', fontWeight: 700 }}
+                  >
+                    {formatLKRSigned(balance)}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {tab === 'activity' && (
+        <>
+          <h2 className="section-title" style={{ marginTop: 0 }}>Settlements</h2>
+          {settlements.length === 0 ? (
+            <EmptyState icon="🤝" title="No settlements yet" text="Payments between members show up here." />
+          ) : (
+            <div className="stack-sm">
+              {settlements.map((settlement) => (
+                <div key={settlement.id} className="card row">
+                  <span className="icon-tile" style={{ width: 36, height: 36, fontSize: 16 }}>
+                    💸
+                  </span>
+                  <span className="grow" style={{ minWidth: 0 }}>
+                    <span className="truncate" style={{ display: 'block', fontSize: '0.88rem', fontWeight: 600 }}>
+                      {settlement.from_user === user.id ? 'You' : settlement.payer?.display_name ?? 'Someone'} paid{' '}
+                      {settlement.to_user === user.id ? 'you' : settlement.payee?.display_name ?? 'someone'}
+                    </span>
+                    <span className="hint">
+                      {friendlyDate(settlement.created_at.slice(0, 10))} · {settlement.payment_method.toLowerCase()}
+                      {settlement.note ? ` · ${settlement.note}` : ''}
+                    </span>
+                  </span>
+                  <span className="amount-md tabular" style={{ flexShrink: 0 }}>
+                    {formatLKR(settlement.amount)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
+      {showAdd && (
         <AddExpenseModal
           groupId={groupId}
           user={user}
           members={members}
-          onClose={() => setShowAddExpense(false)}
-          onSaved={() => { setShowAddExpense(false); loadGroupDetails(); }}
+          onClose={() => setShowAdd(false)}
+          onSaved={() => {
+            setShowAdd(false);
+            void load();
+          }}
         />
       )}
 
-      {showInviteModal && group && (
-        <div className="modal-overlay" onClick={() => setShowInviteModal(false)}>
-          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ textAlign: 'center' }}>
-            <h3 style={{ fontSize: '1.2rem', fontWeight: 800, marginBottom: 8 }}>Invite Code</h3>
-            <p style={{ fontSize: '0.85rem', color: 'var(--on-surface-variant)', marginBottom: 20 }}>
-              Share this code with friends so they can join "{group.name}":
+      {editing && (
+        <AddExpenseModal
+          groupId={groupId}
+          user={user}
+          members={members}
+          expense={editing}
+          onClose={() => setEditing(null)}
+          onSaved={() => {
+            setEditing(null);
+            void load();
+          }}
+        />
+      )}
+
+      {settleTarget && (
+        <SettleUpSheet
+          target={settleTarget}
+          onClose={() => setSettleTarget(null)}
+          onSettled={() => {
+            setSettleTarget(null);
+            void load();
+          }}
+        />
+      )}
+
+      {showInvite && group && (
+        <Sheet title="Invite to group" onClose={() => setShowInvite(false)}>
+          <div className="stack" style={{ textAlign: 'center' }}>
+            <p className="text-muted" style={{ fontSize: '0.87rem' }}>
+              Share this code so friends can request to join "{group.name}". You approve each request.
             </p>
-            <div className="glass-card-primary" style={{ padding: '16px 32px', marginBottom: 20, display: 'inline-block' }}>
-              <span style={{ fontSize: '2rem', fontWeight: 800, letterSpacing: 8, color: 'var(--primary-light)' }}>
-                {group.invite_code}
-              </span>
-            </div>
-            <div>
-              <button
-                onClick={() => { navigator.clipboard.writeText(group.invite_code); setCopied(true); setTimeout(() => setCopied(false), 2000); }}
-                className="btn-primary" style={{ width: '100%', height: 48 }}
+
+            <div className="card-hero is-neutral">
+              <div
+                className="tabular"
+                style={{ fontSize: '2.1rem', fontWeight: 800, letterSpacing: 8, color: 'var(--primary-light)' }}
               >
-                {copied ? <Check size={18} /> : <Share2 size={18} />} {copied ? 'Copied!' : 'Copy Code'}
-              </button>
+                {group.invite_code}
+              </div>
+              <div className="hint" style={{ marginTop: 6 }}>
+                {codeExpired
+                  ? 'This code has expired'
+                  : `Valid until ${new Date(group.invite_code_expires_at).toLocaleDateString()}`}
+              </div>
             </div>
+
+            {codeExpired && (
+              <Alert variant="warning">
+                Expired codes are rejected on join. Generate a new one to keep inviting.
+              </Alert>
+            )}
+
+            <button type="button" className="btn btn-primary btn-block btn-lg" onClick={copyInvite}>
+              {copied ? <Check size={17} /> : <Copy size={17} />}
+              {copied ? 'Copied' : 'Copy code'}
+            </button>
+
+            {isAdmin && (
+              <button
+                type="button"
+                className="btn btn-secondary btn-block"
+                onClick={handleRegenerateCode}
+                disabled={regenerating}
+              >
+                {regenerating ? <Spinner /> : <RefreshCw size={15} />}
+                {regenerating ? 'Generating…' : 'Generate a new code'}
+              </button>
+            )}
           </div>
-        </div>
+        </Sheet>
       )}
     </div>
   );
 };
+
+/** Header-shaped placeholder so the page does not jump when data lands. */
+const Skeletonish: React.FC<{ onBack: () => void }> = ({ onBack }) => (
+  <>
+    <header className="row-between" style={{ marginBottom: 'var(--sp-4)' }}>
+      <button type="button" className="btn-icon" onClick={onBack} aria-label="Back to groups">
+        <ArrowLeft size={18} />
+      </button>
+      <div className="skeleton" style={{ height: 20, width: 140, borderRadius: 8 }} />
+      <div style={{ width: 40 }} />
+    </header>
+    <div className="skeleton" style={{ height: 150, borderRadius: 24, marginBottom: 20 }} />
+    <SkeletonRows count={4} />
+  </>
+);

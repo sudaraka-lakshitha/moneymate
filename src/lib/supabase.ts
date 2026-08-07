@@ -13,5 +13,10 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: {
     persistSession: true,
     autoRefreshToken: true,
-  }
+    // Required for the Google redirect to be turned into a session on return.
+    detectSessionInUrl: true,
+    // PKCE keeps the token exchange off the URL fragment, which is what makes
+    // OAuth safe in a browser app.
+    flowType: 'pkce',
+  },
 });

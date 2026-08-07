@@ -1,113 +1,242 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { User } from '../types';
-import { formatLKR } from '../lib/currency';
+import { DailyExpense, User } from '../types';
+import { formatLKR, roundMoney } from '../lib/currency';
+import { CATEGORIES, categoryMeta } from '../lib/categories';
+import { lastNDays, monthKey, toISODate } from '../lib/dates';
+import { friendlyDbError } from '../lib/authErrors';
+import { Alert, EmptyState, Skeleton } from '../components/ui';
+import { CategoryBars, CategoryDatum, TrendChart, TrendPoint } from '../components/Charts';
+import { TrendingDown, TrendingUp } from 'lucide-react';
 
 interface AnalyticsPageProps {
   user: User;
 }
 
-const CATEGORY_COLORS: Record<string, string> = {
-  FOOD: '#FF6B35',
-  TRANSPORT: '#4ECDC4',
-  ACCOMMODATION: '#6C63FF',
-  ENTERTAINMENT: '#FFBE0B',
-  SHOPPING: '#FF6B6B',
-  HEALTH: '#2ECC71',
-  UTILITIES: '#3498DB',
-  OTHER: '#95A5A6',
-};
+type Range = 30 | 90;
 
 export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
-  const [categoryTotals, setCategoryTotals] = useState<Record<string, number>>({});
-  const [grandTotal, setGrandTotal] = useState(0);
+  const [expenses, setExpenses] = useState<DailyExpense[]>([]);
+  const [groupShare, setGroupShare] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [range, setRange] = useState<Range>(30);
 
-  useEffect(() => {
-    loadAnalytics();
-  }, [user.id]);
-
-  const loadAnalytics = async () => {
+  const load = useCallback(async () => {
+    setError(null);
     try {
-      const { data } = await supabase
+      // 90 days covers the widest range, plus the previous period for the
+      // month-over-month comparison.
+      const since = toISODate(new Date(Date.now() - 190 * 24 * 3600 * 1000));
+
+      const { data, error: fetchError } = await supabase
         .from('daily_expenses')
-        .select('category, amount')
+        .select('*')
         .eq('user_id', user.id)
-        .eq('is_deleted', false);
+        .eq('is_deleted', false)
+        .gte('date', since)
+        .order('date', { ascending: true });
 
-      if (data) {
-        const catMap: Record<string, number> = {};
-        let total = 0;
+      if (fetchError) throw fetchError;
+      setExpenses((data ?? []) as DailyExpense[]);
 
-        data.forEach((row) => {
-          const cat = row.category || 'OTHER';
-          const amt = Number(row.amount);
-          catMap[cat] = (catMap[cat] || 0) + amt;
-          total += amt;
-        });
+      // What the user personally owes across all group bills this month.
+      const { data: splitData } = await supabase
+        .from('expense_splits')
+        .select('amount, is_included, expenses!inner(is_deleted, created_at)')
+        .eq('user_id', user.id)
+        .eq('is_included', true);
 
-        setCategoryTotals(catMap);
-        setGrandTotal(total);
-      }
+      const monthPrefix = monthKey();
+      const share = (splitData ?? [])
+        .filter((row: any) => !row.expenses?.is_deleted && String(row.expenses?.created_at).startsWith(monthPrefix))
+        .reduce((sum: number, row: any) => sum + Number(row.amount), 0);
+      setGroupShare(roundMoney(share));
     } catch (err) {
-      console.error(err);
+      setError(friendlyDbError(err, 'Could not load your analytics.'));
     } finally {
       setLoading(false);
     }
-  };
+  }, [user.id]);
 
-  const sortedCategories = Object.entries(categoryTotals).sort((a, b) => b[1] - a[1]);
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const byDate = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const expense of expenses) {
+      map[expense.date] = roundMoney((map[expense.date] ?? 0) + Number(expense.amount));
+    }
+    return map;
+  }, [expenses]);
+
+  /** Every day in the window, including the zero-spend ones. */
+  const trend = useMemo<TrendPoint[]>(
+    () => lastNDays(range).map((date) => ({ date, value: byDate[date] ?? 0 })),
+    [byDate, range]
+  );
+
+  const windowTotal = useMemo(() => roundMoney(trend.reduce((sum, p) => sum + p.value, 0)), [trend]);
+
+  const previousTotal = useMemo(() => {
+    const dates = lastNDays(range * 2).slice(0, range);
+    return roundMoney(dates.reduce((sum, date) => sum + (byDate[date] ?? 0), 0));
+  }, [byDate, range]);
+
+  const changePercent =
+    previousTotal > 0 ? ((windowTotal - previousTotal) / previousTotal) * 100 : null;
+
+  const activeDays = trend.filter((p) => p.value > 0).length;
+  const dailyAverage = activeDays > 0 ? roundMoney(windowTotal / range) : 0;
+  const busiest = trend.reduce<TrendPoint | null>(
+    (top, point) => (point.value > (top?.value ?? 0) ? point : top),
+    null
+  );
+
+  const categoryData = useMemo<CategoryDatum[]>(() => {
+    const windowDates = new Set(lastNDays(range));
+    const totals: Record<string, number> = {};
+    for (const expense of expenses) {
+      if (!windowDates.has(expense.date)) continue;
+      totals[expense.category] = roundMoney((totals[expense.category] ?? 0) + Number(expense.amount));
+    }
+    return CATEGORIES.filter((cat) => (totals[cat.id] ?? 0) > 0)
+      .map((cat) => ({
+        key: cat.id,
+        label: cat.name,
+        emoji: cat.emoji,
+        value: totals[cat.id],
+        color: cat.color,
+      }))
+      .sort((a, b) => b.value - a.value);
+  }, [expenses, range]);
+
+  const topCategory = categoryData[0];
+
+  if (loading) {
+    return (
+      <div className="page">
+        <header className="page-header">
+          <h1 className="page-title">Stats</h1>
+        </header>
+        <Skeleton height={150} radius={24} />
+        <div style={{ height: 16 }} />
+        <Skeleton height={200} radius={18} />
+      </div>
+    );
+  }
 
   return (
-    <div style={{ padding: '20px 16px 100px' }}>
-      <h2 style={{ fontSize: '1.4rem', fontWeight: 800, color: 'var(--on-background)', marginBottom: 20 }}>
-        Analytics & Insights
-      </h2>
+    <div className="page">
+      <header className="page-header">
+        <div>
+          <h1 className="page-title">Stats</h1>
+          <p className="page-subtitle">Your personal spending</p>
+        </div>
+      </header>
 
-      <div className="glass-card-primary" style={{ padding: 20, marginBottom: 24 }}>
-        <span style={{ fontSize: '0.8rem', color: 'var(--on-surface-variant)' }}>Total Tracked Expenses</span>
-        <h2 style={{ fontSize: '2.2rem', fontWeight: 800, color: 'var(--on-background)', margin: '6px 0 4px' }}>
-          {formatLKR(grandTotal)}
-        </h2>
-        <span style={{ fontSize: '0.8rem', color: 'var(--on-surface-variant)' }}>
-          {Object.keys(categoryTotals).length} categories active
-        </span>
+      {error && (
+        <div style={{ marginBottom: 'var(--sp-4)' }}>
+          <Alert variant="error">{error}</Alert>
+        </div>
+      )}
+
+      <div className="chip-grid" style={{ gridTemplateColumns: 'repeat(2, 1fr)', marginBottom: 'var(--sp-4)' }}>
+        {([30, 90] as Range[]).map((option) => (
+          <button
+            key={option}
+            type="button"
+            className={`chip ${range === option ? 'is-selected' : ''}`}
+            style={{ display: 'flex', justifyContent: 'center' }}
+            onClick={() => setRange(option)}
+          >
+            Last {option} days
+          </button>
+        ))}
       </div>
 
-      <h3 style={{ fontSize: '1rem', fontWeight: 700, color: 'var(--on-background)', marginBottom: 16 }}>
-        Spending by Category
-      </h3>
-
-      {sortedCategories.length === 0 && !loading ? (
-        <div className="glass-card" style={{ padding: 36, textAlign: 'center' }}>
-          <span style={{ fontSize: 44 }}>📊</span>
-          <p style={{ marginTop: 12, color: 'var(--on-surface-variant)', fontSize: '0.85rem' }}>
-            No spending data recorded yet.
-          </p>
+      <section className="card-hero is-neutral" style={{ marginBottom: 'var(--sp-5)' }}>
+        <span className="label">Tracked in the last {range} days</span>
+        <div className="amount-xl" style={{ margin: '6px 0 4px' }}>
+          {formatLKR(windowTotal)}
         </div>
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          {sortedCategories.map(([category, amount]) => {
-            const pct = grandTotal > 0 ? (amount / grandTotal) * 100 : 0;
-            const barColor = CATEGORY_COLORS[category] || '#6C63FF';
+        {changePercent !== null && (
+          <span
+            className="row hint"
+            style={{ gap: 5, color: changePercent > 0 ? 'var(--negative)' : 'var(--positive)' }}
+          >
+            {changePercent > 0 ? <TrendingUp size={13} /> : <TrendingDown size={13} />}
+            {Math.abs(changePercent).toFixed(0)}% {changePercent > 0 ? 'more than' : 'less than'} the previous{' '}
+            {range} days
+          </span>
+        )}
 
-            return (
-              <div key={category} className="glass-card" style={{ padding: 16 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, fontSize: '0.9rem' }}>
-                  <span style={{ fontWeight: 600, color: 'var(--on-background)' }}>{category}</span>
-                  <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-                    <span style={{ fontSize: '0.8rem', color: 'var(--on-surface-variant)' }}>{pct.toFixed(1)}%</span>
-                    <span style={{ fontWeight: 700, color: 'var(--on-background)' }}>{formatLKR(amount)}</span>
-                  </div>
-                </div>
+        <div
+          className="row card-divider"
+          style={{ gap: 'var(--sp-6)', marginTop: 'var(--sp-4)', paddingTop: 'var(--sp-4)' }}
+        >
+          <div>
+            <div className="label">Daily average</div>
+            <div className="amount-md tabular">{formatLKR(dailyAverage)}</div>
+          </div>
+          <div>
+            <div className="label">Days with spend</div>
+            <div className="amount-md tabular">
+              {activeDays}
+              <span className="hint"> / {range}</span>
+            </div>
+          </div>
+        </div>
+      </section>
 
-                <div style={{ width: '100%', height: 8, borderRadius: 4, background: 'var(--surface-variant)', overflow: 'hidden' }}>
-                  <div style={{ width: `${Math.min(pct, 100)}%`, height: '100%', background: barColor, borderRadius: 4 }} />
-                </div>
-              </div>
-            );
+      <h2 className="section-title" style={{ marginTop: 0 }}>
+        Daily spending
+      </h2>
+      <div className="card" style={{ marginBottom: 'var(--sp-2)' }}>
+        <TrendChart data={trend} />
+      </div>
+      {busiest && busiest.value > 0 && (
+        <p className="hint" style={{ marginBottom: 'var(--sp-5)' }}>
+          Highest day: {formatLKR(busiest.value)} on{' '}
+          {new Date(busiest.date + 'T00:00:00').toLocaleDateString(undefined, {
+            day: 'numeric',
+            month: 'long',
           })}
+          .
+        </p>
+      )}
+
+      {groupShare > 0 && (
+        <div className="card row" style={{ marginBottom: 'var(--sp-5)' }}>
+          <span className="icon-tile" style={{ width: 40, height: 40, fontSize: 19 }}>
+            👥
+          </span>
+          <span className="grow">
+            <span className="label">Your share of group bills this month</span>
+            <div className="amount-md tabular">{formatLKR(groupShare)}</div>
+          </span>
         </div>
+      )}
+
+      <h2 className="section-title" style={{ marginTop: 0 }}>
+        Where it goes
+      </h2>
+      {topCategory && (
+        <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+          {categoryMeta(topCategory.key).name} is your biggest category at{' '}
+          {((topCategory.value / windowTotal) * 100).toFixed(0)}% of spending.
+        </p>
+      )}
+
+      {categoryData.length === 0 ? (
+        <EmptyState
+          icon="📊"
+          title="No data yet"
+          text="Log a few expenses in the Tracker and your breakdown and trends will appear here."
+        />
+      ) : (
+        <CategoryBars data={categoryData} total={windowTotal} />
       )}
     </div>
   );
