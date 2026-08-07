@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { DailyExpense, User } from '../types';
+import { ExpenseCategory, User } from '../types';
 import { formatLKR, roundMoney } from '../lib/currency';
 import { CATEGORIES, categoryMeta } from '../lib/categories';
-import { lastNDays, monthKey, toISODate } from '../lib/dates';
+import { useTheme } from '../lib/theme';
+import { lastNDays, toISODate } from '../lib/dates';
 import { friendlyDbError } from '../lib/authErrors';
 import { Alert, EmptyState, Skeleton } from '../components/ui';
 import { CategoryBars, CategoryDatum, TrendChart, TrendPoint } from '../components/Charts';
@@ -14,44 +15,75 @@ interface AnalyticsPageProps {
 }
 
 type Range = 30 | 90;
+type Source = 'all' | 'personal' | 'group';
+
+/** One spending fact, whatever it came from. */
+interface SpendRow {
+  date: string;
+  category: ExpenseCategory;
+  amount: number;
+  source: 'personal' | 'group';
+}
+
+const SOURCE_LABELS: Record<Source, string> = {
+  all: 'Everything',
+  personal: 'Personal',
+  group: 'Group share',
+};
 
 export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
-  const [expenses, setExpenses] = useState<DailyExpense[]>([]);
-  const [groupShare, setGroupShare] = useState(0);
+  const { resolved } = useTheme();
+  const [rows, setRows] = useState<SpendRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [range, setRange] = useState<Range>(30);
+  const [source, setSource] = useState<Source>('all');
 
   const load = useCallback(async () => {
     setError(null);
     try {
-      // 90 days covers the widest range, plus the previous period for the
-      // month-over-month comparison.
+      // 190 days covers the 90-day range plus its comparison period.
       const since = toISODate(new Date(Date.now() - 190 * 24 * 3600 * 1000));
 
-      const { data, error: fetchError } = await supabase
-        .from('daily_expenses')
-        .select('*')
-        .eq('user_id', user.id)
-        .eq('is_deleted', false)
-        .gte('date', since)
-        .order('date', { ascending: true });
+      const [dailyRes, splitRes] = await Promise.all([
+        supabase
+          .from('daily_expenses')
+          .select('date, category, amount')
+          .eq('user_id', user.id)
+          .eq('is_deleted', false)
+          .gte('date', since),
+        // Your share of group bills, carrying the bill's own category. This is
+        // what the breakdown used to miss: group spending was summed into a
+        // single figure and never split by category.
+        supabase
+          .from('expense_splits')
+          .select('amount, expenses!inner(category, created_at, is_deleted)')
+          .eq('user_id', user.id)
+          .eq('is_included', true)
+          .eq('expenses.is_deleted', false)
+          .gte('expenses.created_at', since),
+      ]);
 
-      if (fetchError) throw fetchError;
-      setExpenses((data ?? []) as DailyExpense[]);
+      if (dailyRes.error) throw dailyRes.error;
+      if (splitRes.error) throw splitRes.error;
 
-      // What the user personally owes across all group bills this month.
-      const { data: splitData } = await supabase
-        .from('expense_splits')
-        .select('amount, is_included, expenses!inner(is_deleted, created_at)')
-        .eq('user_id', user.id)
-        .eq('is_included', true);
+      const personal: SpendRow[] = (dailyRes.data ?? []).map((row: any) => ({
+        date: row.date,
+        category: (row.category || 'OTHER') as ExpenseCategory,
+        amount: Number(row.amount),
+        source: 'personal',
+      }));
 
-      const monthPrefix = monthKey();
-      const share = (splitData ?? [])
-        .filter((row: any) => !row.expenses?.is_deleted && String(row.expenses?.created_at).startsWith(monthPrefix))
-        .reduce((sum: number, row: any) => sum + Number(row.amount), 0);
-      setGroupShare(roundMoney(share));
+      const group: SpendRow[] = (splitRes.data ?? [])
+        .filter((row: any) => row.expenses)
+        .map((row: any) => ({
+          date: String(row.expenses.created_at).slice(0, 10),
+          category: (row.expenses.category || 'OTHER') as ExpenseCategory,
+          amount: Number(row.amount),
+          source: 'group',
+        }));
+
+      setRows([...personal, ...group]);
     } catch (err) {
       setError(friendlyDbError(err, 'Could not load your analytics.'));
     } finally {
@@ -63,15 +95,17 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
     void load();
   }, [load]);
 
+  const visible = useMemo(
+    () => (source === 'all' ? rows : rows.filter((row) => row.source === source)),
+    [rows, source]
+  );
+
   const byDate = useMemo(() => {
     const map: Record<string, number> = {};
-    for (const expense of expenses) {
-      map[expense.date] = roundMoney((map[expense.date] ?? 0) + Number(expense.amount));
-    }
+    for (const row of visible) map[row.date] = roundMoney((map[row.date] ?? 0) + row.amount);
     return map;
-  }, [expenses]);
+  }, [visible]);
 
-  /** Every day in the window, including the zero-spend ones. */
   const trend = useMemo<TrendPoint[]>(
     () => lastNDays(range).map((date) => ({ date, value: byDate[date] ?? 0 })),
     [byDate, range]
@@ -84,22 +118,33 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
     return roundMoney(dates.reduce((sum, date) => sum + (byDate[date] ?? 0), 0));
   }, [byDate, range]);
 
-  const changePercent =
-    previousTotal > 0 ? ((windowTotal - previousTotal) / previousTotal) * 100 : null;
+  const changePercent = previousTotal > 0 ? ((windowTotal - previousTotal) / previousTotal) * 100 : null;
 
   const activeDays = trend.filter((p) => p.value > 0).length;
-  const dailyAverage = activeDays > 0 ? roundMoney(windowTotal / range) : 0;
+  const dailyAverage = range > 0 ? roundMoney(windowTotal / range) : 0;
   const busiest = trend.reduce<TrendPoint | null>(
     (top, point) => (point.value > (top?.value ?? 0) ? point : top),
     null
   );
 
+  const splitByOrigin = useMemo(() => {
+    const windowDates = new Set(lastNDays(range));
+    let personal = 0;
+    let group = 0;
+    for (const row of rows) {
+      if (!windowDates.has(row.date)) continue;
+      if (row.source === 'personal') personal += row.amount;
+      else group += row.amount;
+    }
+    return { personal: roundMoney(personal), group: roundMoney(group) };
+  }, [rows, range]);
+
   const categoryData = useMemo<CategoryDatum[]>(() => {
     const windowDates = new Set(lastNDays(range));
     const totals: Record<string, number> = {};
-    for (const expense of expenses) {
-      if (!windowDates.has(expense.date)) continue;
-      totals[expense.category] = roundMoney((totals[expense.category] ?? 0) + Number(expense.amount));
+    for (const row of visible) {
+      if (!windowDates.has(row.date)) continue;
+      totals[row.category] = roundMoney((totals[row.category] ?? 0) + row.amount);
     }
     return CATEGORIES.filter((cat) => (totals[cat.id] ?? 0) > 0)
       .map((cat) => ({
@@ -107,10 +152,10 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
         label: cat.name,
         emoji: cat.emoji,
         value: totals[cat.id],
-        color: cat.color,
+        color: cat.color[resolved],
       }))
       .sort((a, b) => b.value - a.value);
-  }, [expenses, range]);
+  }, [visible, range, resolved]);
 
   const topCategory = categoryData[0];
 
@@ -132,7 +177,7 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
       <header className="page-header">
         <div>
           <h1 className="page-title">Stats</h1>
-          <p className="page-subtitle">Your personal spending</p>
+          <p className="page-subtitle">Personal tracker + your share of group bills</p>
         </div>
       </header>
 
@@ -142,7 +187,7 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
         </div>
       )}
 
-      <div className="chip-grid" style={{ gridTemplateColumns: 'repeat(2, 1fr)', marginBottom: 'var(--sp-4)' }}>
+      <div className="chip-grid" style={{ gridTemplateColumns: 'repeat(2, 1fr)', marginBottom: 'var(--sp-2)' }}>
         {([30, 90] as Range[]).map((option) => (
           <button
             key={option}
@@ -156,8 +201,24 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
         ))}
       </div>
 
+      <div className="chip-grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)', marginBottom: 'var(--sp-4)' }}>
+        {(['all', 'personal', 'group'] as Source[]).map((option) => (
+          <button
+            key={option}
+            type="button"
+            className={`chip ${source === option ? 'is-selected' : ''}`}
+            style={{ display: 'flex', justifyContent: 'center' }}
+            onClick={() => setSource(option)}
+          >
+            {SOURCE_LABELS[option]}
+          </button>
+        ))}
+      </div>
+
       <section className="card-hero is-neutral" style={{ marginBottom: 'var(--sp-5)' }}>
-        <span className="label">Tracked in the last {range} days</span>
+        <span className="label">
+          {SOURCE_LABELS[source]} spending · last {range} days
+        </span>
         <div className="amount-xl" style={{ margin: '6px 0 4px' }}>
           {formatLKR(windowTotal)}
         </div>
@@ -190,6 +251,19 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
         </div>
       </section>
 
+      {source === 'all' && (splitByOrigin.personal > 0 || splitByOrigin.group > 0) && (
+        <div className="card row-between" style={{ marginBottom: 'var(--sp-5)' }}>
+          <div>
+            <span className="label">Own spending</span>
+            <div className="amount-md tabular">{formatLKR(splitByOrigin.personal)}</div>
+          </div>
+          <div style={{ textAlign: 'right' }}>
+            <span className="label">Share of group bills</span>
+            <div className="amount-md tabular">{formatLKR(splitByOrigin.group)}</div>
+          </div>
+        </div>
+      )}
+
       <h2 className="section-title" style={{ marginTop: 0 }}>
         Daily spending
       </h2>
@@ -207,22 +281,10 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
         </p>
       )}
 
-      {groupShare > 0 && (
-        <div className="card row" style={{ marginBottom: 'var(--sp-5)' }}>
-          <span className="icon-tile" style={{ width: 40, height: 40, fontSize: 19 }}>
-            👥
-          </span>
-          <span className="grow">
-            <span className="label">Your share of group bills this month</span>
-            <div className="amount-md tabular">{formatLKR(groupShare)}</div>
-          </span>
-        </div>
-      )}
-
       <h2 className="section-title" style={{ marginTop: 0 }}>
         Where it goes
       </h2>
-      {topCategory && (
+      {topCategory && windowTotal > 0 && (
         <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
           {categoryMeta(topCategory.key).name} is your biggest category at{' '}
           {((topCategory.value / windowTotal) * 100).toFixed(0)}% of spending.
@@ -233,7 +295,11 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
         <EmptyState
           icon="📊"
           title="No data yet"
-          text="Log a few expenses in the Tracker and your breakdown and trends will appear here."
+          text={
+            source === 'group'
+              ? 'Add a group expense and your share will be broken down here by category.'
+              : 'Log a few expenses in the Tracker and your breakdown and trends will appear here.'
+          }
         />
       ) : (
         <CategoryBars data={categoryData} total={windowTotal} />

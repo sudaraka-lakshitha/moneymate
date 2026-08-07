@@ -9,7 +9,25 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="MoneyMate" />
-    <meta name="theme-color" content="#0D0D1A" />
+    <meta name="theme-color" content="#0B0B16" />
+
+    <!-- Apply the saved theme before first paint. Without this the page renders
+         in the OS theme for a frame and then snaps to the saved one. -->
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem('moneymate.theme');
+          if (saved === 'light' || saved === 'dark') {
+            document.documentElement.setAttribute('data-theme', saved);
+            document
+              .querySelector('meta[name="theme-color"]')
+              .setAttribute('content', saved === 'light' ? '#F5F6FB' : '#0B0B16');
+          }
+        } catch (e) {
+          /* storage unavailable — fall through to the OS preference */
+        }
+      })();
+    </script>
     <link rel="manifest" href="/manifest.json" />
     
     <!-- Google Fonts: Inter -->

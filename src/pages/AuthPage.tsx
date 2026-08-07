@@ -22,6 +22,7 @@ export const AuthPage: React.FC = () => {
 
   const [submitting, setSubmitting] = useState(false);
   const [googlePending, setGooglePending] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -104,18 +105,24 @@ export const AuthPage: React.FC = () => {
 
   const handleForgotPassword = async () => {
     if (!email.trim()) {
-      setError('Enter your email address first, then tap "Forgot password".');
+      setError('Enter your email address first, then tap "Reset password".');
       return;
     }
     setError(null);
+    setNotice(null);
+    setResetting(true);
     try {
       const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
         redirectTo: window.location.origin + window.location.pathname,
       });
       if (resetError) throw resetError;
-      setNotice(`Password reset link sent to ${email.trim()}.`);
+      setNotice(
+        `Reset link sent to ${email.trim()}. Open it on this device and you can set a new password.`
+      );
     } catch (err) {
       setError(friendlyAuthError(err));
+    } finally {
+      setResetting(false);
     }
   };
 
@@ -244,6 +251,8 @@ export const AuthPage: React.FC = () => {
         </button>
       </form>
 
+      {/* Reset stays available in both modes: people routinely hit "create an
+          account", find the email already exists, and need the reset from here. */}
       <div className="row-between" style={{ marginTop: 'var(--sp-4)' }}>
         <button
           type="button"
@@ -257,11 +266,15 @@ export const AuthPage: React.FC = () => {
           {isSignUp ? 'Have an account? Sign in' : 'New here? Create an account'}
         </button>
 
-        {!isSignUp && (
-          <button type="button" className="btn btn-ghost btn-sm" onClick={handleForgotPassword}>
-            Forgot password
-          </button>
-        )}
+        <button
+          type="button"
+          className="btn btn-ghost btn-sm"
+          onClick={handleForgotPassword}
+          disabled={resetting || submitting || googlePending}
+        >
+          {resetting ? <Spinner /> : null}
+          {resetting ? 'Sending…' : 'Reset password'}
+        </button>
       </div>
     </div>
   );

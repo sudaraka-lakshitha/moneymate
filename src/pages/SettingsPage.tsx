@@ -1,11 +1,21 @@
 import React, { useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { User } from '../types';
-import { friendlyDbError } from '../lib/authErrors';
-import { Avatar, Sheet, Spinner } from '../components/ui';
+import { friendlyAuthError, friendlyDbError } from '../lib/authErrors';
+import { ThemePreference, useTheme } from '../lib/theme';
+import { Alert, Avatar, Sheet, Spinner } from '../components/ui';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/Confirm';
-import { LogOut, Pencil, Globe, Shield, Database, Github, ChevronRight } from 'lucide-react';
+import {
+  LogOut, Pencil, Globe, Shield, Database, Github, ChevronRight,
+  Sun, Moon, Monitor, KeyRound,
+} from 'lucide-react';
+
+const THEME_OPTIONS: { id: ThemePreference; label: string; icon: React.ElementType }[] = [
+  { id: 'light', label: 'Light', icon: Sun },
+  { id: 'dark', label: 'Dark', icon: Moon },
+  { id: 'system', label: 'Auto', icon: Monitor },
+];
 
 interface SettingsPageProps {
   user: User;
@@ -16,11 +26,58 @@ interface SettingsPageProps {
 export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated, onSignedOut }) => {
   const toast = useToast();
   const confirm = useConfirm();
+  const { preference, resolved, setPreference } = useTheme();
 
   const [editing, setEditing] = useState(false);
   const [draftName, setDraftName] = useState(user.display_name);
   const [saving, setSaving] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
+
+  const [changingPassword, setChangingPassword] = useState(false);
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [passwordSaving, setPasswordSaving] = useState(false);
+  const [passwordError, setPasswordError] = useState<string | null>(null);
+
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPasswordError(null);
+
+    if (newPassword.length < 6) {
+      setPasswordError('Password must be at least 6 characters.');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setPasswordError('The two passwords do not match.');
+      return;
+    }
+
+    setPasswordSaving(true);
+    try {
+      const { error } = await supabase.auth.updateUser({ password: newPassword });
+      if (error) throw error;
+      toast.success('Password updated.');
+      setChangingPassword(false);
+      setNewPassword('');
+      setConfirmPassword('');
+    } catch (error) {
+      setPasswordError(friendlyAuthError(error));
+    } finally {
+      setPasswordSaving(false);
+    }
+  };
+
+  const handleSendReset = async () => {
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(user.email, {
+        redirectTo: window.location.origin + window.location.pathname,
+      });
+      if (error) throw error;
+      toast.success(`Reset link sent to ${user.email}.`);
+    } catch (error) {
+      toast.error(friendlyAuthError(error));
+    }
+  };
 
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -104,6 +161,49 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
       </section>
 
       <h2 className="section-title" style={{ marginTop: 'var(--sp-6)', marginBottom: 'var(--sp-3)' }}>
+        Appearance
+      </h2>
+      <div className="segmented" role="group" aria-label="Theme">
+        {THEME_OPTIONS.map((option) => (
+          <button
+            key={option.id}
+            type="button"
+            className={`segmented-option ${preference === option.id ? 'is-active' : ''}`}
+            onClick={() => setPreference(option.id)}
+            aria-pressed={preference === option.id}
+          >
+            <option.icon size={15} />
+            {option.label}
+          </button>
+        ))}
+      </div>
+      <p className="hint" style={{ marginTop: 'var(--sp-2)' }}>
+        {preference === 'system'
+          ? `Following your device — currently ${resolved}.`
+          : `Always ${preference}.`}
+      </p>
+
+      <h2 className="section-title" style={{ marginTop: 'var(--sp-6)', marginBottom: 'var(--sp-3)' }}>
+        Security
+      </h2>
+      <div className="card card-flush">
+        <button
+          type="button"
+          className="list-row list-row-interactive"
+          onClick={() => {
+            setPasswordError(null);
+            setChangingPassword(true);
+          }}
+        >
+          <KeyRound size={18} color="var(--primary)" />
+          <span className="grow" style={{ fontSize: '0.9rem', fontWeight: 500 }}>
+            Change password
+          </span>
+          <ChevronRight size={16} color="var(--on-surface-faint)" />
+        </button>
+      </div>
+
+      <h2 className="section-title" style={{ marginTop: 'var(--sp-6)', marginBottom: 'var(--sp-3)' }}>
         About this app
       </h2>
       <div className="card card-flush">
@@ -173,6 +273,49 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
               {saving && <Spinner />}
               {saving ? 'Saving…' : 'Save changes'}
             </button>
+          </form>
+        </Sheet>
+      )}
+
+      {changingPassword && (
+        <Sheet title="Change password" onClose={() => setChangingPassword(false)}>
+          <form onSubmit={handleChangePassword} className="stack">
+            {passwordError && <Alert variant="error">{passwordError}</Alert>}
+
+            <input
+              type="password"
+              className="input"
+              placeholder="New password"
+              autoComplete="new-password"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              minLength={6}
+              autoFocus
+              required
+            />
+            <input
+              type="password"
+              className="input"
+              placeholder="Confirm new password"
+              autoComplete="new-password"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              minLength={6}
+              required
+            />
+            <span className="hint">At least 6 characters.</span>
+
+            <button type="submit" className="btn btn-primary btn-block btn-lg" disabled={passwordSaving}>
+              {passwordSaving && <Spinner />}
+              {passwordSaving ? 'Saving…' : 'Update password'}
+            </button>
+
+            <button type="button" className="btn btn-ghost btn-block" onClick={handleSendReset}>
+              Email me a reset link instead
+            </button>
+            <span className="hint">
+              Signed in with Google? Use the reset link to add a password you can also sign in with.
+            </span>
           </form>
         </Sheet>
       )}

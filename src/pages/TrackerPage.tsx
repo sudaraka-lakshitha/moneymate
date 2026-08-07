@@ -3,6 +3,7 @@ import { supabase } from '../lib/supabase';
 import { Budget, DailyExpense, ExpenseCategory, User } from '../types';
 import { formatLKR, parseAmount, roundMoney } from '../lib/currency';
 import { CATEGORIES, categoryMeta } from '../lib/categories';
+import { useTheme } from '../lib/theme';
 import { friendlyDate, monthKey, monthLabel, startOfMonthISO, todayISO } from '../lib/dates';
 import { friendlyDbError } from '../lib/authErrors';
 import { Alert, EmptyState, ProgressBar, Sheet, SkeletonRows, Spinner } from '../components/ui';
@@ -17,6 +18,7 @@ interface TrackerPageProps {
 export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
   const toast = useToast();
   const confirm = useConfirm();
+  const { resolved } = useTheme();
 
   const [expenses, setExpenses] = useState<DailyExpense[]>([]);
   const [budgets, setBudgets] = useState<Budget[]>([]);
@@ -309,7 +311,7 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
             const meta = categoryMeta(budget.category);
             const remaining = limit - spent;
             const barColor =
-              percent >= 100 ? 'var(--negative)' : percent >= 80 ? 'var(--warning)' : meta.color;
+              percent >= 100 ? 'var(--negative)' : percent >= 80 ? 'var(--warning)' : meta.color[resolved];
             return (
               <div key={budget.id} className="card">
                 <div className="row-between" style={{ marginBottom: 8 }}>

@@ -3,9 +3,11 @@ import { Session } from '@supabase/supabase-js';
 import { supabase } from './lib/supabase';
 import { User } from './types';
 import { clearAuthParamsFromUrl, readOAuthError } from './lib/authErrors';
+import { ThemeProvider } from './lib/theme';
 import { ToastProvider } from './components/Toast';
 import { ConfirmProvider } from './components/Confirm';
 import { AuthPage } from './pages/AuthPage';
+import { ResetPasswordPage } from './pages/ResetPasswordPage';
 import { HomePage } from './pages/HomePage';
 import { GroupsPage } from './pages/GroupsPage';
 import { GroupDetailPage } from './pages/GroupDetailPage';
@@ -57,12 +59,13 @@ const SplashScreen: React.FC<{ label: string }> = ({ label }) => (
   </div>
 );
 
-export const App: React.FC = () => {
+const AppShell: React.FC = () => {
   const [session, setSession] = useState<Session | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [profileError, setProfileError] = useState<string | null>(null);
   const [route, setRoute] = useState('home');
+  const [recovering, setRecovering] = useState(false);
 
   /**
    * Loads the profile row for a signed-in account, creating it if the
@@ -158,13 +161,20 @@ export const App: React.FC = () => {
 
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+    } = supabase.auth.onAuthStateChange((event, nextSession) => {
       if (!active) return;
+
+      // Following a reset link signs the user in with a recovery session. Catch
+      // it so they get the "set a new password" screen rather than being
+      // dropped into the app with the old password still in force.
+      if (event === 'PASSWORD_RECOVERY') setRecovering(true);
+
       setSession(nextSession);
       if (nextSession?.user) {
         void loadProfile(nextSession.user);
       } else {
         setUser(null);
+        setRecovering(false);
         setLoading(false);
       }
     });
@@ -176,6 +186,20 @@ export const App: React.FC = () => {
   }, [loadProfile]);
 
   if (loading) return <SplashScreen label="Loading MoneyMate…" />;
+
+  if (recovering && session) {
+    return (
+      <ToastProvider>
+        <ResetPasswordPage
+          onDone={() => setRecovering(false)}
+          onCancel={async () => {
+            await supabase.auth.signOut();
+            setRecovering(false);
+          }}
+        />
+      </ToastProvider>
+    );
+  }
 
   if (!session || !user) {
     return (
@@ -256,3 +280,10 @@ export const App: React.FC = () => {
     </ToastProvider>
   );
 };
+
+/** Theme has to wrap everything, including the signed-out and recovery screens. */
+export const App: React.FC = () => (
+  <ThemeProvider>
+    <AppShell />
+  </ThemeProvider>
+);
