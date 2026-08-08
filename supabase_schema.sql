@@ -2265,3 +2265,136 @@ GRANT EXECUTE ON FUNCTION public.delete_group(UUID)                 TO authentic
 GRANT EXECUTE ON FUNCTION public.remove_group_member(UUID, UUID)    TO authenticated;
 GRANT EXECUTE ON FUNCTION public.set_member_role(UUID, UUID, TEXT)  TO authenticated;
 GRANT EXECUTE ON FUNCTION public.leave_group(UUID)                  TO authenticated;
+
+-- ========================================
+-- WRITE VALIDATION HARDENING
+-- ========================================
+-- write_expense_rows checked that included splits SUM to the bill total, then
+-- wrote a ledger row only for splits with amount > 0. A negative split slips
+-- through both: it counts toward the sum but is skipped when writing.
+--
+-- Splits of 200 and -100 on a 100 bill therefore validated (they sum to 100),
+-- credited the payer 100, debited 200, and wrote nothing for the -100. The
+-- group ledger ended at -100 instead of 0 — money destroyed, and because
+-- group_is_settled tests for a zero balance, that group could never again be
+-- settled, archived, purged or deleted. A permanently stuck group.
+--
+-- Fixed by rejecting negative split amounts outright. Zero stays legal: an
+-- included member who owes nothing (an itemised bill where they took nothing)
+-- is meaningful, and writes no ledger row by design.
+CREATE OR REPLACE FUNCTION public.write_expense_rows(
+    p_expense_id UUID,
+    p_group_id   UUID,
+    p_title      TEXT,
+    p_amount     DECIMAL,
+    p_paid_by    UUID,
+    p_splits     JSONB,
+    p_items      JSONB
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_split       JSONB;
+    v_item        JSONB;
+    v_split_total DECIMAL(14,2) := 0;
+    v_negatives   INT := 0;
+BEGIN
+    -- No split may be negative, included or not. Without this the sum check
+    -- below can be satisfied by amounts that never reach the ledger.
+    SELECT COUNT(*) INTO v_negatives
+    FROM jsonb_array_elements(p_splits) s
+    WHERE COALESCE((s->>'amount')::DECIMAL, 0) < 0;
+
+    IF v_negatives > 0 THEN
+        RAISE EXCEPTION 'A split cannot be a negative amount';
+    END IF;
+
+    -- Splits must reconstruct the bill exactly, or the ledger will not net to
+    -- zero and every balance in the group drifts.
+    SELECT COALESCE(SUM((s->>'amount')::DECIMAL), 0) INTO v_split_total
+    FROM jsonb_array_elements(p_splits) s
+    WHERE (s->>'is_included')::BOOLEAN;
+
+    IF ROUND(v_split_total, 2) <> ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Split total (%) does not equal the expense amount (%)', v_split_total, p_amount;
+    END IF;
+
+    INSERT INTO expense_splits (expense_id, user_id, is_included, amount, percentage, shares)
+    SELECT
+        p_expense_id,
+        (s->>'user_id')::UUID,
+        COALESCE((s->>'is_included')::BOOLEAN, TRUE),
+        COALESCE((s->>'amount')::DECIMAL, 0),
+        COALESCE((s->>'percentage')::DECIMAL, 0),
+        COALESCE((s->>'shares')::INT, 1)
+    FROM jsonb_array_elements(p_splits) s;
+
+    IF jsonb_array_length(COALESCE(p_items, '[]'::jsonb)) > 0 THEN
+        FOR v_item IN SELECT * FROM jsonb_array_elements(p_items) LOOP
+            INSERT INTO expense_items (expense_id, name, amount, shared_by)
+            VALUES (
+                p_expense_id,
+                v_item->>'name',
+                (v_item->>'amount')::DECIMAL,
+                COALESCE(
+                    (SELECT ARRAY_AGG(value::TEXT::UUID)
+                     FROM jsonb_array_elements_text(v_item->'shared_by') AS value),
+                    '{}'::UUID[]
+                )
+            );
+        END LOOP;
+    END IF;
+
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    VALUES (p_group_id, p_paid_by, 'EXPENSE', p_amount, p_expense_id, 'Paid for ' || p_title);
+
+    FOR v_split IN SELECT * FROM jsonb_array_elements(p_splits) LOOP
+        IF COALESCE((v_split->>'is_included')::BOOLEAN, FALSE)
+           AND COALESCE((v_split->>'amount')::DECIMAL, 0) > 0 THEN
+            INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+            VALUES (
+                p_group_id,
+                (v_split->>'user_id')::UUID,
+                'SPLIT',
+                -(v_split->>'amount')::DECIMAL,
+                p_expense_id,
+                'Share of ' || p_title
+            );
+        END IF;
+    END LOOP;
+END;
+$$;
+
+-- Reject junk on the columns the UI renders from. A category or split method
+-- outside the known set silently falls back to a default in the client, which
+-- hides bad data instead of surfacing it; an all-whitespace title renders as a
+-- blank row. None of these are reachable through the app's own forms, only via
+-- the API directly, but the server is the only place that can actually hold
+-- the line.
+ALTER TABLE expenses DROP CONSTRAINT IF EXISTS expenses_category_known;
+ALTER TABLE expenses ADD CONSTRAINT expenses_category_known
+    CHECK (category IN ('FOOD','TRANSPORT','ACCOMMODATION','ENTERTAINMENT',
+                        'SHOPPING','HEALTH','UTILITIES','OTHER')) NOT VALID;
+
+ALTER TABLE expenses DROP CONSTRAINT IF EXISTS expenses_split_method_known;
+ALTER TABLE expenses ADD CONSTRAINT expenses_split_method_known
+    CHECK (split_method IN ('EQUAL','UNEQUAL','PERCENTAGE','SHARES','ITEMIZED')) NOT VALID;
+
+ALTER TABLE expenses DROP CONSTRAINT IF EXISTS expenses_title_sane;
+ALTER TABLE expenses ADD CONSTRAINT expenses_title_sane
+    CHECK (LENGTH(TRIM(title)) BETWEEN 1 AND 200) NOT VALID;
+
+ALTER TABLE daily_expenses DROP CONSTRAINT IF EXISTS daily_expenses_category_known;
+ALTER TABLE daily_expenses ADD CONSTRAINT daily_expenses_category_known
+    CHECK (category IN ('FOOD','TRANSPORT','ACCOMMODATION','ENTERTAINMENT',
+                        'SHOPPING','HEALTH','UTILITIES','OTHER')) NOT VALID;
+
+ALTER TABLE daily_expenses DROP CONSTRAINT IF EXISTS daily_expenses_title_sane;
+ALTER TABLE daily_expenses ADD CONSTRAINT daily_expenses_title_sane
+    CHECK (LENGTH(TRIM(title)) BETWEEN 1 AND 200) NOT VALID;
+
+-- NOT VALID above: the constraints bind every future write immediately, but do
+-- not re-check rows already stored. Applying this to a live database therefore
+-- cannot fail partway on historical data — which for a schema meant to be
+-- re-run against production matters more than retroactively rejecting old rows.
