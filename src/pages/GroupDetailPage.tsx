@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { Expense, Group, GroupMember, GroupSettlement, SplitMethod, User } from '../types';
+import { Expense, Group, GroupInvitation, GroupMember, GroupSettlement, SplitMethod, User } from '../types';
 import { formatLKR, formatLKRSigned } from '../lib/currency';
 import { simplifyDebts } from '../lib/debtSimplifier';
 import { netByUser } from '../lib/balances';
@@ -13,7 +13,7 @@ import { useConfirm } from '../components/Confirm';
 import { AddExpenseModal } from './AddExpenseModal';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
 import {
-  ArrowLeft, ArrowRight, Check, Copy, Pencil, Plus, RefreshCw, Share2, Trash2, UserCheck,
+  ArrowLeft, ArrowRight, AtSign, Check, Copy, Mail, Pencil, Plus, RefreshCw, Share2, Trash2, UserCheck, X,
 } from 'lucide-react';
 
 interface GroupDetailPageProps {
@@ -41,6 +41,7 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   const [settlements, setSettlements] = useState<GroupSettlement[]>([]);
   const [balances, setBalances] = useState<Record<string, number>>({});
   const [requests, setRequests] = useState<JoinRequest[]>([]);
+  const [invitations, setInvitations] = useState<GroupInvitation[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -52,6 +53,11 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   const [copied, setCopied] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
   const [busyRequest, setBusyRequest] = useState<string | null>(null);
+
+  const [inviteEmail, setInviteEmail] = useState('');
+  const [invitingByEmail, setInvitingByEmail] = useState(false);
+  const [inviteEmailError, setInviteEmailError] = useState<string | null>(null);
+  const [cancellingInvite, setCancellingInvite] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoadError(null);
@@ -93,6 +99,15 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
         .eq('group_id', groupId)
         .eq('status', 'PENDING');
       setRequests((requestData ?? []) as unknown as JoinRequest[]);
+
+      // Same visibility rule as join requests — admin-only, quiet on failure.
+      const { data: invitationData } = await supabase
+        .from('group_invitations')
+        .select('*, inviter:users!group_invitations_invited_by_fkey(*)')
+        .eq('group_id', groupId)
+        .eq('status', 'PENDING')
+        .order('created_at', { ascending: false });
+      setInvitations((invitationData ?? []) as unknown as GroupInvitation[]);
     } catch (error) {
       setLoadError(friendlyDbError(error, 'Could not load this group.'));
     } finally {
@@ -218,6 +233,65 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   };
 
   const codeExpired = group ? new Date(group.invite_code_expires_at).getTime() < Date.now() : false;
+
+  const handleInviteByEmail = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setInviteEmailError(null);
+    setInvitingByEmail(true);
+
+    try {
+      const { data, error } = await supabase.rpc('invite_to_group_by_email', {
+        p_group_id: groupId,
+        p_email: inviteEmail.trim(),
+      });
+      if (error) throw error;
+
+      const result = (data as { out_status: string }[])?.[0];
+      switch (result?.out_status) {
+        case 'INVITED':
+          toast.success(`Invited ${inviteEmail.trim()} — they'll see it next time they sign in.`);
+          setInviteEmail('');
+          await load();
+          break;
+        case 'INVITED_PENDING_SIGNUP':
+          toast.success(`Invited ${inviteEmail.trim()}. No account yet — it'll wait for them to sign up.`);
+          setInviteEmail('');
+          await load();
+          break;
+        case 'ALREADY_MEMBER':
+          setInviteEmailError('That person is already in this group.');
+          break;
+        case 'ALREADY_INVITED':
+          setInviteEmailError('Already invited — waiting on a response.');
+          break;
+        case 'INVALID_EMAIL':
+          setInviteEmailError('Enter a valid email address.');
+          break;
+        default:
+          setInviteEmailError('Could not send the invite.');
+      }
+    } catch (error) {
+      setInviteEmailError(friendlyDbError(error, 'Could not send the invite.'));
+    } finally {
+      setInvitingByEmail(false);
+    }
+  };
+
+  const handleCancelInvitation = async (invitation: GroupInvitation) => {
+    setCancellingInvite(invitation.id);
+    try {
+      const { error } = await supabase.rpc('cancel_group_invitation', {
+        p_invitation_id: invitation.id,
+      });
+      if (error) throw error;
+      toast.info(`Invite to ${invitation.invited_email} withdrawn.`);
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not withdraw the invite.'));
+    } finally {
+      setCancellingInvite(null);
+    }
+  };
 
   if (loading) {
     return (
@@ -599,6 +673,77 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                 {regenerating ? <Spinner /> : <RefreshCw size={15} />}
                 {regenerating ? 'Generating…' : 'Generate a new code'}
               </button>
+            )}
+
+            {isAdmin && (
+              <>
+                <div className="row" style={{ margin: 'var(--sp-2) 0' }}>
+                  <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
+                  <span className="hint">or invite directly</span>
+                  <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
+                </div>
+
+                <form onSubmit={handleInviteByEmail} className="stack" style={{ textAlign: 'left' }}>
+                  <div className="input-prefixed">
+                    <span className="input-prefix" style={{ left: 14 }}>
+                      <AtSign size={15} />
+                    </span>
+                    <input
+                      type="email"
+                      className="input"
+                      style={{ paddingLeft: 40 }}
+                      placeholder="friend@email.com"
+                      value={inviteEmail}
+                      onChange={(e) => {
+                        setInviteEmail(e.target.value);
+                        setInviteEmailError(null);
+                      }}
+                      required
+                    />
+                  </div>
+                  {inviteEmailError && <Alert variant="error">{inviteEmailError}</Alert>}
+                  <button
+                    type="submit"
+                    className="btn btn-secondary btn-block"
+                    disabled={invitingByEmail || !inviteEmail.trim()}
+                  >
+                    {invitingByEmail ? <Spinner /> : <Mail size={15} />}
+                    {invitingByEmail ? 'Sending…' : 'Send invite'}
+                  </button>
+                  <span className="hint" style={{ textAlign: 'center', display: 'block' }}>
+                    They need to accept before they can see the group. If they don't have an account yet,
+                    the invite waits until they sign up with that email.
+                  </span>
+                </form>
+
+                {invitations.length > 0 && (
+                  <div className="stack-sm" style={{ textAlign: 'left', marginTop: 'var(--sp-2)' }}>
+                    <span className="label">Pending invites</span>
+                    {invitations.map((inv) => (
+                      <div key={inv.id} className="card row-between" style={{ padding: 'var(--sp-3)' }}>
+                        <span className="truncate" style={{ fontSize: '0.85rem', minWidth: 0 }}>
+                          {inv.invited_email}
+                          {!inv.invited_user_id && (
+                            <span className="hint" style={{ display: 'block' }}>
+                              waiting on signup
+                            </span>
+                          )}
+                        </span>
+                        <button
+                          type="button"
+                          className="btn-icon"
+                          style={{ width: 30, height: 30, flexShrink: 0 }}
+                          onClick={() => handleCancelInvitation(inv)}
+                          disabled={cancellingInvite === inv.id}
+                          aria-label={`Withdraw invite to ${inv.invited_email}`}
+                        >
+                          {cancellingInvite === inv.id ? <Spinner size={13} /> : <X size={14} />}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
             )}
           </div>
         </Sheet>

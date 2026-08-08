@@ -16,9 +16,13 @@ idempotent, so re-running it is safe and is the fix for most "nothing loads"
 problems.
 
 The script creates the tables, the row-level-security policies, and the
-server-side functions the app calls (`save_expense`, `update_expense`,
-`delete_expense`, `record_settlement`, `request_to_join_group`,
-`find_group_by_invite_code`, `regenerate_invite_code`).
+server-side functions the app calls: expenses and balances (`save_expense`,
+`update_expense`, `delete_expense`, `record_settlement`, `save_split_defaults`,
+`run_due_recurring`), groups (`create_group`, `request_to_join_group`,
+`find_group_by_invite_code`, `regenerate_invite_code`), and the social features
+(`invite_to_group_by_email`, `respond_to_group_invitation`,
+`cancel_group_invitation`, `send_friend_request`, `respond_to_friend_request`,
+`cancel_friend_request`, `claim_pending_invitations`).
 
 If you are upgrading an older install, this run is **required** — earlier
 policy definitions had three faults that broke core features:

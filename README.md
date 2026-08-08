@@ -64,11 +64,20 @@ npm run dev
 - **Offline mode** — installs as a real app, launches with no connection, shows your
   last-known data, and queues personal entries until you are back online.
 
+### Social
+- **Invite to a group by email** — admins enter an email; if that person already has
+  an account they see the invite next time they open the app, otherwise it is claimed
+  automatically the moment they sign up.
+- **Friend connections** — send a friend request by email, independent of any shared
+  group. Accepting either direction (yours or theirs) links the accounts and a "Friend"
+  badge appears wherever that person is shown.
+- **Invite codes** — six characters, expiring, regenerable by admins, for joining a
+  group without knowing anyone's email.
+- **Join approval** — admins approve or decline each request.
+
 ### Access
 - **Google Sign-In** and email/password, with real error messages when a provider is
   misconfigured rather than a silent bounce back to the login screen.
-- **Invite codes** — six characters, expiring, regenerable by admins.
-- **Join approval** — admins approve or decline each request.
 
 ---
 
@@ -105,7 +114,12 @@ Saving an expense touches four tables; done as four browser round trips, a failu
 midway leaves splits with no ledger entries and corrupts every balance in the group.
 `save_expense`, `update_expense`, `delete_expense` and `record_settlement` are
 `SECURITY DEFINER` functions that do the whole job in one transaction and reject a
-split set that does not reconstruct the bill total.
+split set that does not reconstruct the bill total. The same pattern covers group
+creation and the social features — `create_group`, `invite_to_group_by_email`,
+`respond_to_group_invitation`, `send_friend_request` and `respond_to_friend_request`
+are all `SECURITY DEFINER` RPCs rather than raw client-side inserts, so a status
+transition (invited → accepted, pending → friends) either fully commits or doesn't
+happen at all.
 
 **RLS membership checks go through `SECURITY DEFINER` helpers.** A policy on
 `group_members` that itself queries `group_members` makes Postgres re-enter the same

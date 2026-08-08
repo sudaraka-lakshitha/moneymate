@@ -1266,3 +1266,304 @@ DROP TRIGGER IF EXISTS on_auth_user_updated ON auth.users;
 CREATE TRIGGER on_auth_user_updated
     AFTER UPDATE ON auth.users
     FOR EACH ROW EXECUTE PROCEDURE handle_new_user();
+
+-- ========================================
+-- GROUP INVITATIONS & FRIEND CONNECTIONS
+-- ========================================
+-- Every write path below is a SECURITY DEFINER RPC rather than a table-level
+-- RLS INSERT/UPDATE policy — see create_group's comment earlier in this file
+-- for why that pattern is used throughout this project rather than relying on
+-- `column = auth.uid()`-style WITH CHECK expressions directly.
+--
+-- There is no outbound email service wired into this app. Inviting someone
+-- who has not signed up yet stores the invite by email; the moment they
+-- create an account with that address, claim_pending_invitations() links it
+-- to their new account and it becomes visible/actionable in-app. Nothing is
+-- actually emailed.
+
+-- ---- GROUP INVITATIONS (admin invites a specific person by email) ----
+CREATE TABLE IF NOT EXISTS group_invitations (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    group_id         UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    invited_email    TEXT NOT NULL,
+    invited_user_id  UUID REFERENCES users(id) ON DELETE CASCADE,
+    invited_by       UUID REFERENCES users(id) ON DELETE SET NULL,
+    status           TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'ACCEPTED', 'DECLINED', 'CANCELLED')),
+    created_at       TIMESTAMPTZ DEFAULT NOW(),
+    responded_at     TIMESTAMPTZ,
+    UNIQUE (group_id, invited_email)
+);
+
+CREATE INDEX IF NOT EXISTS idx_group_invitations_group ON group_invitations(group_id);
+CREATE INDEX IF NOT EXISTS idx_group_invitations_user  ON group_invitations(invited_user_id) WHERE invited_user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_group_invitations_email ON group_invitations(invited_email);
+
+ALTER TABLE group_invitations ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Invitee or admin can read invitations" ON group_invitations;
+CREATE POLICY "Invitee or admin can read invitations" ON group_invitations FOR SELECT
+    USING (invited_user_id = auth.uid() OR public.is_group_admin(group_id));
+
+-- ---- FRIEND REQUESTS ----
+CREATE TABLE IF NOT EXISTS friend_requests (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    requester_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    addressee_id    UUID REFERENCES users(id) ON DELETE CASCADE,
+    addressee_email TEXT NOT NULL,
+    status          TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'ACCEPTED', 'DECLINED', 'CANCELLED')),
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    responded_at    TIMESTAMPTZ,
+    UNIQUE (requester_id, addressee_email)
+);
+
+CREATE INDEX IF NOT EXISTS idx_friend_requests_requester ON friend_requests(requester_id);
+CREATE INDEX IF NOT EXISTS idx_friend_requests_addressee ON friend_requests(addressee_id) WHERE addressee_id IS NOT NULL;
+
+ALTER TABLE friend_requests ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Participants can read friend requests" ON friend_requests;
+CREATE POLICY "Participants can read friend requests" ON friend_requests FOR SELECT
+    USING (requester_id = auth.uid() OR addressee_id = auth.uid());
+
+-- Links any invitations/requests sent to my email before I had an account.
+-- Cheap and idempotent — safe to call on every login.
+CREATE OR REPLACE FUNCTION public.claim_pending_invitations()
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_email TEXT;
+BEGIN
+    IF auth.uid() IS NULL THEN RETURN; END IF;
+
+    SELECT email INTO v_email FROM users WHERE id = auth.uid();
+    IF v_email IS NULL THEN RETURN; END IF;
+
+    UPDATE group_invitations
+    SET invited_user_id = auth.uid()
+    WHERE LOWER(invited_email) = LOWER(v_email) AND invited_user_id IS NULL AND status = 'PENDING';
+
+    UPDATE friend_requests
+    SET addressee_id = auth.uid()
+    WHERE LOWER(addressee_email) = LOWER(v_email) AND addressee_id IS NULL AND status = 'PENDING';
+END;
+$$;
+
+-- Returns one of: INVALID_EMAIL, ALREADY_MEMBER, ALREADY_INVITED, INVITED, INVITED_PENDING_SIGNUP
+CREATE OR REPLACE FUNCTION public.invite_to_group_by_email(p_group_id UUID, p_email TEXT)
+RETURNS TABLE (out_status TEXT, out_invitation_id UUID)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_email         TEXT := LOWER(TRIM(p_email));
+    v_invited_user  UUID;
+    v_invitation_id UUID;
+BEGIN
+    IF NOT public.is_group_admin(p_group_id) THEN
+        RAISE EXCEPTION 'Only a group admin can invite members';
+    END IF;
+    IF v_email = '' OR v_email !~ '^[^@\s]+@[^@\s]+\.[^@\s]+$' THEN
+        RETURN QUERY SELECT 'INVALID_EMAIL'::TEXT, NULL::UUID;
+        RETURN;
+    END IF;
+
+    SELECT id INTO v_invited_user FROM users u WHERE LOWER(u.email) = v_email;
+
+    IF v_invited_user IS NOT NULL AND EXISTS (
+        SELECT 1 FROM group_members m WHERE m.group_id = p_group_id AND m.user_id = v_invited_user
+    ) THEN
+        RETURN QUERY SELECT 'ALREADY_MEMBER'::TEXT, NULL::UUID;
+        RETURN;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM group_invitations gi
+        WHERE gi.group_id = p_group_id AND gi.invited_email = v_email AND gi.status = 'PENDING'
+    ) THEN
+        RETURN QUERY SELECT 'ALREADY_INVITED'::TEXT, NULL::UUID;
+        RETURN;
+    END IF;
+
+    INSERT INTO group_invitations (group_id, invited_email, invited_user_id, invited_by)
+    VALUES (p_group_id, v_email, v_invited_user, auth.uid())
+    ON CONFLICT (group_id, invited_email) DO UPDATE
+        SET status = 'PENDING', invited_by = auth.uid(), invited_user_id = v_invited_user,
+            created_at = NOW(), responded_at = NULL
+    RETURNING id INTO v_invitation_id;
+
+    RETURN QUERY SELECT
+        (CASE WHEN v_invited_user IS NULL THEN 'INVITED_PENDING_SIGNUP' ELSE 'INVITED' END)::TEXT,
+        v_invitation_id;
+END;
+$$;
+
+-- Invitee accepts or declines. Accepting seats them as a MEMBER atomically.
+CREATE OR REPLACE FUNCTION public.respond_to_group_invitation(p_invitation_id UUID, p_accept BOOLEAN)
+RETURNS TEXT
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_invite group_invitations%ROWTYPE;
+BEGIN
+    SELECT * INTO v_invite FROM group_invitations WHERE id = p_invitation_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Invitation not found';
+    END IF;
+    IF v_invite.invited_user_id IS DISTINCT FROM auth.uid() THEN
+        RAISE EXCEPTION 'This invitation is not addressed to you';
+    END IF;
+    IF v_invite.status <> 'PENDING' THEN
+        RETURN v_invite.status;
+    END IF;
+
+    IF p_accept THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM group_members m WHERE m.group_id = v_invite.group_id AND m.user_id = auth.uid()
+        ) THEN
+            INSERT INTO group_members (group_id, user_id, role)
+            VALUES (v_invite.group_id, auth.uid(), 'MEMBER');
+        END IF;
+        UPDATE group_invitations SET status = 'ACCEPTED', responded_at = NOW() WHERE id = p_invitation_id;
+        RETURN 'ACCEPTED';
+    ELSE
+        UPDATE group_invitations SET status = 'DECLINED', responded_at = NOW() WHERE id = p_invitation_id;
+        RETURN 'DECLINED';
+    END IF;
+END;
+$$;
+
+-- Admin withdraws a still-open invitation.
+CREATE OR REPLACE FUNCTION public.cancel_group_invitation(p_invitation_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_group_id UUID;
+BEGIN
+    SELECT group_id INTO v_group_id FROM group_invitations WHERE id = p_invitation_id;
+    IF v_group_id IS NULL THEN RETURN; END IF;
+    IF NOT public.is_group_admin(v_group_id) THEN
+        RAISE EXCEPTION 'Only a group admin can cancel an invitation';
+    END IF;
+    UPDATE group_invitations SET status = 'CANCELLED', responded_at = NOW()
+    WHERE id = p_invitation_id AND status = 'PENDING';
+END;
+$$;
+
+-- Returns one of: INVALID_EMAIL, SELF, ALREADY_FRIENDS, ALREADY_PENDING, SENT,
+-- SENT_PENDING_SIGNUP, ACCEPTED_EXISTING (they had already invited me — accept
+-- theirs rather than leave two crossing requests open).
+CREATE OR REPLACE FUNCTION public.send_friend_request(p_email TEXT)
+RETURNS TABLE (out_status TEXT, out_request_id UUID)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_email      TEXT := LOWER(TRIM(p_email));
+    v_me_email   TEXT;
+    v_addressee  UUID;
+    v_reverse_id UUID;
+    v_request_id UUID;
+BEGIN
+    IF auth.uid() IS NULL THEN
+        RAISE EXCEPTION 'Not authenticated';
+    END IF;
+    IF v_email = '' OR v_email !~ '^[^@\s]+@[^@\s]+\.[^@\s]+$' THEN
+        RETURN QUERY SELECT 'INVALID_EMAIL'::TEXT, NULL::UUID;
+        RETURN;
+    END IF;
+
+    SELECT email INTO v_me_email FROM users WHERE id = auth.uid();
+    IF v_me_email IS NOT NULL AND LOWER(v_me_email) = v_email THEN
+        RETURN QUERY SELECT 'SELF'::TEXT, NULL::UUID;
+        RETURN;
+    END IF;
+
+    SELECT id INTO v_addressee FROM users u WHERE LOWER(u.email) = v_email;
+
+    IF v_addressee IS NOT NULL THEN
+        SELECT fr.id INTO v_reverse_id FROM friend_requests fr
+        WHERE fr.requester_id = v_addressee AND fr.addressee_id = auth.uid() AND fr.status = 'PENDING';
+
+        IF v_reverse_id IS NOT NULL THEN
+            UPDATE friend_requests SET status = 'ACCEPTED', responded_at = NOW() WHERE id = v_reverse_id;
+            RETURN QUERY SELECT 'ACCEPTED_EXISTING'::TEXT, v_reverse_id;
+            RETURN;
+        END IF;
+
+        -- Friendship is symmetric once accepted — check both directions,
+        -- since either party could have been the original requester.
+        IF EXISTS (
+            SELECT 1 FROM friend_requests fr
+            WHERE fr.status = 'ACCEPTED'
+              AND ((fr.requester_id = auth.uid() AND fr.addressee_id = v_addressee)
+                OR (fr.requester_id = v_addressee AND fr.addressee_id = auth.uid()))
+        ) THEN
+            RETURN QUERY SELECT 'ALREADY_FRIENDS'::TEXT, NULL::UUID;
+            RETURN;
+        END IF;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM friend_requests fr
+        WHERE fr.requester_id = auth.uid() AND fr.addressee_email = v_email AND fr.status = 'PENDING'
+    ) THEN
+        RETURN QUERY SELECT 'ALREADY_PENDING'::TEXT, NULL::UUID;
+        RETURN;
+    END IF;
+
+    INSERT INTO friend_requests (requester_id, addressee_id, addressee_email)
+    VALUES (auth.uid(), v_addressee, v_email)
+    ON CONFLICT (requester_id, addressee_email) DO UPDATE
+        SET status = 'PENDING', addressee_id = v_addressee, created_at = NOW(), responded_at = NULL
+    RETURNING id INTO v_request_id;
+
+    RETURN QUERY SELECT
+        (CASE WHEN v_addressee IS NULL THEN 'SENT_PENDING_SIGNUP' ELSE 'SENT' END)::TEXT,
+        v_request_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.respond_to_friend_request(p_request_id UUID, p_accept BOOLEAN)
+RETURNS TEXT
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_request friend_requests%ROWTYPE;
+BEGIN
+    SELECT * INTO v_request FROM friend_requests WHERE id = p_request_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Request not found';
+    END IF;
+    IF v_request.addressee_id IS DISTINCT FROM auth.uid() THEN
+        RAISE EXCEPTION 'This request is not addressed to you';
+    END IF;
+    IF v_request.status <> 'PENDING' THEN
+        RETURN v_request.status;
+    END IF;
+
+    UPDATE friend_requests
+    SET status = CASE WHEN p_accept THEN 'ACCEPTED' ELSE 'DECLINED' END, responded_at = NOW()
+    WHERE id = p_request_id;
+
+    RETURN CASE WHEN p_accept THEN 'ACCEPTED' ELSE 'DECLINED' END;
+END;
+$$;
+
+-- Requester withdraws their own still-pending outgoing request.
+CREATE OR REPLACE FUNCTION public.cancel_friend_request(p_request_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+    UPDATE friend_requests SET status = 'CANCELLED', responded_at = NOW()
+    WHERE id = p_request_id AND requester_id = auth.uid() AND status = 'PENDING';
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.claim_pending_invitations()               TO authenticated;
+GRANT EXECUTE ON FUNCTION public.invite_to_group_by_email(UUID, TEXT)      TO authenticated;
+GRANT EXECUTE ON FUNCTION public.respond_to_group_invitation(UUID, BOOLEAN) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.cancel_group_invitation(UUID)             TO authenticated;
+GRANT EXECUTE ON FUNCTION public.send_friend_request(TEXT)                 TO authenticated;
+GRANT EXECUTE ON FUNCTION public.respond_to_friend_request(UUID, BOOLEAN)  TO authenticated;
+GRANT EXECUTE ON FUNCTION public.cancel_friend_request(UUID)               TO authenticated;

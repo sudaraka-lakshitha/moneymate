@@ -1,24 +1,44 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { Group, User } from '../types';
+import { FriendRequest, Group, User } from '../types';
 import { formatLKR, formatLKRSigned } from '../lib/currency';
 import { computeFriendBalances, FriendBalanceDetail, GroupLedger, netByUser } from '../lib/balances';
 import { friendlyDbError } from '../lib/authErrors';
-import { Alert, Avatar, EmptyState, Sheet, SkeletonRows } from '../components/ui';
+import { Alert, Avatar, EmptyState, Sheet, SkeletonRows, Spinner } from '../components/ui';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
-import { Search } from 'lucide-react';
+import { useToast } from '../components/Toast';
+import { Check, Clock, UserPlus, Search, X } from 'lucide-react';
 
 interface FriendsPageProps {
   user: User;
 }
 
+/** A row shown in the list — either shared-balance data, a direct connection, or both. */
+interface DisplayFriend extends FriendBalanceDetail {
+  isConnected: boolean;
+}
+
+const emailOf = (row: FriendRequest, meId: string): string =>
+  (row.requester_id === meId ? row.addressee?.display_name : row.requester?.display_name) ||
+  row.addressee_email;
+
 export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
-  const [friends, setFriends] = useState<FriendBalanceDetail[]>([]);
+  const toast = useToast();
+
+  const [friends, setFriends] = useState<DisplayFriend[]>([]);
+  const [incoming, setIncoming] = useState<FriendRequest[]>([]);
+  const [outgoing, setOutgoing] = useState<FriendRequest[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
-  const [selected, setSelected] = useState<FriendBalanceDetail | null>(null);
+  const [selected, setSelected] = useState<DisplayFriend | null>(null);
   const [settleTarget, setSettleTarget] = useState<SettleTarget | null>(null);
+
+  const [showAdd, setShowAdd] = useState(false);
+  const [addEmail, setAddEmail] = useState('');
+  const [sending, setSending] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+  const [respondingTo, setRespondingTo] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -30,20 +50,27 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       if (membershipError) throw membershipError;
 
       const groups = (memberships ?? []).map((row: any) => row.groups).filter(Boolean) as Group[];
-      if (groups.length === 0) {
-        setFriends([]);
-        return;
-      }
-
       const groupIds = groups.map((g) => g.id);
 
-      const [memberRes, ledgerRes] = await Promise.all([
-        supabase.from('group_members').select('group_id, user_id, users(*)').in('group_id', groupIds),
-        supabase.from('ledger_entries').select('group_id, user_id, amount').in('group_id', groupIds),
+      const [memberRes, ledgerRes, requestRes] = await Promise.all([
+        groupIds.length > 0
+          ? supabase.from('group_members').select('group_id, user_id, users(*)').in('group_id', groupIds)
+          : Promise.resolve({ data: [], error: null }),
+        groupIds.length > 0
+          ? supabase.from('ledger_entries').select('group_id, user_id, amount').in('group_id', groupIds)
+          : Promise.resolve({ data: [], error: null }),
+        supabase
+          .from('friend_requests')
+          .select(
+            '*, requester:users!friend_requests_requester_id_fkey(*), addressee:users!friend_requests_addressee_id_fkey(*)'
+          )
+          .or(`requester_id.eq.${user.id},addressee_id.eq.${user.id}`)
+          .in('status', ['PENDING', 'ACCEPTED']),
       ]);
 
       if (memberRes.error) throw memberRes.error;
       if (ledgerRes.error) throw ledgerRes.error;
+      if (requestRes.error) throw requestRes.error;
 
       const ledgers: GroupLedger[] = groups.map((group) => ({
         groupId: group.id,
@@ -56,9 +83,40 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
         ),
       }));
 
-      setFriends(computeFriendBalances(ledgers, user.id));
+      const balanceFriends = computeFriendBalances(ledgers, user.id);
+      const requests = (requestRes.data ?? []) as unknown as FriendRequest[];
+
+      const accepted = requests.filter((r) => r.status === 'ACCEPTED');
+      const connectedIds = new Set(
+        accepted.map((r) => (r.requester_id === user.id ? r.addressee_id : r.requester_id)).filter(Boolean)
+      );
+
+      const merged: DisplayFriend[] = balanceFriends.map((f) => ({
+        ...f,
+        isConnected: connectedIds.has(f.friend.id),
+      }));
+
+      // Connected friends with no shared group show up here too, at zero balance.
+      for (const row of accepted) {
+        const friendUser = row.requester_id === user.id ? row.addressee : row.requester;
+        if (!friendUser || merged.some((m) => m.friend.id === friendUser.id)) continue;
+        merged.push({
+          friend: friendUser,
+          net_balance: 0,
+          total_they_owe_me: 0,
+          total_i_owe_them: 0,
+          shared_group_count: 0,
+          perGroup: [],
+          isConnected: true,
+        });
+      }
+
+      merged.sort((a, b) => Math.abs(b.net_balance) - Math.abs(a.net_balance));
+      setFriends(merged);
+      setIncoming(requests.filter((r) => r.status === 'PENDING' && r.addressee_id === user.id));
+      setOutgoing(requests.filter((r) => r.status === 'PENDING' && r.requester_id === user.id));
     } catch (err) {
-      setError(friendlyDbError(err, 'Could not load friend balances.'));
+      setError(friendlyDbError(err, 'Could not load your friends.'));
     } finally {
       setLoading(false);
     }
@@ -84,6 +142,94 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
 
   const isPositive = totals.net >= 0;
 
+  const handleSendRequest = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAddError(null);
+    setSending(true);
+
+    try {
+      const { data, error: rpcError } = await supabase.rpc('send_friend_request', {
+        p_email: addEmail.trim(),
+      });
+      if (rpcError) throw rpcError;
+
+      const result = (data as { out_status: string }[])?.[0];
+      switch (result?.out_status) {
+        case 'SENT':
+          toast.success('Friend request sent.');
+          setShowAdd(false);
+          setAddEmail('');
+          await load();
+          break;
+        case 'SENT_PENDING_SIGNUP':
+          toast.success("Sent — they'll see it once they sign up with that email.");
+          setShowAdd(false);
+          setAddEmail('');
+          await load();
+          break;
+        case 'ACCEPTED_EXISTING':
+          toast.success("You're now friends — they had already added you!");
+          setShowAdd(false);
+          setAddEmail('');
+          await load();
+          break;
+        case 'ALREADY_FRIENDS':
+          setAddError("You're already friends with them.");
+          break;
+        case 'ALREADY_PENDING':
+          setAddError('Already sent — waiting on a response.');
+          break;
+        case 'SELF':
+          setAddError("That's your own email.");
+          break;
+        case 'INVALID_EMAIL':
+          setAddError('Enter a valid email address.');
+          break;
+        default:
+          setAddError('Could not send the request.');
+      }
+    } catch (err) {
+      setAddError(friendlyDbError(err, 'Could not send the request.'));
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const handleRespond = async (request: FriendRequest, accept: boolean) => {
+    setRespondingTo(request.id);
+    try {
+      const { error: rpcError } = await supabase.rpc('respond_to_friend_request', {
+        p_request_id: request.id,
+        p_accept: accept,
+      });
+      if (rpcError) throw rpcError;
+      toast[accept ? 'success' : 'info'](
+        accept ? `You and ${request.requester?.display_name ?? 'they'} are now friends.` : 'Request declined.'
+      );
+      await load();
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not respond to the request.'));
+    } finally {
+      setRespondingTo(null);
+    }
+  };
+
+  const handleCancel = async (request: FriendRequest) => {
+    setRespondingTo(request.id);
+    try {
+      const { error: rpcError } = await supabase.rpc('cancel_friend_request', {
+        p_request_id: request.id,
+      });
+      if (rpcError) throw rpcError;
+      toast.info('Request withdrawn.');
+      await load();
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not withdraw the request.'));
+    } finally {
+      setRespondingTo(null);
+    }
+  };
+
   return (
     <div className="page">
       <header className="page-header">
@@ -91,11 +237,75 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
           <h1 className="page-title">Friends</h1>
           <p className="page-subtitle">What you owe, and what you are owed</p>
         </div>
+        <button type="button" className="btn btn-primary btn-sm" onClick={() => setShowAdd(true)}>
+          <UserPlus size={15} /> Add
+        </button>
       </header>
 
       {error && (
         <div style={{ marginBottom: 'var(--sp-4)' }}>
           <Alert variant="error">{error}</Alert>
+        </div>
+      )}
+
+      {incoming.length > 0 && (
+        <div className="stack-sm" style={{ marginBottom: 'var(--sp-5)' }}>
+          <span className="label">
+            {incoming.length} friend request{incoming.length === 1 ? '' : 's'}
+          </span>
+          {incoming.map((req) => (
+            <div key={req.id} className="card row">
+              <Avatar name={req.requester?.display_name} url={req.requester?.avatar_url} size={40} />
+              <span className="grow truncate" style={{ fontWeight: 700, fontSize: '0.9rem' }}>
+                {req.requester?.display_name ?? req.addressee_email}
+              </span>
+              <span className="row" style={{ gap: 6, flexShrink: 0 }}>
+                <button
+                  type="button"
+                  className="btn-icon"
+                  style={{ width: 32, height: 32 }}
+                  onClick={() => handleRespond(req, false)}
+                  disabled={respondingTo === req.id}
+                  aria-label="Decline"
+                >
+                  <X size={15} />
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  onClick={() => handleRespond(req, true)}
+                  disabled={respondingTo === req.id}
+                >
+                  {respondingTo === req.id ? <Spinner /> : <Check size={14} />}
+                  Accept
+                </button>
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {outgoing.length > 0 && (
+        <div className="stack-sm" style={{ marginBottom: 'var(--sp-5)' }}>
+          <span className="label">Waiting on a response</span>
+          {outgoing.map((req) => (
+            <div key={req.id} className="card row">
+              <span className="icon-tile" style={{ width: 40, height: 40 }}>
+                <Clock size={16} color="var(--on-surface-variant)" />
+              </span>
+              <span className="grow truncate" style={{ fontSize: '0.9rem' }}>
+                {emailOf(req, user.id)}
+              </span>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={() => handleCancel(req)}
+                disabled={respondingTo === req.id}
+              >
+                {respondingTo === req.id ? <Spinner /> : 'Cancel'}
+              </button>
+            </div>
+          ))}
         </div>
       )}
 
@@ -153,7 +363,14 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
           text={
             search
               ? 'Try a different name.'
-              : 'Join a group and split a bill — everyone you share a group with shows up here.'
+              : 'Add a friend by email, or join a group and split a bill — everyone you share a group with shows up here.'
+          }
+          action={
+            !search && (
+              <button type="button" className="btn btn-primary" onClick={() => setShowAdd(true)}>
+                <UserPlus size={15} /> Add a friend
+              </button>
+            )
           }
         />
       ) : (
@@ -169,11 +386,16 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
               >
                 <Avatar name={friend.friend.display_name} url={friend.friend.avatar_url} size={42} />
                 <span className="grow" style={{ minWidth: 0 }}>
-                  <span className="truncate" style={{ display: 'block', fontWeight: 700, fontSize: '0.93rem' }}>
-                    {friend.friend.display_name}
+                  <span className="row" style={{ gap: 5 }}>
+                    <span className="truncate" style={{ fontWeight: 700, fontSize: '0.93rem' }}>
+                      {friend.friend.display_name}
+                    </span>
+                    {friend.isConnected && <span className="badge badge-info">Friend</span>}
                   </span>
                   <span className="hint">
-                    {friend.shared_group_count} shared group{friend.shared_group_count === 1 ? '' : 's'}
+                    {friend.shared_group_count > 0
+                      ? `${friend.shared_group_count} shared group${friend.shared_group_count === 1 ? '' : 's'}`
+                      : 'No shared groups yet'}
                   </span>
                 </span>
                 <span style={{ textAlign: 'right', flexShrink: 0 }}>
@@ -198,6 +420,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
           <div className="stack">
             <div className="row" style={{ justifyContent: 'center', flexDirection: 'column', gap: 'var(--sp-2)' }}>
               <Avatar name={selected.friend.display_name} url={selected.friend.avatar_url} size={64} />
+              {selected.isConnected && <span className="badge badge-info">Friend</span>}
               <span
                 className={`amount-lg tabular ${
                   Math.abs(selected.net_balance) < 0.01
@@ -219,7 +442,15 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
             </div>
 
             {selected.perGroup.length === 0 ? (
-              <EmptyState icon="✅" title="Nothing outstanding" text="No open balances with this friend." />
+              <EmptyState
+                icon="✅"
+                title="Nothing outstanding"
+                text={
+                  selected.shared_group_count === 0
+                    ? 'You are connected, but have not shared a group or bill yet.'
+                    : 'No open balances with this friend.'
+                }
+              />
             ) : (
               <>
                 <span className="label label-block">Breakdown by group</span>
@@ -278,6 +509,40 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
             void load();
           }}
         />
+      )}
+
+      {showAdd && (
+        <Sheet
+          title="Add a friend"
+          onClose={() => {
+            setShowAdd(false);
+            setAddError(null);
+          }}
+        >
+          <form onSubmit={handleSendRequest} className="stack">
+            <p className="text-muted" style={{ fontSize: '0.87rem' }}>
+              Enter their email. If they're already on MoneyMate, they'll get a request to accept. If not,
+              it'll wait and connect automatically the moment they sign up with that address.
+            </p>
+            <input
+              type="email"
+              className="input"
+              placeholder="friend@email.com"
+              value={addEmail}
+              onChange={(e) => {
+                setAddEmail(e.target.value);
+                setAddError(null);
+              }}
+              autoFocus
+              required
+            />
+            {addError && <Alert variant="error">{addError}</Alert>}
+            <button type="submit" className="btn btn-primary btn-block btn-lg" disabled={sending || !addEmail.trim()}>
+              {sending && <Spinner />}
+              {sending ? 'Sending…' : 'Send friend request'}
+            </button>
+          </form>
+        </Sheet>
       )}
     </div>
   );

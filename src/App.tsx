@@ -128,6 +128,11 @@ const AppShell: React.FC = () => {
       if (existing) {
         setUser(existing as User);
         setProfileError(null);
+        // Links any group invites / friend requests sent to this email before
+        // the account existed. Best-effort — never blocks sign-in on it.
+        void supabase.rpc('claim_pending_invitations').then(({ error: claimError }) => {
+          if (claimError) console.error('claim_pending_invitations failed:', claimError);
+        });
         return;
       }
 
@@ -147,6 +152,9 @@ const AppShell: React.FC = () => {
       if (insertError) throw insertError;
       setUser(created as User);
       setProfileError(null);
+      void supabase.rpc('claim_pending_invitations').then(({ error: claimError }) => {
+        if (claimError) console.error('claim_pending_invitations failed:', claimError);
+      });
     } catch (error) {
       // Still let the user in with what the token tells us, so a profile
       // hiccup does not lock them out of the whole app.
