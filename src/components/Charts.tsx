@@ -337,3 +337,92 @@ export const Legend: React.FC<{ items: { label: string; color: string }[] }> = (
     ))}
   </div>
 );
+
+/* ------------------------------------------------------------------ Donut */
+
+export interface PieDatum {
+  label: string;
+  value: number;
+  color: string;
+}
+
+/**
+ * Donut rather than a full pie: the hole carries the total, which is the number
+ * people look for first, and the arc lengths still read as fractions.
+ *
+ * Drawn with stroke-dasharray on circles instead of arc paths — no trig, no
+ * large-arc-flag edge case at exactly half, and a single-slice chart renders as
+ * a clean ring instead of a degenerate path.
+ */
+export const DonutChart: React.FC<{
+  data: PieDatum[];
+  total: number;
+  size?: number;
+  centerLabel?: string;
+}> = ({ data, total, size = 168, centerLabel }) => {
+  const stroke = Math.round(size * 0.16);
+  const radius = (size - stroke) / 2;
+  const circumference = 2 * Math.PI * radius;
+
+  if (total <= 0) {
+    return (
+      <svg width={size} height={size} role="img" aria-label="Nothing to show yet">
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          fill="none"
+          stroke="var(--card-border)"
+          strokeWidth={stroke}
+        />
+      </svg>
+    );
+  }
+
+  let offset = 0;
+
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox={`0 0 ${size} ${size}`}
+      role="img"
+      aria-label={data.map((d) => `${d.label} ${Math.round((d.value / total) * 100)}%`).join(', ')}
+    >
+      <g transform={`rotate(-90 ${size / 2} ${size / 2})`}>
+        {data.map((slice) => {
+          const fraction = slice.value / total;
+          const length = fraction * circumference;
+          const dash = `${length} ${circumference - length}`;
+          const el = (
+            <circle
+              key={slice.label}
+              cx={size / 2}
+              cy={size / 2}
+              r={radius}
+              fill="none"
+              stroke={slice.color}
+              strokeWidth={stroke}
+              strokeDasharray={dash}
+              strokeDashoffset={-offset}
+            />
+          );
+          offset += length;
+          return el;
+        })}
+      </g>
+
+      {centerLabel && (
+        <text
+          x="50%"
+          y="50%"
+          textAnchor="middle"
+          dominantBaseline="central"
+          style={{ fontSize: size * 0.13, fontWeight: 800, fill: 'var(--on-surface)' }}
+        >
+          {centerLabel}
+        </text>
+      )}
+    </svg>
+  );
+};

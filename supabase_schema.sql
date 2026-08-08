@@ -2932,3 +2932,259 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION public.record_payment_received(UUID, UUID, DECIMAL, TEXT, TEXT) TO authenticated;
+
+-- ========================================
+-- REMOVING A FRIEND
+-- ========================================
+-- Refused while money is still between you. The connection is what makes the
+-- pair's records reachable from the Friends screen, so dropping it mid-debt
+-- would leave a live balance with no obvious way back to it.
+CREATE OR REPLACE FUNCTION public.remove_friend(p_friend_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me      UUID := auth.uid();
+    v_group   UUID;
+    v_balance DECIMAL := 0;
+BEGIN
+    IF v_me IS NULL THEN
+        RAISE EXCEPTION 'Not authenticated';
+    END IF;
+
+    -- Any direct ledger between the two of them must be square first.
+    SELECT g.id INTO v_group
+    FROM groups g
+    WHERE g.is_direct
+      AND EXISTS (SELECT 1 FROM group_members m WHERE m.group_id = g.id AND m.user_id = v_me)
+      AND EXISTS (SELECT 1 FROM group_members m WHERE m.group_id = g.id AND m.user_id = p_friend_id)
+      AND (SELECT COUNT(*) FROM group_members m WHERE m.group_id = g.id) = 2
+    LIMIT 1;
+
+    IF v_group IS NOT NULL THEN
+        v_balance := public.member_balance(v_group, v_me);
+        IF ABS(v_balance) >= 0.01 THEN
+            RAISE EXCEPTION 'Settle up before removing this friend (currently %)', v_balance;
+        END IF;
+    END IF;
+
+    DELETE FROM friend_requests
+    WHERE (requester_id = v_me AND addressee_id = p_friend_id)
+       OR (requester_id = p_friend_id AND addressee_id = v_me);
+
+    -- A pin is meaningless once the connection is gone.
+    DELETE FROM friend_pins
+    WHERE (user_id = v_me AND friend_id = p_friend_id)
+       OR (user_id = p_friend_id AND friend_id = v_me);
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.remove_friend(UUID) TO authenticated;
+
+-- ========================================
+-- PER-PERSON STATS OPT-IN
+-- ========================================
+-- Shared spending no longer lands in anyone's personal statistics by default.
+-- Each participant decides, for each expense, whether their own share counts
+-- toward their own totals.
+--
+-- This is only ever about statistics. It does not touch the ledger, the split,
+-- or whether the expense exists: anybody may still add a bill that includes
+-- somebody else, and the money side is unaffected either way. The choice is
+-- purely "does this show up in my spending charts".
+--
+--   NULL  = not decided yet, so not counted, and surfaced for confirmation
+--   TRUE  = counts toward my stats
+--   FALSE = deliberately excluded
+ALTER TABLE expense_splits ADD COLUMN IF NOT EXISTS include_in_stats BOOLEAN;
+
+CREATE INDEX IF NOT EXISTS idx_splits_stats_pending
+    ON expense_splits(user_id) WHERE include_in_stats IS NULL;
+
+-- Answer the question for one expense, for yourself only.
+CREATE OR REPLACE FUNCTION public.set_split_stats_choice(p_expense_id UUID, p_include BOOLEAN)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+    IF auth.uid() IS NULL THEN
+        RAISE EXCEPTION 'Not authenticated';
+    END IF;
+
+    UPDATE expense_splits
+    SET include_in_stats = p_include
+    WHERE expense_id = p_expense_id
+      AND user_id = auth.uid();
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'You have no share in that expense';
+    END IF;
+END;
+$$;
+
+-- Decide everything outstanding in one go.
+CREATE OR REPLACE FUNCTION public.set_all_pending_stats_choices(p_include BOOLEAN)
+RETURNS INT
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_count INT;
+BEGIN
+    UPDATE expense_splits
+    SET include_in_stats = p_include
+    WHERE user_id = auth.uid()
+      AND include_in_stats IS NULL;
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.set_split_stats_choice(UUID, BOOLEAN)   TO authenticated;
+GRANT EXECUTE ON FUNCTION public.set_all_pending_stats_choices(BOOLEAN)  TO authenticated;
+
+-- ========================================
+-- GROUP CONTRIBUTION STATS
+-- ========================================
+-- Who actually fronted the money for this group, and how much of the total each
+-- person carried. `paid` is what they put in on everyone's behalf, which is what
+-- the pie divides; `share` is what was theirs to pay; `net` is the difference and
+-- matches their balance before any settlements.
+--
+-- Settlements are excluded on purpose: paying somebody back is not spending on
+-- the group's behalf, and folding it in would make the fractions meaningless.
+CREATE OR REPLACE FUNCTION public.group_contribution_stats(p_group_id UUID)
+RETURNS TABLE (
+    out_user_id     UUID,
+    out_display_name TEXT,
+    out_avatar_url  TEXT,
+    out_paid        DECIMAL,
+    out_share       DECIMAL,
+    out_net         DECIMAL,
+    out_expenses    INT
+)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+    WITH paid AS (
+        SELECT e.paid_by AS user_id,
+               SUM(e.amount)  AS total,
+               COUNT(*)::INT  AS cnt
+        FROM expenses e
+        WHERE e.group_id = p_group_id AND NOT e.is_deleted
+        GROUP BY e.paid_by
+    ),
+    owed AS (
+        SELECT s.user_id, SUM(s.amount) AS total
+        FROM expense_splits s
+        JOIN expenses e ON e.id = s.expense_id
+        WHERE e.group_id = p_group_id AND NOT e.is_deleted AND s.is_included
+        GROUP BY s.user_id
+    )
+    SELECT
+        m.user_id,
+        COALESCE(u.display_name, 'Member'),
+        u.avatar_url,
+        ROUND(COALESCE(p.total, 0), 2),
+        ROUND(COALESCE(o.total, 0), 2),
+        ROUND(COALESCE(p.total, 0) - COALESCE(o.total, 0), 2),
+        COALESCE(p.cnt, 0)
+    FROM group_members m
+    LEFT JOIN users u ON u.id = m.user_id
+    LEFT JOIN paid  p ON p.user_id = m.user_id
+    LEFT JOIN owed  o ON o.user_id = m.user_id
+    WHERE m.group_id = p_group_id
+      AND public.is_group_member(p_group_id)
+    ORDER BY COALESCE(p.total, 0) DESC;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.group_contribution_stats(UUID) TO authenticated;
+
+-- write_expense_rows re-defined to record the stats choice as it writes splits.
+--
+-- The person entering the bill answers for themselves in the form, so their own
+-- choice arrives on their split as `stats`. Everyone else is left NULL — undecided
+-- — because nobody should have their personal statistics changed by a bill
+-- somebody else typed. The expense itself is still created for all of them; only
+-- the charts wait for consent.
+CREATE OR REPLACE FUNCTION public.write_expense_rows(
+    p_expense_id UUID,
+    p_group_id   UUID,
+    p_title      TEXT,
+    p_amount     DECIMAL,
+    p_paid_by    UUID,
+    p_splits     JSONB,
+    p_items      JSONB
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_split       JSONB;
+    v_item        JSONB;
+    v_split_total DECIMAL(14,2) := 0;
+    v_negatives   INT := 0;
+BEGIN
+    SELECT COUNT(*) INTO v_negatives
+    FROM jsonb_array_elements(p_splits) s
+    WHERE COALESCE((s->>'amount')::DECIMAL, 0) < 0;
+
+    IF v_negatives > 0 THEN
+        RAISE EXCEPTION 'A split cannot be a negative amount';
+    END IF;
+
+    SELECT COALESCE(SUM((s->>'amount')::DECIMAL), 0) INTO v_split_total
+    FROM jsonb_array_elements(p_splits) s
+    WHERE (s->>'is_included')::BOOLEAN;
+
+    IF ROUND(v_split_total, 2) <> ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Split total (%) does not equal the expense amount (%)', v_split_total, p_amount;
+    END IF;
+
+    INSERT INTO expense_splits (expense_id, user_id, is_included, amount, percentage, shares, include_in_stats)
+    SELECT
+        p_expense_id,
+        (s->>'user_id')::UUID,
+        COALESCE((s->>'is_included')::BOOLEAN, TRUE),
+        COALESCE((s->>'amount')::DECIMAL, 0),
+        COALESCE((s->>'percentage')::DECIMAL, 0),
+        COALESCE((s->>'shares')::INT, 1),
+        CASE
+            WHEN (s->>'user_id')::UUID = auth.uid() THEN (s->>'stats')::BOOLEAN
+            ELSE NULL
+        END
+    FROM jsonb_array_elements(p_splits) s;
+
+    IF jsonb_array_length(COALESCE(p_items, '[]'::jsonb)) > 0 THEN
+        FOR v_item IN SELECT * FROM jsonb_array_elements(p_items) LOOP
+            INSERT INTO expense_items (expense_id, name, amount, shared_by)
+            VALUES (
+                p_expense_id,
+                v_item->>'name',
+                (v_item->>'amount')::DECIMAL,
+                COALESCE(
+                    (SELECT ARRAY_AGG(value::TEXT::UUID)
+                     FROM jsonb_array_elements_text(v_item->'shared_by') AS value),
+                    '{}'::UUID[]
+                )
+            );
+        END LOOP;
+    END IF;
+
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    VALUES (p_group_id, p_paid_by, 'EXPENSE', p_amount, p_expense_id, 'Paid for ' || p_title);
+
+    FOR v_split IN SELECT * FROM jsonb_array_elements(p_splits) LOOP
+        IF COALESCE((v_split->>'is_included')::BOOLEAN, FALSE)
+           AND COALESCE((v_split->>'amount')::DECIMAL, 0) > 0 THEN
+            INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+            VALUES (
+                p_group_id,
+                (v_split->>'user_id')::UUID,
+                'SPLIT',
+                -(v_split->>'amount')::DECIMAL,
+                p_expense_id,
+                'Share of ' || p_title
+            );
+        END IF;
+    END LOOP;
+END;
+$$;
