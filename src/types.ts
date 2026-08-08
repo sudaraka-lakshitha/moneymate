@@ -16,6 +16,11 @@ export interface Group {
   status: 'ACTIVE' | 'SETTLING' | 'SETTLED';
   current_cycle_id?: string;
   created_at: string;
+  /** Set when hidden from the main list; null means active. Reversible. */
+  archived_at?: string | null;
+  archived_by?: string | null;
+  /** Last time the group's financial history was permanently cleared. */
+  purged_at?: string | null;
   /** Saved split arrangement, applied to each new bill. */
   default_split_method?: SplitMethod;
   /** Derived client-side. */

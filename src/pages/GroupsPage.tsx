@@ -5,7 +5,7 @@ import { formatLKRSigned } from '../lib/currency';
 import { friendlyDbError } from '../lib/authErrors';
 import { Alert, EmptyState, Sheet, SkeletonRows, Spinner } from '../components/ui';
 import { useToast } from '../components/Toast';
-import { Check, Plus, Search, Users2, X } from 'lucide-react';
+import { Archive, Check, Plus, Search, Users2, X } from 'lucide-react';
 
 interface GroupsPageProps {
   user: User;
@@ -25,6 +25,7 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
 
   const [showCreate, setShowCreate] = useState(false);
   const [showJoin, setShowJoin] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
 
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -212,12 +213,16 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
     }
   };
 
+  // Archived groups stay out of the way until asked for, but are never lost.
+  const archivedCount = groups.filter((g) => g.archived_at).length;
+  const visibleGroups = showArchived ? groups : groups.filter((g) => !g.archived_at);
+
   return (
     <div className="page">
       <header className="page-header">
         <div>
           <h1 className="page-title">Groups</h1>
-          <p className="page-subtitle">{groups.length} active</p>
+          <p className="page-subtitle">{groups.length - archivedCount} active</p>
         </div>
         <div className="row" style={{ gap: 'var(--sp-2)' }}>
           <button type="button" className="btn btn-secondary btn-sm" onClick={() => setShowJoin(true)}>
@@ -276,9 +281,21 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
         </div>
       )}
 
+      {archivedCount > 0 && (
+        <button
+          type="button"
+          className="btn btn-ghost btn-sm"
+          style={{ marginBottom: 'var(--sp-3)' }}
+          onClick={() => setShowArchived((current) => !current)}
+        >
+          <Archive size={14} />
+          {showArchived ? 'Hide' : 'Show'} {archivedCount} archived
+        </button>
+      )}
+
       {loading ? (
         <SkeletonRows count={3} height={82} />
-      ) : groups.length === 0 ? (
+      ) : visibleGroups.length === 0 ? (
         <EmptyState
           icon="👥"
           title="No groups yet"
@@ -296,7 +313,7 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
         />
       ) : (
         <div className="stack">
-          {groups.map((group) => {
+          {visibleGroups.map((group) => {
             const balance = balances[group.id] ?? 0;
             const settled = Math.abs(balance) < 0.01;
             return (
@@ -305,6 +322,7 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
                 type="button"
                 className="card card-interactive row"
                 onClick={() => onNavigate(`group-detail/${group.id}`)}
+                style={group.archived_at ? { opacity: 0.6 } : undefined}
               >
                 <span
                   className="icon-tile"
@@ -313,8 +331,11 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
                   {group.icon_emoji}
                 </span>
                 <span className="grow" style={{ minWidth: 0 }}>
-                  <span className="truncate" style={{ display: 'block', fontWeight: 700, fontSize: '0.98rem' }}>
-                    {group.name}
+                  <span className="row" style={{ gap: 5 }}>
+                    <span className="truncate" style={{ fontWeight: 700, fontSize: '0.98rem' }}>
+                      {group.name}
+                    </span>
+                    {group.archived_at && <span className="badge">Archived</span>}
                   </span>
                   <span className="hint">
                     Code <strong style={{ color: 'var(--primary-light)', letterSpacing: 1 }}>{group.invite_code}</strong>
