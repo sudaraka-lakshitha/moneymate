@@ -35,7 +35,11 @@ export const HomePage: React.FC<HomePageProps> = ({ user, onNavigate }) => {
       if (membershipError) throw membershipError;
 
       const myGroups = (memberships ?? []).map((row: any) => row.groups).filter(Boolean) as Group[];
-      setGroups(myGroups);
+
+      // Direct 1:1 groups back friend loans. They must stay in the balance
+      // maths below — a loan is real money — but they are not groups you browse,
+      // so they are kept out of the "Your groups" list.
+      setGroups(myGroups.filter((g) => !g.is_direct));
 
       const groupIds = myGroups.map((g) => g.id);
 

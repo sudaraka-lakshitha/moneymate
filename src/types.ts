@@ -21,6 +21,11 @@ export interface Group {
   archived_by?: string | null;
   /** Last time the group's financial history was permanently cleared. */
   purged_at?: string | null;
+  /**
+   * A hidden one-to-one group backing direct loans between two friends. Kept
+   * out of the Groups list — it is a ledger, not somewhere you add bills.
+   */
+  is_direct?: boolean;
   /** Saved split arrangement, applied to each new bill. */
   default_split_method?: SplitMethod;
   /** Derived client-side. */

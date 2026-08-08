@@ -49,7 +49,12 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
 
       if (error) throw error;
 
-      const list = (data ?? []).map((row: any) => row.groups).filter(Boolean) as Group[];
+      // Direct 1:1 groups back friend-to-friend loans and belong on the Friends
+      // screen, not here — they are a ledger, not somewhere you add bills.
+      const list = (data ?? [])
+        .map((row: any) => row.groups)
+        .filter(Boolean)
+        .filter((g: Group) => !g.is_direct) as Group[];
       list.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
       setGroups(list);
 
