@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
+import { useLiveRefresh } from '../lib/realtime';
 import { Group, GroupInvitation, InviteLookup, User } from '../types';
 import { formatLKRSigned } from '../lib/currency';
 import { friendlyDbError } from '../lib/authErrors';
@@ -89,6 +90,8 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
   useEffect(() => {
     void loadGroups();
   }, [loadGroups]);
+
+  useLiveRefresh('groups', ['groups','group_members','ledger_entries','group_invitations'], loadGroups);
 
   const handleRespondToInvitation = async (invitation: GroupInvitation, accept: boolean) => {
     setRespondingTo(invitation.id);

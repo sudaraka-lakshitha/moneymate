@@ -3188,3 +3188,187 @@ BEGIN
     END LOOP;
 END;
 $$;
+
+-- ========================================
+-- INVITING A FRIEND STRAIGHT INTO A GROUP
+-- ========================================
+-- Same outcome as invite_to_group_by_email, but picked from your friends list
+-- instead of retyping an address you already have on file. It still creates an
+-- invitation rather than seating them: being added to a group means seeing
+-- everybody's spending, which is not something to do to someone silently.
+CREATE OR REPLACE FUNCTION public.invite_friend_to_group(p_group_id UUID, p_friend_id UUID)
+RETURNS TABLE (out_status TEXT, out_invitation_id UUID)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me    UUID := auth.uid();
+    v_email TEXT;
+    v_id    UUID;
+BEGIN
+    IF NOT public.is_group_admin(p_group_id) THEN
+        RAISE EXCEPTION 'Only a group admin can invite people';
+    END IF;
+
+    -- Must actually be a friend; this is not a back door to inviting strangers
+    -- by guessing user ids.
+    IF NOT EXISTS (
+        SELECT 1 FROM friend_requests fr
+        WHERE fr.status = 'ACCEPTED'
+          AND ((fr.requester_id = v_me AND fr.addressee_id = p_friend_id)
+            OR (fr.requester_id = p_friend_id AND fr.addressee_id = v_me))
+    ) THEN
+        RAISE EXCEPTION 'You are not connected to that person';
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM group_members WHERE group_id = p_group_id AND user_id = p_friend_id) THEN
+        RETURN QUERY SELECT 'ALREADY_MEMBER'::TEXT, NULL::UUID;
+        RETURN;
+    END IF;
+
+    SELECT email INTO v_email FROM users WHERE id = p_friend_id;
+
+    SELECT id INTO v_id FROM group_invitations
+    WHERE group_id = p_group_id AND invited_user_id = p_friend_id AND status = 'PENDING';
+
+    IF v_id IS NOT NULL THEN
+        RETURN QUERY SELECT 'ALREADY_INVITED'::TEXT, v_id;
+        RETURN;
+    END IF;
+
+    INSERT INTO group_invitations (group_id, invited_email, invited_user_id, invited_by, status)
+    VALUES (p_group_id, LOWER(COALESCE(v_email, '')), p_friend_id, v_me, 'PENDING')
+    ON CONFLICT (group_id, invited_email) DO UPDATE
+        SET status = 'PENDING', invited_user_id = EXCLUDED.invited_user_id,
+            invited_by = EXCLUDED.invited_by, created_at = NOW(), responded_at = NULL
+    RETURNING id INTO v_id;
+
+    RETURN QUERY SELECT 'INVITED'::TEXT, v_id;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.invite_friend_to_group(UUID, UUID) TO authenticated;
+
+-- ========================================
+-- DELETING YOUR ACCOUNT
+-- ========================================
+-- Refused while you are up or down in any group. Deleting an account mid-debt
+-- would erase one side of a balance that other people are still counting on,
+-- and the ledger has no way to represent a person who no longer exists.
+--
+-- Sole-admin groups are handed over the same way leave_group does it, so a
+-- group is never orphaned; a group left with nobody in it is removed.
+CREATE OR REPLACE FUNCTION public.delete_my_account()
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me   UUID := auth.uid();
+    v_gid  UUID;
+    v_heir UUID;
+    v_bal  DECIMAL;
+BEGIN
+    IF v_me IS NULL THEN
+        RAISE EXCEPTION 'Not authenticated';
+    END IF;
+
+    FOR v_gid IN SELECT group_id FROM group_members WHERE user_id = v_me LOOP
+        v_bal := public.member_balance(v_gid, v_me);
+        IF ABS(v_bal) >= 0.01 THEN
+            RAISE EXCEPTION
+                'Settle every balance before deleting your account (% outstanding in one of your groups)', v_bal;
+        END IF;
+    END LOOP;
+
+    -- Step out of every group, handing over or cleaning up as needed.
+    FOR v_gid IN SELECT group_id FROM group_members WHERE user_id = v_me LOOP
+        DELETE FROM group_members WHERE group_id = v_gid AND user_id = v_me;
+
+        IF NOT EXISTS (SELECT 1 FROM group_members WHERE group_id = v_gid) THEN
+            DELETE FROM groups WHERE id = v_gid;
+        ELSIF NOT EXISTS (SELECT 1 FROM group_members WHERE group_id = v_gid AND role = 'ADMIN') THEN
+            SELECT user_id INTO v_heir FROM group_members
+            WHERE group_id = v_gid ORDER BY joined_at ASC LIMIT 1;
+            UPDATE group_members SET role = 'ADMIN' WHERE group_id = v_gid AND user_id = v_heir;
+        END IF;
+    END LOOP;
+
+    DELETE FROM friend_requests WHERE requester_id = v_me OR addressee_id = v_me;
+    DELETE FROM friend_pins     WHERE user_id = v_me OR friend_id = v_me;
+    DELETE FROM group_invitations WHERE invited_user_id = v_me OR invited_by = v_me;
+    DELETE FROM group_join_requests WHERE user_id = v_me;
+    DELETE FROM recurring_expenses WHERE user_id = v_me;
+    DELETE FROM budgets            WHERE user_id = v_me;
+    DELETE FROM daily_expenses     WHERE user_id = v_me;
+
+    DELETE FROM users WHERE id = v_me;
+
+    -- Removing the auth row is what actually revokes the login. Guarded because
+    -- the local test harness stands in for the auth schema and may not have it.
+    BEGIN
+        DELETE FROM auth.users WHERE id = v_me;
+    EXCEPTION WHEN undefined_table OR insufficient_privilege THEN
+        RAISE NOTICE 'auth.users not removable here; profile data deleted';
+    END;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.delete_my_account() TO authenticated;
+
+-- ========================================
+-- REALTIME
+-- ========================================
+-- Without these in the publication the client subscribes successfully and then
+-- simply never receives anything, which looks exactly like the app being slow.
+-- Guarded so a database without the Supabase realtime publication still applies
+-- this script cleanly.
+DO $realtime$
+DECLARE
+    t TEXT;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
+        RAISE NOTICE 'supabase_realtime publication not present — skipping';
+        RETURN;
+    END IF;
+
+    FOREACH t IN ARRAY ARRAY[
+        'expenses', 'expense_splits', 'ledger_entries', 'group_settlements',
+        'group_members', 'groups', 'group_invitations', 'group_join_requests',
+        'friend_requests', 'daily_expenses'
+    ] LOOP
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_publication_tables
+            WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = t
+        ) THEN
+            EXECUTE format('ALTER PUBLICATION supabase_realtime ADD TABLE public.%I', t);
+        END IF;
+    END LOOP;
+END
+$realtime$;
+
+-- Four references to users had no ON DELETE action, so deleting an account
+-- failed on a foreign key instead of completing. They are all attribution —
+-- "who initiated this", "who reviewed this", "who paid whom" — so the row must
+-- outlive the person: a settlement is the other party's record too, and dropping
+-- it because one side left would erase their evidence that money changed hands.
+--
+-- from_user / to_user lose NOT NULL for the same reason. The app already renders
+-- a missing party as "Someone", so history stays readable with a gap in it
+-- rather than disappearing.
+ALTER TABLE group_settlements ALTER COLUMN from_user DROP NOT NULL;
+ALTER TABLE group_settlements ALTER COLUMN to_user   DROP NOT NULL;
+
+ALTER TABLE settlement_cycles    DROP CONSTRAINT IF EXISTS settlement_cycles_initiated_by_fkey;
+ALTER TABLE settlement_cycles    ADD  CONSTRAINT settlement_cycles_initiated_by_fkey
+     FOREIGN KEY (initiated_by) REFERENCES users(id) ON DELETE SET NULL;
+
+ALTER TABLE group_join_requests  DROP CONSTRAINT IF EXISTS group_join_requests_reviewed_by_fkey;
+ALTER TABLE group_join_requests  ADD  CONSTRAINT group_join_requests_reviewed_by_fkey
+     FOREIGN KEY (reviewed_by) REFERENCES users(id) ON DELETE SET NULL;
+
+ALTER TABLE group_settlements    DROP CONSTRAINT IF EXISTS group_settlements_from_user_fkey;
+ALTER TABLE group_settlements    ADD  CONSTRAINT group_settlements_from_user_fkey
+     FOREIGN KEY (from_user) REFERENCES users(id) ON DELETE SET NULL;
+
+ALTER TABLE group_settlements    DROP CONSTRAINT IF EXISTS group_settlements_to_user_fkey;
+ALTER TABLE group_settlements    ADD  CONSTRAINT group_settlements_to_user_fkey
+     FOREIGN KEY (to_user) REFERENCES users(id) ON DELETE SET NULL;
