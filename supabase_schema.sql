@@ -264,16 +264,16 @@ $$;
 -- ========================================
 -- VIEWS
 -- ========================================
-
-CREATE OR REPLACE VIEW group_balances AS
-SELECT
-    group_id,
-    user_id,
-    COALESCE(SUM(amount), 0)                                            AS net_balance,
-    COALESCE(SUM(CASE WHEN amount > 0 THEN amount  ELSE 0 END), 0)     AS total_paid,
-    COALESCE(SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END), 0) AS total_owed
-FROM ledger_entries
-GROUP BY group_id, user_id;
+-- group_balances (net_balance/total_paid/total_owed per group_id+user_id) used
+-- to live here. Removed: it was never queried by the app — balances are
+-- computed client-side from ledger_entries directly — and plain views run
+-- with the CREATOR's privileges against their underlying tables, not the
+-- querying user's, so it silently bypassed ledger_entries' RLS. Exposed over
+-- the auto-generated REST API, that let any signed-in user read every group's
+-- balance data, not just their own. Flagged by Supabase's linter as
+-- "Security Definer View"; dropping removes the exposure entirely rather than
+-- patching it with `security_invoker = true`, since nothing needs it.
+DROP VIEW IF EXISTS public.group_balances;
 
 -- ========================================
 -- ROW LEVEL SECURITY — enable AFTER all tables exist
@@ -612,6 +612,64 @@ BEGIN
     RETURN v_code;
 END;
 $$;
+
+-- Creates a group and seats its creator as ADMIN in one atomic call.
+--
+-- The client used to do this as two plain inserts (groups, then group_members),
+-- relying on the table-level RLS policy `WITH CHECK (created_by = auth.uid())`
+-- to authorize the first one. On at least one live project that check reliably
+-- rejected the insert even though auth.uid() was independently proven — via a
+-- direct SELECT in the same session — to equal the exact value being compared,
+-- with no trigger, rule, restrictive policy, or identity mismatch involved
+-- anywhere in the request. Root cause undetermined; this sidesteps it by moving
+-- the write into a SECURITY DEFINER function, which runs with the function
+-- owner's privileges and therefore never evaluates that table-level INSERT
+-- policy at all. Authorization is instead the explicit auth.uid() IS NOT NULL
+-- check below.
+CREATE OR REPLACE FUNCTION public.create_group(
+    p_name        TEXT,
+    p_description TEXT DEFAULT '',
+    p_icon_emoji  TEXT DEFAULT '💰'
+)
+RETURNS groups
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_group    groups%ROWTYPE;
+    v_code     TEXT;
+    v_attempts INT := 0;
+BEGIN
+    IF auth.uid() IS NULL THEN
+        RAISE EXCEPTION 'Not authenticated';
+    END IF;
+    IF COALESCE(TRIM(p_name), '') = '' THEN
+        RAISE EXCEPTION 'Group name is required';
+    END IF;
+
+    LOOP
+        v_attempts := v_attempts + 1;
+        v_code := UPPER(SUBSTRING(REPLACE(gen_random_uuid()::TEXT, '-', '') FROM 1 FOR 6));
+        EXIT WHEN NOT EXISTS (SELECT 1 FROM groups WHERE invite_code = v_code);
+        IF v_attempts > 20 THEN
+            RAISE EXCEPTION 'Could not allocate a unique invite code';
+        END IF;
+    END LOOP;
+
+    INSERT INTO groups (name, description, icon_emoji, created_by, invite_code, invite_code_expires_at)
+    VALUES (
+        TRIM(p_name), COALESCE(p_description, ''), COALESCE(NULLIF(p_icon_emoji, ''), '💰'),
+        auth.uid(), v_code, NOW() + INTERVAL '7 days'
+    )
+    RETURNING * INTO v_group;
+
+    INSERT INTO group_members (group_id, user_id, role)
+    VALUES (v_group.id, auth.uid(), 'ADMIN');
+
+    RETURN v_group;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.create_group(TEXT, TEXT, TEXT) TO authenticated;
 
 -- Records a payment between two members and writes the matching pair of ledger
 -- entries in one transaction, so a settlement can never half-apply.

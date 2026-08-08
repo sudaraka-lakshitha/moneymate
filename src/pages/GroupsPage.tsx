@@ -14,11 +14,6 @@ interface GroupsPageProps {
 
 const EMOJIS = ['💰', '🏠', '🎉', '✈️', '🍔', '🚗', '🎓', '💼', '🏖️', '🎮', '🛍️', '💊'];
 
-const randomCode = () => {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no I/O/0/1 — easier to read aloud
-  return Array.from({ length: 6 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
-};
-
 export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
   const toast = useToast();
 
@@ -85,31 +80,16 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
     setCreating(true);
 
     try {
-      const { data: group, error } = await supabase
-        .from('groups')
-        .insert({
-          name: name.trim(),
-          description: description.trim(),
-          icon_emoji: emoji,
-          created_by: user.id,
-          invite_code: randomCode(),
-          invite_code_expires_at: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString(),
-        })
-        .select()
-        .single();
+      // Creates the group and seats the creator as ADMIN atomically, server
+      // side — see create_group in supabase_schema.sql for why this isn't two
+      // plain inserts.
+      const { data: group, error } = await supabase.rpc('create_group', {
+        p_name: name.trim(),
+        p_description: description.trim(),
+        p_icon_emoji: emoji,
+      });
 
       if (error) throw error;
-
-      const { error: memberError } = await supabase
-        .from('group_members')
-        .insert({ group_id: group.id, user_id: user.id, role: 'ADMIN' });
-
-      // Without a membership row the creator cannot even read their own group
-      // back (RLS is membership-based), so clean up rather than orphan it.
-      if (memberError) {
-        await supabase.from('groups').delete().eq('id', group.id);
-        throw memberError;
-      }
 
       toast.success(`"${group.name}" created.`);
       setShowCreate(false);
