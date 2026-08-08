@@ -1,7 +1,11 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { FriendBalance, User } from '../types';
+import { Group, User } from '../types';
 import { formatLKR, formatLKRSigned } from '../lib/currency';
+import { computeFriendBalances, FriendBalanceDetail, GroupLedger, netByUser } from '../lib/balances';
+import { friendlyDbError } from '../lib/authErrors';
+import { Alert, Avatar, EmptyState, Sheet, SkeletonRows } from '../components/ui';
+import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
 import { Search } from 'lucide-react';
 
 interface FriendsPageProps {
@@ -9,152 +13,271 @@ interface FriendsPageProps {
 }
 
 export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
-  const [friends, setFriends] = useState<FriendBalance[]>([]);
-  const [search, setSearch] = useState('');
-  const [totalOwed, setTotalOwed] = useState(0);
-  const [totalOwing, setTotalOwing] = useState(0);
+  const [friends, setFriends] = useState<FriendBalanceDetail[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState('');
+  const [selected, setSelected] = useState<FriendBalanceDetail | null>(null);
+  const [settleTarget, setSettleTarget] = useState<SettleTarget | null>(null);
 
-  useEffect(() => {
-    loadFriendBalances();
-  }, [user.id]);
-
-  const loadFriendBalances = async () => {
+  const load = useCallback(async () => {
+    setError(null);
     try {
-      const { data: myGroups } = await supabase
+      const { data: memberships, error: membershipError } = await supabase
         .from('group_members')
-        .select('group_id')
+        .select('group_id, groups(*)')
         .eq('user_id', user.id);
+      if (membershipError) throw membershipError;
 
-      if (!myGroups) return;
-      const groupIds = myGroups.map((g) => g.group_id);
-
-      const { data: coMembers } = await supabase
-        .from('group_members')
-        .select('user_id, users(*)')
-        .in('group_id', groupIds)
-        .neq('user_id', user.id);
-
-      if (!coMembers) return;
-
-      const friendMap: Record<string, { user: User; count: number }> = {};
-      coMembers.forEach((m: any) => {
-        if (!friendMap[m.user_id]) {
-          friendMap[m.user_id] = { user: m.users, count: 1 };
-        } else {
-          friendMap[m.user_id].count += 1;
-        }
-      });
-
-      const { data: ledgerData } = await supabase
-        .from('ledger_entries')
-        .select('user_id, amount, group_id')
-        .in('group_id', groupIds);
-
-      const fList: FriendBalance[] = [];
-      let sumOwed = 0;
-      let sumOwing = 0;
-
-      for (const [friendId, info] of Object.entries(friendMap)) {
-        const friendLedger = (ledgerData || []).filter((l) => l.user_id === friendId);
-        const net = friendLedger.reduce((acc, row) => acc + Number(row.amount), 0);
-
-        if (net > 0) sumOwed += net;
-        if (net < 0) sumOwing += Math.abs(net);
-
-        fList.push({
-          friend: info.user,
-          net_balance: net,
-          total_they_owe_me: net > 0 ? net : 0,
-          total_i_owe_them: net < 0 ? Math.abs(net) : 0,
-          shared_group_count: info.count,
-        });
+      const groups = (memberships ?? []).map((row: any) => row.groups).filter(Boolean) as Group[];
+      if (groups.length === 0) {
+        setFriends([]);
+        return;
       }
 
-      setFriends(fList);
-      setTotalOwed(sumOwed);
-      setTotalOwing(sumOwing);
+      const groupIds = groups.map((g) => g.id);
+
+      const [memberRes, ledgerRes] = await Promise.all([
+        supabase.from('group_members').select('group_id, user_id, users(*)').in('group_id', groupIds),
+        supabase.from('ledger_entries').select('group_id, user_id, amount').in('group_id', groupIds),
+      ]);
+
+      if (memberRes.error) throw memberRes.error;
+      if (ledgerRes.error) throw ledgerRes.error;
+
+      const ledgers: GroupLedger[] = groups.map((group) => ({
+        groupId: group.id,
+        groupName: group.name,
+        balances: netByUser((ledgerRes.data ?? []).filter((row: any) => row.group_id === group.id)),
+        members: Object.fromEntries(
+          (memberRes.data ?? [])
+            .filter((row: any) => row.group_id === group.id && row.users)
+            .map((row: any) => [row.user_id, row.users as User])
+        ),
+      }));
+
+      setFriends(computeFriendBalances(ledgers, user.id));
     } catch (err) {
-      console.error('Friends load error:', err);
+      setError(friendlyDbError(err, 'Could not load friend balances.'));
     } finally {
       setLoading(false);
     }
-  };
+  }, [user.id]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const totals = useMemo(() => {
+    let owedToMe = 0;
+    let owedByMe = 0;
+    for (const friend of friends) {
+      if (friend.net_balance > 0) owedToMe += friend.net_balance;
+      else owedByMe += Math.abs(friend.net_balance);
+    }
+    return { owedToMe, owedByMe, net: owedToMe - owedByMe };
+  }, [friends]);
 
   const filtered = friends.filter((f) =>
-    f.friend.display_name.toLowerCase().includes(search.toLowerCase())
+    f.friend.display_name.toLowerCase().includes(search.trim().toLowerCase())
   );
 
-  const overallNet = totalOwed - totalOwing;
-  const isPositive = overallNet >= 0;
+  const isPositive = totals.net >= 0;
 
   return (
-    <div style={{ padding: '20px 16px 100px' }}>
-      <h2 style={{ fontSize: '1.4rem', fontWeight: 800, color: 'var(--on-background)', marginBottom: 20 }}>
-        Friends Balance Panel
-      </h2>
+    <div className="page">
+      <header className="page-header">
+        <div>
+          <h1 className="page-title">Friends</h1>
+          <p className="page-subtitle">What you owe, and what you are owed</p>
+        </div>
+      </header>
 
-      <div className={isPositive ? 'glass-card-positive' : 'glass-card-negative'} style={{ padding: 20, marginBottom: 20 }}>
-        <span style={{ fontSize: '0.8rem', color: 'var(--on-surface-variant)' }}>Overall Friends Balance</span>
-        <h2 style={{ fontSize: '2rem', fontWeight: 800, color: isPositive ? 'var(--positive)' : 'var(--negative)', margin: '6px 0 4px' }}>
-          {formatLKRSigned(overallNet)}
-        </h2>
-        <span style={{ fontSize: '0.8rem', color: 'var(--on-surface-variant)' }}>
-          {isPositive ? 'You are owed across all friends' : 'You owe across all friends'}
+      {error && (
+        <div style={{ marginBottom: 'var(--sp-4)' }}>
+          <Alert variant="error">{error}</Alert>
+        </div>
+      )}
+
+      <section
+        className={`card-hero ${Math.abs(totals.net) < 0.01 ? 'is-neutral' : isPositive ? 'is-positive' : 'is-negative'}`}
+        style={{ marginBottom: 'var(--sp-5)' }}
+      >
+        <span className="label">Net across all friends</span>
+        <div
+          className={`amount-xl tabular ${Math.abs(totals.net) < 0.01 ? '' : isPositive ? 'text-positive' : 'text-negative'}`}
+          style={{ margin: '6px 0 4px' }}
+        >
+          {formatLKRSigned(totals.net)}
+        </div>
+        <span className="hint">
+          {Math.abs(totals.net) < 0.01
+            ? 'Everyone is square'
+            : isPositive
+              ? 'You are owed overall'
+              : 'You owe overall'}
         </span>
-      </div>
 
-      <div className="glass-card" style={{ padding: '8px 14px', display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20 }}>
-        <Search size={18} color="var(--on-surface-variant)" />
-        <input
-          type="text"
-          placeholder="Search friends…"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          style={{ background: 'none', border: 'none', color: 'var(--on-background)', outline: 'none', width: '100%', fontSize: '0.9rem' }}
+        <div className="row card-divider" style={{ gap: 'var(--sp-6)', marginTop: 'var(--sp-4)', paddingTop: 'var(--sp-4)' }}>
+          <div>
+            <div className="label">You are owed</div>
+            <div className="amount-md tabular text-positive">{formatLKR(totals.owedToMe)}</div>
+          </div>
+          <div>
+            <div className="label">You owe</div>
+            <div className="amount-md tabular text-negative">{formatLKR(totals.owedByMe)}</div>
+          </div>
+        </div>
+      </section>
+
+      {friends.length > 4 && (
+        <div className="card row" style={{ padding: '6px var(--sp-4)', marginBottom: 'var(--sp-4)' }}>
+          <Search size={17} color="var(--on-surface-variant)" />
+          <input
+            type="search"
+            className="grow"
+            placeholder="Search friends…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            style={{ background: 'none', border: 'none', outline: 'none', padding: '8px 0', fontSize: '0.9rem' }}
+          />
+        </div>
+      )}
+
+      {loading ? (
+        <SkeletonRows count={4} />
+      ) : filtered.length === 0 ? (
+        <EmptyState
+          icon="🤝"
+          title={search ? 'No matches' : 'No friends yet'}
+          text={
+            search
+              ? 'Try a different name.'
+              : 'Join a group and split a bill — everyone you share a group with shows up here.'
+          }
         />
-      </div>
-
-      {filtered.length === 0 && !loading ? (
-        <div className="glass-card" style={{ padding: 36, textAlign: 'center' }}>
-          <span style={{ fontSize: 44 }}>🤝</span>
-          <h3 style={{ marginTop: 12, fontSize: '1rem', color: 'var(--on-background)' }}>No friends found</h3>
-          <p style={{ color: 'var(--on-surface-variant)', fontSize: '0.85rem', marginTop: 4 }}>
-            Join groups and split bills to see friend balances here.
-          </p>
-        </div>
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {filtered.map((item) => (
-            <div key={item.friend.id} className="glass-card" style={{ padding: 16, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                <div style={{
-                  width: 44, height: 44, borderRadius: '50%', background: 'var(--primary-container)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18,
-                  fontWeight: 700, color: 'var(--primary-light)'
-                }}>
-                  {item.friend.display_name.charAt(0).toUpperCase()}
-                </div>
-                <div>
-                  <div style={{ fontWeight: 700, fontSize: '0.95rem', color: 'var(--on-background)' }}>{item.friend.display_name}</div>
-                  <div style={{ fontSize: '0.75rem', color: 'var(--on-surface-variant)' }}>Shared in {item.shared_group_count} group(s)</div>
-                </div>
-              </div>
-
-              <div style={{ textAlign: 'right' }}>
-                <div style={{
-                  fontWeight: 700, fontSize: '0.95rem',
-                  color: item.net_balance > 0 ? 'var(--positive)' : item.net_balance < 0 ? 'var(--negative)' : 'var(--neutral)'
-                }}>
-                  {formatLKRSigned(item.net_balance)}
-                </div>
-                <div style={{ fontSize: '0.75rem', color: 'var(--on-surface-variant)' }}>
-                  {item.net_balance > 0 ? 'owes you' : item.net_balance < 0 ? 'you owe' : 'settled'}
-                </div>
-              </div>
-            </div>
-          ))}
+        <div className="stack-sm">
+          {filtered.map((friend) => {
+            const settled = Math.abs(friend.net_balance) < 0.01;
+            return (
+              <button
+                key={friend.friend.id}
+                type="button"
+                className="card card-interactive row"
+                onClick={() => setSelected(friend)}
+              >
+                <Avatar name={friend.friend.display_name} url={friend.friend.avatar_url} size={42} />
+                <span className="grow" style={{ minWidth: 0 }}>
+                  <span className="truncate" style={{ display: 'block', fontWeight: 700, fontSize: '0.93rem' }}>
+                    {friend.friend.display_name}
+                  </span>
+                  <span className="hint">
+                    {friend.shared_group_count} shared group{friend.shared_group_count === 1 ? '' : 's'}
+                  </span>
+                </span>
+                <span style={{ textAlign: 'right', flexShrink: 0 }}>
+                  <span
+                    className={`amount-md tabular ${settled ? 'text-neutral' : friend.net_balance > 0 ? 'text-positive' : 'text-negative'}`}
+                    style={{ display: 'block' }}
+                  >
+                    {settled ? 'Settled' : formatLKR(Math.abs(friend.net_balance))}
+                  </span>
+                  <span className="hint">
+                    {settled ? 'all square' : friend.net_balance > 0 ? 'owes you' : 'you owe'}
+                  </span>
+                </span>
+              </button>
+            );
+          })}
         </div>
+      )}
+
+      {selected && (
+        <Sheet title={selected.friend.display_name} onClose={() => setSelected(null)}>
+          <div className="stack">
+            <div className="row" style={{ justifyContent: 'center', flexDirection: 'column', gap: 'var(--sp-2)' }}>
+              <Avatar name={selected.friend.display_name} url={selected.friend.avatar_url} size={64} />
+              <span
+                className={`amount-lg tabular ${
+                  Math.abs(selected.net_balance) < 0.01
+                    ? 'text-neutral'
+                    : selected.net_balance > 0
+                      ? 'text-positive'
+                      : 'text-negative'
+                }`}
+              >
+                {formatLKRSigned(selected.net_balance)}
+              </span>
+              <span className="hint">
+                {Math.abs(selected.net_balance) < 0.01
+                  ? 'You are all square'
+                  : selected.net_balance > 0
+                    ? `${selected.friend.display_name} owes you`
+                    : `You owe ${selected.friend.display_name}`}
+              </span>
+            </div>
+
+            {selected.perGroup.length === 0 ? (
+              <EmptyState icon="✅" title="Nothing outstanding" text="No open balances with this friend." />
+            ) : (
+              <>
+                <span className="label label-block">Breakdown by group</span>
+                <div className="stack-sm">
+                  {selected.perGroup.map((entry) => (
+                    <div key={entry.groupId} className="card row-between">
+                      <span className="grow" style={{ minWidth: 0 }}>
+                        <span className="truncate" style={{ display: 'block', fontWeight: 600, fontSize: '0.9rem' }}>
+                          {entry.groupName}
+                        </span>
+                        <span className="hint">{entry.net > 0 ? 'owes you' : 'you owe'}</span>
+                      </span>
+                      <span className="row" style={{ gap: 'var(--sp-3)', flexShrink: 0 }}>
+                        <span
+                          className={`amount-md tabular ${entry.net > 0 ? 'text-positive' : 'text-negative'}`}
+                        >
+                          {formatLKR(Math.abs(entry.net))}
+                        </span>
+                        {entry.net < 0 && (
+                          <button
+                            type="button"
+                            className="btn btn-primary btn-sm"
+                            onClick={() => {
+                              setSettleTarget({
+                                groupId: entry.groupId,
+                                groupName: entry.groupName,
+                                payee: selected.friend,
+                                suggestedAmount: Math.abs(entry.net),
+                              });
+                              setSelected(null);
+                            }}
+                          >
+                            Settle
+                          </button>
+                        )}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <span className="hint">
+                  Settlements are recorded against a group so the group ledger stays balanced.
+                </span>
+              </>
+            )}
+          </div>
+        </Sheet>
+      )}
+
+      {settleTarget && (
+        <SettleUpSheet
+          target={settleTarget}
+          onClose={() => setSettleTarget(null)}
+          onSettled={() => {
+            setSettleTarget(null);
+            setLoading(true);
+            void load();
+          }}
+        />
       )}
     </div>
   );

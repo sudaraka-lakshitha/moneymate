@@ -1,63 +1,131 @@
 # MoneyMate — Expense Splitter & Daily Tracker (Web App & PWA)
 
-MoneyMate is a cross-platform Web Application and Progressive Web App (PWA) built for splitting group expenses, tracking daily personal spending in **LKR (Rs.)**, simplifying debts, and managing balances across friends.
+MoneyMate is a cross-platform web app and Progressive Web App for splitting group
+expenses, tracking daily personal spending in **LKR (Rs.)**, simplifying debts, and
+settling up with friends.
 
 ---
 
-## ⚡ Quick Start (Run Locally)
+## ⚡ Quick start
 
-### Option 1: Double-Click Batch File (Windows)
-Simply double-click **`run.bat`** in the project folder. It will install dependencies (if needed), launch the server, and automatically open `http://localhost:5173` in your web browser!
+> **Run `supabase_schema.sql` in the Supabase SQL editor first.** Without it the
+> app cannot read groups or members. See [SETUP.md](SETUP.md).
 
-### Option 2: Terminal / Command Prompt
+### Option 1: double-click batch file (Windows)
+Double-click **`run.bat`**. It installs dependencies if needed, launches the
+server, and opens `http://localhost:5173`.
+
+### Option 2: terminal
 ```bash
-# 1. Install dependencies
 npm install
-
-# 2. Run dev server
 npm run dev
 ```
 
-Open your browser at `http://localhost:5173`.
+---
+
+## 🚀 Features
+
+### Splitting
+- **Five split methods** — Equal, Custom (exact LKR), Percentage, Shares, and
+  **Itemized** (add each line, tick who is on it, and per-person totals are derived).
+- **Per-bill member toggle** — include or exclude members on any bill.
+- **Proxy entry** — record an expense on behalf of whoever actually paid.
+- **Exact money maths** — Rs. 100 across three people is 33.34 / 33.33 / 33.33, not
+  three lots of 33.33. The remainder is distributed, so a split always sums to the bill.
+- **Live preview** — see what each person owes before saving, and a clear warning
+  when percentages do not reach 100% or custom amounts miss the total.
+
+### Balances
+- **Append-only ledger** — expenses, edits and deletions all post entries rather than
+  mutating history. Every operation nets to zero.
+- **Edit with audit trail** — editing reverses the old ledger entries, posts fresh
+  ones, and records a before/after snapshot in `expense_edits`.
+- **Debt simplification** — the fewest payments that clear the group.
+- **Friends panel** — true pairwise balances (what each friend owes *you*), broken
+  down by group.
+- **Settle up** — record a payment and the balancing ledger entries in one transaction.
+
+### Personal
+- **Daily tracker** — log spending, grouped by day.
+- **Monthly budgets** — per-category limits with progress meters and over-budget warnings.
+- **Analytics** — 30/90-day trend chart with hover detail, period-over-period change,
+  daily average, and a ranked category breakdown. Covers both your own spending and your
+  share of group bills, filterable by source.
+
+### Convenience
+- **Receipt scanning** — photograph a receipt and on-device OCR fills in the total,
+  date and merchant. The image is attached either way, and everything stays editable.
+- **Recurring expenses** — rent, subscriptions and season tickets repeat daily, weekly
+  or monthly. Missed occurrences are backfilled the next time you open the app.
+- **Saved default splits** — remember a group's usual arrangement so the regular
+  dinner crowd is not re-configured on every bill.
+- **Search** — across every bill and tracker entry, filtered by category, source,
+  amount range and date range.
+- **Offline mode** — installs as a real app, launches with no connection, shows your
+  last-known data, and queues personal entries until you are back online.
+
+### Access
+- **Google Sign-In** and email/password, with real error messages when a provider is
+  misconfigured rather than a silent bounce back to the login screen.
+- **Invite codes** — six characters, expiring, regenerable by admins.
+- **Join approval** — admins approve or decline each request.
 
 ---
 
-## 🌐 Deploying to Vercel / Netlify (Free)
+## 📲 Install as an app
 
-Anyone on **iPhone (iOS)**, **Android**, **Mac**, or **Windows** can use your app once deployed!
+The app prompts to install itself when the browser reports it is installable.
 
-1. Push this repository to GitHub.
-2. Go to **[vercel.com](https://vercel.com)** → Import your repository.
-3. Click **Deploy**.
-4. Share your live URL (e.g. `moneymate.vercel.app`) with your friends!
+- **Android (Chrome/Edge)**: tap **Install** in the prompt. This installs a **WebAPK**,
+  so MoneyMate appears in the **app drawer**, in Settings → Apps and in the share
+  sheet — not just as a home-screen shortcut. Using the browser's own
+  "Add to Home screen" menu item instead creates a plain bookmark, so prefer the
+  in-app Install button.
+- **Desktop (Chrome/Edge)**: the install icon in the address bar, or the in-app
+  prompt. It then appears in your OS app list and `chrome://apps`.
+- **iPhone (Safari)**: Share → **Add to Home Screen**. iOS has no install API and no
+  app drawer, so this is the only route there.
+
+Installability is enforced by a check in CI-style testing: manifest `id`, name,
+description, `start_url`, standalone display, 192/512 icons, a maskable icon, a
+narrow screenshot, and a registered service worker.
+
+**Offline scope, honestly:** the app shell and your last-loaded data are cached, so
+MoneyMate opens and remains readable with no connection, and personal tracker entries
+you add offline are queued and sent on reconnect. Group expenses and settlements
+require a connection — they are validated server-side against balances other people
+are changing concurrently, so replaying them blind would corrupt a shared ledger.
 
 ---
 
-## 📲 Install as PWA on Mobile (iPhone & Android)
+## ⚙️ Architecture notes
 
-- **iPhone (Safari)**: Tap the Share button → **"Add to Home Screen"**.
-- **Android (Chrome)**: Tap the 3 dots menu → **"Install App"** or **"Add to Home Screen"**.
+**Security-sensitive and multi-step writes live in the database, not the client.**
+Saving an expense touches four tables; done as four browser round trips, a failure
+midway leaves splits with no ledger entries and corrupts every balance in the group.
+`save_expense`, `update_expense`, `delete_expense` and `record_settlement` are
+`SECURITY DEFINER` functions that do the whole job in one transaction and reject a
+split set that does not reconstruct the bill total.
+
+**RLS membership checks go through `SECURITY DEFINER` helpers.** A policy on
+`group_members` that itself queries `group_members` makes Postgres re-enter the same
+policy and raise `infinite recursion detected in policy`. `is_group_member()`,
+`is_group_admin()` and `can_view_profile()` break the cycle.
+
+**Chart colours are validated, not eyeballed.** The categorical palette in
+`src/lib/categories.ts` clears the colour-vision-deficiency separation floor and the
+3:1 contrast floor against the dark chart surface.
 
 ---
 
-## ⚙️ Backend & Supabase Configuration
+## 🗄️ Backend
 
-The app connects directly to your Supabase project:
 - **Supabase URL**: `https://illvzuwxcvttbsoddptr.supabase.co`
-- **Anon Public Key**: Configured in `src/lib/supabase.ts`
+- **Anon public key**: in `src/lib/supabase.ts`, overridable via `VITE_SUPABASE_ANON_KEY`
 
-The database schema, RLS security policies, and user triggers are fully installed via `supabase_schema.sql`.
+The anon key is a public, RLS-protected client key — it is designed to ship in the
+browser bundle. Schema, policies, functions and triggers all live in
+`supabase_schema.sql`.
 
----
-
-## 🚀 Key Features Implemented
-
-- 💸 **LKR Currency Only (Rs.)** — Tailored for Sri Lanka.
-- 👥 **Group Expense Splitting** — Equal, Custom LKR, Percentage %, and Shares split methods.
-- 🔘 **Per-Bill Member Toggle** — Include or exclude specific group members per bill.
-- 🔄 **Proxy Expense Entry** — Add expenses on behalf of other group members.
-- 📜 **Ledger-Based Balance Integrity** — Append-only ledger entries; deletions and edits generate reversal entries.
-- 🤝 **Friends Balance Panel** — Cross-group credit/debit calculation per friend.
-- 📆 **Daily Personal Expense Tracker** — Log personal expenses, view monthly category totals.
-- 📊 **Analytics & Insights** — Category percentage breakdowns.
-- 🔐 **Supabase Auth** — Email/Password sign up & Google OAuth.
+Full setup — including the Google Cloud + Supabase steps needed for Google
+Sign-In — is in **[SETUP.md](SETUP.md)**.
