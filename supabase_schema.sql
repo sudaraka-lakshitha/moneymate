@@ -2635,3 +2635,225 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION public.add_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL) TO authenticated;
+
+-- Editing a direct entry, expressed the same way as creating one.
+--
+-- The client should not have to rebuild a split array to correct a loan, and
+-- doing so would duplicate the "who paid / how much is theirs" logic that
+-- add_direct_expense already owns. This resolves the other party from the pair
+-- group, rebuilds the splits, and hands off to update_expense — so the audit
+-- trail, the ledger reversal and the settled-expense lock all still apply.
+CREATE OR REPLACE FUNCTION public.update_direct_expense(
+    p_expense_id  UUID,
+    p_amount      DECIMAL,
+    p_note        TEXT    DEFAULT '',
+    p_i_paid      BOOLEAN DEFAULT TRUE,
+    p_their_share DECIMAL DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me     UUID := auth.uid();
+    v_group  UUID;
+    v_friend UUID;
+    v_theirs DECIMAL;
+    v_mine   DECIMAL;
+    v_payer  UUID;
+    v_title  TEXT;
+BEGIN
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+
+    SELECT group_id INTO v_group FROM expenses WHERE id = p_expense_id;
+    IF v_group IS NULL THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM groups WHERE id = v_group AND is_direct) THEN
+        RAISE EXCEPTION 'That entry is not a direct record — edit it in its group';
+    END IF;
+    IF NOT public.is_group_member(v_group) THEN
+        RAISE EXCEPTION 'You are not part of this record';
+    END IF;
+
+    SELECT user_id INTO v_friend
+    FROM group_members WHERE group_id = v_group AND user_id <> v_me
+    LIMIT 1;
+
+    v_theirs := ROUND(COALESCE(p_their_share, p_amount / 2), 2);
+    IF v_theirs < 0 OR v_theirs > ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Their share must be between zero and the full amount';
+    END IF;
+    v_mine  := ROUND(p_amount, 2) - v_theirs;
+    v_payer := CASE WHEN p_i_paid THEN v_me ELSE v_friend END;
+    v_title := COALESCE(NULLIF(TRIM(p_note), ''), 'Shared expense');
+
+    PERFORM public.update_expense(
+        p_expense_id, v_title, p_amount, v_payer, 'OTHER',
+        CASE WHEN v_theirs * 2 = ROUND(p_amount, 2) THEN 'EQUAL' ELSE 'UNEQUAL' END,
+        COALESCE(p_note, ''),
+        jsonb_build_array(
+            jsonb_build_object('user_id', v_friend, 'amount', v_theirs, 'is_included', TRUE),
+            jsonb_build_object('user_id', v_me,     'amount', v_mine,   'is_included', TRUE)
+        ),
+        '[]'::jsonb
+    );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL) TO authenticated;
+
+-- ========================================
+-- LEDGER FIX: EDITING TWICE CORRUPTED BALANCES
+-- ========================================
+-- update_expense and delete_expense reversed an expense by re-negating every
+-- EXPENSE and SPLIT row carrying its id. That is correct exactly once. After a
+-- first edit the expense owns two generations of rows — the original pair and
+-- the replacement pair — plus the EDIT_REVERSAL that cancelled the first. The
+-- next edit then re-negated the already-cancelled generation as well, so every
+-- edit after the first silently moved money.
+--
+-- Reproduced: a 1000 bill split evenly, edited to 1400, then edited again to
+-- swap the payer, left the payer at -1200 instead of -700.
+--
+-- The fix is to reverse the expense's NET contribution per person rather than
+-- its individual rows. Summing every row that references the expense — of any
+-- entry type, including earlier reversals — and posting the negative of that
+-- sum drives its contribution to exactly zero, whatever happened before. It is
+-- therefore correct on the first edit and every edit after it, and the ledger
+-- stays append-only.
+CREATE OR REPLACE FUNCTION public.update_expense(
+    p_expense_id   UUID,
+    p_title        TEXT,
+    p_amount       DECIMAL,
+    p_paid_by      UUID,
+    p_category     TEXT,
+    p_split_method TEXT,
+    p_notes        TEXT,
+    p_splits       JSONB,
+    p_items        JSONB DEFAULT '[]'::jsonb
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_old      expenses%ROWTYPE;
+    v_old_snap JSONB;
+    v_new_snap JSONB;
+    v_summary  TEXT := '';
+BEGIN
+    SELECT * INTO v_old FROM expenses WHERE id = p_expense_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+    IF v_old.is_deleted THEN
+        RAISE EXCEPTION 'This expense has been deleted';
+    END IF;
+    IF v_old.created_by <> auth.uid() AND NOT public.is_group_admin(v_old.group_id) THEN
+        RAISE EXCEPTION 'Only the person who added this expense, or a group admin, can edit it';
+    END IF;
+    IF public.expense_is_locked(p_expense_id) THEN
+        RAISE EXCEPTION 'This expense has already been settled and cannot be changed. Add a new expense to correct it.';
+    END IF;
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+
+    v_old_snap := jsonb_build_object(
+        'title', v_old.title, 'amount', v_old.amount, 'paid_by', v_old.paid_by,
+        'category', v_old.category, 'split_method', v_old.split_method, 'notes', v_old.notes,
+        'splits', (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                       'user_id', user_id, 'amount', amount, 'is_included', is_included)), '[]'::jsonb)
+                   FROM expense_splits WHERE expense_id = p_expense_id)
+    );
+
+    IF v_old.title <> p_title THEN
+        v_summary := v_summary || format('title "%s" → "%s"; ', v_old.title, p_title);
+    END IF;
+    IF ROUND(v_old.amount, 2) <> ROUND(p_amount, 2) THEN
+        v_summary := v_summary || format('amount %s → %s; ', v_old.amount, p_amount);
+    END IF;
+    IF v_old.paid_by IS DISTINCT FROM p_paid_by THEN
+        v_summary := v_summary || 'payer changed; ';
+    END IF;
+    IF v_old.split_method <> p_split_method THEN
+        v_summary := v_summary || format('split %s → %s; ', v_old.split_method, p_split_method);
+    END IF;
+    IF v_summary = '' THEN
+        v_summary := 'splits adjusted';
+    END IF;
+
+    -- Zero out whatever this expense currently contributes, however many edits
+    -- it has already been through. Nothing is deleted: the ledger stays
+    -- append-only and auditable.
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    SELECT group_id, user_id, 'EDIT_REVERSAL', -SUM(amount), p_expense_id,
+           'Reversal for edit of ' || v_old.title
+    FROM ledger_entries
+    WHERE reference_id = p_expense_id
+    GROUP BY group_id, user_id
+    HAVING SUM(amount) <> 0;
+
+    DELETE FROM expense_splits WHERE expense_id = p_expense_id;
+    DELETE FROM expense_items  WHERE expense_id = p_expense_id;
+
+    UPDATE expenses
+    SET title = p_title, amount = p_amount, paid_by = p_paid_by,
+        on_behalf_of = CASE WHEN p_paid_by <> auth.uid() THEN p_paid_by END,
+        category = COALESCE(p_category, 'OTHER'),
+        split_method = COALESCE(p_split_method, 'EQUAL'),
+        notes = COALESCE(p_notes, ''),
+        updated_at = NOW()
+    WHERE id = p_expense_id;
+
+    PERFORM public.write_expense_rows(p_expense_id, v_old.group_id, p_title, p_amount, p_paid_by, p_splits, p_items);
+
+    v_new_snap := jsonb_build_object(
+        'title', p_title, 'amount', p_amount, 'paid_by', p_paid_by,
+        'category', p_category, 'split_method', p_split_method, 'notes', p_notes,
+        'splits', p_splits
+    );
+
+    INSERT INTO expense_edits (expense_id, edited_by, old_snapshot, new_snapshot, change_summary)
+    VALUES (p_expense_id, auth.uid(), v_old_snap, v_new_snap, RTRIM(v_summary, '; '));
+END;
+$$;
+
+-- Same net-based reversal, so deleting an expense that was edited first also
+-- lands on exactly zero instead of over-correcting.
+CREATE OR REPLACE FUNCTION public.delete_expense(p_expense_id UUID, p_reason TEXT DEFAULT '')
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_old expenses%ROWTYPE;
+BEGIN
+    SELECT * INTO v_old FROM expenses WHERE id = p_expense_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+    IF v_old.is_deleted THEN
+        RETURN;  -- already gone; nothing to reverse twice
+    END IF;
+    IF v_old.created_by <> auth.uid() AND NOT public.is_group_admin(v_old.group_id) THEN
+        RAISE EXCEPTION 'Only the person who added this expense, or a group admin, can delete it';
+    END IF;
+    IF public.expense_is_locked(p_expense_id) THEN
+        RAISE EXCEPTION 'This expense has already been settled and cannot be deleted. Add a new expense to correct it.';
+    END IF;
+
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    SELECT group_id, user_id, 'DELETE_REVERSAL', -SUM(amount), p_expense_id,
+           'Reversal of deleted expense'
+    FROM ledger_entries
+    WHERE reference_id = p_expense_id
+    GROUP BY group_id, user_id
+    HAVING SUM(amount) <> 0;
+
+    UPDATE expenses
+    SET is_deleted = TRUE, deleted_at = NOW(), deleted_by = auth.uid(),
+        delete_reason = COALESCE(p_reason, '')
+    WHERE id = p_expense_id;
+END;
+$$;
