@@ -339,10 +339,19 @@ DROP POLICY IF EXISTS "User can insert own membership" ON group_members;
 DROP POLICY IF EXISTS "Users can join groups" ON group_members;
 DROP POLICY IF EXISTS "Members can leave groups" ON group_members;
 
+-- NOTE: there is deliberately no "user can insert their own membership" policy.
+-- A WITH CHECK of (user_id = auth.uid()) reads like "you may only add yourself",
+-- but it says nothing about *which group* — so any signed-in user could insert
+-- themselves into any group id, and pick their own role while doing it. That is
+-- instant admin on somebody else's group, and it walks straight past both the
+-- join-request approval and the invitation flow. The group id is not a secret:
+-- find_group_by_invite_code hands it out for a 6-character code.
+--
+-- Joining is therefore only ever done by code that has already checked
+-- permission: an admin approving a request (the policy below), or the
+-- SECURITY DEFINER functions create_group and respond_to_group_invitation.
 CREATE POLICY "Members can read group membership" ON group_members FOR SELECT
     USING (public.is_group_member(group_id));
-CREATE POLICY "User can insert own membership"    ON group_members FOR INSERT
-    WITH CHECK (user_id = auth.uid());
 CREATE POLICY "Admins can add members"            ON group_members FOR INSERT
     WITH CHECK (public.is_group_admin(group_id));
 CREATE POLICY "Admins can remove members"         ON group_members FOR DELETE
