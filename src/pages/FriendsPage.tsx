@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { FriendRequest, Group, User } from '../types';
+import { FriendRequest, Group, GroupSettlement, User } from '../types';
 import { formatLKR, formatLKRSigned } from '../lib/currency';
 import { computeFriendBalances, FriendBalanceDetail, GroupLedger, netByUser } from '../lib/balances';
 import { friendlyDbError } from '../lib/authErrors';
+import { friendlyDate } from '../lib/dates';
 import { Alert, Avatar, EmptyState, Sheet, SkeletonRows, Spinner } from '../components/ui';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
 import { useToast } from '../components/Toast';
@@ -27,6 +28,8 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const toast = useToast();
 
   const [friends, setFriends] = useState<DisplayFriend[]>([]);
+  const [settlements, setSettlements] = useState<GroupSettlement[]>([]);
+  const [groupNames, setGroupNames] = useState<Record<string, string>>({});
   const [incoming, setIncoming] = useState<FriendRequest[]>([]);
   const [outgoing, setOutgoing] = useState<FriendRequest[]>([]);
   const [loading, setLoading] = useState(true);
@@ -54,7 +57,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       const groups = (memberships ?? []).map((row: any) => row.groups).filter(Boolean) as Group[];
       const groupIds = groups.map((g) => g.id);
 
-      const [memberRes, ledgerRes, requestRes, pinRes] = await Promise.all([
+      const [memberRes, ledgerRes, requestRes, pinRes, settlementRes] = await Promise.all([
         groupIds.length > 0
           ? supabase.from('group_members').select('group_id, user_id, users(*)').in('group_id', groupIds)
           : Promise.resolve({ data: [], error: null }),
@@ -69,6 +72,17 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
           .or(`requester_id.eq.${user.id},addressee_id.eq.${user.id}`)
           .in('status', ['PENDING', 'ACCEPTED']),
         supabase.from('friend_pins').select('friend_id').eq('user_id', user.id),
+        // Payments you have made or received. Settlements live on a group, so
+        // this is the only place a friend-to-friend payment history can come
+        // from — the friend sheet filters it down to the pair.
+        groupIds.length > 0
+          ? supabase
+              .from('group_settlements')
+              .select('*')
+              .in('group_id', groupIds)
+              .or(`from_user.eq.${user.id},to_user.eq.${user.id}`)
+              .order('created_at', { ascending: false })
+          : Promise.resolve({ data: [], error: null }),
       ]);
 
       if (memberRes.error) throw memberRes.error;
@@ -76,6 +90,8 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       if (requestRes.error) throw requestRes.error;
 
       const pinnedIds = new Set((pinRes.data ?? []).map((row: any) => row.friend_id as string));
+      setSettlements((settlementRes.data ?? []) as GroupSettlement[]);
+      setGroupNames(Object.fromEntries(groups.map((g) => [g.id, g.name])));
 
       const ledgers: GroupLedger[] = groups.map((group) => ({
         groupId: group.id,
@@ -161,6 +177,17 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const filtered = friends.filter((f) =>
     f.friend.display_name.toLowerCase().includes(search.trim().toLowerCase())
   );
+
+  /** Payments between me and the friend whose sheet is open, newest first. */
+  const selectedHistory = useMemo(() => {
+    if (!selected) return [];
+    const friendId = selected.friend.id;
+    return settlements.filter(
+      (s) =>
+        (s.from_user === user.id && s.to_user === friendId) ||
+        (s.from_user === friendId && s.to_user === user.id)
+    );
+  }, [selected, settlements, user.id]);
 
   const isPositive = totals.net >= 0;
 
@@ -589,6 +616,46 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                 <span className="hint">
                   Settlements are recorded against a group so the group ledger stays balanced.
                 </span>
+              </>
+            )}
+
+            {selectedHistory.length > 0 && (
+              <>
+                <span className="label label-block">Payment history</span>
+                <div className="stack-sm">
+                  {selectedHistory.map((payment) => {
+                    const iPaid = payment.from_user === user.id;
+                    return (
+                      <div key={payment.id} className="card row">
+                        <span className="icon-tile" style={{ width: 34, height: 34, fontSize: 15 }}>
+                          {iPaid ? '↑' : '↓'}
+                        </span>
+                        <span className="grow" style={{ minWidth: 0 }}>
+                          <span
+                            className="truncate"
+                            style={{ display: 'block', fontSize: '0.88rem', fontWeight: 600 }}
+                          >
+                            {iPaid
+                              ? `You paid ${selected.friend.display_name}`
+                              : `${selected.friend.display_name} paid you`}
+                          </span>
+                          <span className="hint">
+                            {friendlyDate(payment.created_at.slice(0, 10))}
+                            {groupNames[payment.group_id] ? ` · ${groupNames[payment.group_id]}` : ''}
+                            {payment.payment_method ? ` · ${payment.payment_method.toLowerCase()}` : ''}
+                            {payment.note ? ` · ${payment.note}` : ''}
+                          </span>
+                        </span>
+                        <span
+                          className={`amount-md tabular ${iPaid ? 'text-negative' : 'text-positive'}`}
+                          style={{ flexShrink: 0 }}
+                        >
+                          {formatLKR(payment.amount)}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
               </>
             )}
           </div>
