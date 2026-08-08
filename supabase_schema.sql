@@ -2857,3 +2857,78 @@ BEGIN
     WHERE id = p_expense_id;
 END;
 $$;
+
+-- ========================================
+-- RECORDING A PAYMENT YOU RECEIVED
+-- ========================================
+-- record_settlement always writes the payment as coming FROM the caller, so a
+-- debt could only ever be cleared by the person who owed it. If a friend handed
+-- you cash, you had no way to record it — you had to ask them to open the app.
+--
+-- Letting someone record a payment made TO them is safe in a way the reverse is
+-- not: it reduces what they are owed, so it can only ever be used against the
+-- recorder's own interest. Claiming you paid somebody (which record_settlement
+-- already allows) is the direction that could be abused.
+CREATE OR REPLACE FUNCTION public.record_payment_received(
+    p_group_id  UUID,
+    p_from_user UUID,
+    p_amount    DECIMAL,
+    p_note      TEXT DEFAULT '',
+    p_method    TEXT DEFAULT 'CASH'
+)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me            UUID := auth.uid();
+    v_cycle_id      UUID;
+    v_settlement_id UUID;
+BEGIN
+    IF v_me IS NULL THEN
+        RAISE EXCEPTION 'Not authenticated';
+    END IF;
+    IF NOT public.is_group_member(p_group_id) THEN
+        RAISE EXCEPTION 'You are not a member of this group';
+    END IF;
+    IF p_from_user = v_me THEN
+        RAISE EXCEPTION 'You cannot settle up with yourself';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM group_members WHERE group_id = p_group_id AND user_id = p_from_user) THEN
+        RAISE EXCEPTION 'That person is not a member of this group';
+    END IF;
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Settlement amount must be greater than zero';
+    END IF;
+
+    SELECT id INTO v_cycle_id FROM settlement_cycles
+    WHERE group_id = p_group_id AND status = 'ACTIVE'
+    ORDER BY started_at DESC LIMIT 1;
+
+    IF v_cycle_id IS NULL THEN
+        INSERT INTO settlement_cycles (group_id, status, initiated_by)
+        VALUES (p_group_id, 'ACTIVE', v_me)
+        RETURNING id INTO v_cycle_id;
+    END IF;
+
+    INSERT INTO group_settlements (group_id, cycle_id, from_user, to_user, amount, note, payment_method, is_confirmed)
+    VALUES (p_group_id, v_cycle_id, p_from_user, v_me, p_amount, COALESCE(p_note, ''), COALESCE(p_method, 'CASH'), TRUE)
+    RETURNING id INTO v_settlement_id;
+
+    -- Identical shape to record_settlement, just with the roles swapped: the
+    -- payer's balance moves up, the receiver's down.
+    INSERT INTO ledger_entries (group_id, cycle_id, user_id, entry_type, amount, reference_id, description)
+    VALUES
+        (p_group_id, v_cycle_id, p_from_user, 'SETTLEMENT',  p_amount, v_settlement_id, 'Settlement paid'),
+        (p_group_id, v_cycle_id, v_me,        'SETTLEMENT', -p_amount, v_settlement_id, 'Settlement received');
+
+    UPDATE expenses
+    SET settled_at = NOW()
+    WHERE group_id = p_group_id
+      AND settled_at IS NULL
+      AND is_deleted = FALSE;
+
+    RETURN v_settlement_id;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.record_payment_received(UUID, UUID, DECIMAL, TEXT, TEXT) TO authenticated;

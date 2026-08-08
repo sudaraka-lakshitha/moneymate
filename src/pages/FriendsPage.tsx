@@ -60,6 +60,8 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const [lendError, setLendError] = useState<string | null>(null);
   const [editingEntry, setEditingEntry] = useState<Expense | null>(null);
   const [directEntries, setDirectEntries] = useState<Expense[]>([]);
+  /** expenseId -> friendId -> their stored share, so editing never guesses. */
+  const [directShares, setDirectShares] = useState<Record<string, Record<string, number>>>({});
   const [busyEntry, setBusyEntry] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -120,9 +122,27 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
           .in('group_id', directIds)
           .eq('is_deleted', false)
           .order('created_at', { ascending: false });
-        setDirectEntries((directData ?? []) as Expense[]);
+        const entries = (directData ?? []) as Expense[];
+        setDirectEntries(entries);
+
+        // The stored split, not a guess. Opening an edit without it would fall
+        // back to an even split and silently halve a loan on save.
+        if (entries.length > 0) {
+          const { data: splitData } = await supabase
+            .from('expense_splits')
+            .select('expense_id, user_id, amount')
+            .in('expense_id', entries.map((x) => x.id));
+          const map: Record<string, Record<string, number>> = {};
+          for (const row of (splitData ?? []) as any[]) {
+            (map[row.expense_id] ||= {})[row.user_id] = Number(row.amount);
+          }
+          setDirectShares(map);
+        } else {
+          setDirectShares({});
+        }
       } else {
         setDirectEntries([]);
+        setDirectShares({});
       }
       setGroupNames(Object.fromEntries(groups.map((g) => [g.id, g.name])));
       const directIdSet = new Set(groups.filter((g) => g.is_direct).map((g) => g.id));
@@ -228,6 +248,18 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     if (!groupId) return [];
     return directEntries.filter((x) => x.group_id === groupId);
   }, [selected, directEntries, directGroupByFriend]);
+
+  /**
+   * Settlements post against one group, so the headline button acts on the
+   * largest outstanding balance rather than pretending to clear several at
+   * once. The per-group rows below remain available for the rest.
+   */
+  const settleablePart = useMemo(() => {
+    if (!selected) return null;
+    const live = selected.perGroup.filter((g) => Math.abs(g.net) >= 0.01);
+    if (live.length === 0) return null;
+    return live.reduce((biggest, g) => (Math.abs(g.net) > Math.abs(biggest.net) ? g : biggest));
+  }, [selected]);
 
   /** Payments between me and the friend whose sheet is open, newest first. */
   const selectedHistory = useMemo(() => {
@@ -344,17 +376,22 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
 
   const openEditEntry = (entry: Expense, friend: User) => {
     const iPaidIt = entry.paid_by === user.id;
-    // Their share is whatever is not mine; recovered from the stored splits by
-    // the amount minus my own share is not available here, so derive from the
-    // entry's own split rows on the server instead — for the form we start from
-    // the common cases and let the user adjust.
+    const theirs = directShares[entry.id]?.[friend.id] ?? roundMoney(Number(entry.amount) / 2);
+    const total = roundMoney(Number(entry.amount));
+
     setLendTo(friend);
     setEditingEntry(entry);
     setLendAmount(String(entry.amount));
     setLendNote(entry.title === 'Loan' || entry.title === 'Shared expense' ? '' : entry.title);
     setIPaid(iPaidIt);
-    setTheirShare('');
-    setLendMode('SHARED');
+    setTheirShare(String(theirs));
+
+    // Reopen in the shape it was recorded in, so saving without touching
+    // anything cannot quietly change what the record means.
+    if (iPaidIt && Math.abs(theirs - total) < 0.01) setLendMode('LENT');
+    else if (!iPaidIt && Math.abs(theirs) < 0.01) setLendMode('BORROWED');
+    else setLendMode('SHARED');
+
     setLendError(null);
     setSelected(null);
   };
@@ -734,9 +771,35 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
               </span>
             </div>
 
+            {Math.abs(selected.net_balance) >= 0.01 && settleablePart && (
+              <button
+                type="button"
+                className="btn btn-primary btn-block btn-lg"
+                onClick={() => {
+                  setSettleTarget({
+                    groupId: settleablePart.groupId,
+                    groupName: directGroupIds.has(settleablePart.groupId)
+                      ? undefined
+                      : settleablePart.groupName,
+                    payee: selected.friend,
+                    suggestedAmount: Math.abs(settleablePart.net),
+                    direction: settleablePart.net > 0 ? 'THEY_PAY' : 'I_PAY',
+                  });
+                  setSelected(null);
+                }}
+              >
+                <HandCoins size={17} />
+                {settleablePart.net > 0
+                  ? `Record ${formatLKR(Math.abs(settleablePart.net))} received`
+                  : `Settle ${formatLKR(Math.abs(settleablePart.net))}`}
+              </button>
+            )}
+
             <button
               type="button"
-              className="btn btn-primary btn-block"
+              className={`btn btn-block ${
+                Math.abs(selected.net_balance) >= 0.01 && settleablePart ? 'btn-secondary' : 'btn-primary'
+              }`}
               onClick={() => openLend(selected.friend)}
             >
               <HandCoins size={16} /> Add expense or loan
@@ -772,7 +835,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                         >
                           {formatLKR(Math.abs(entry.net))}
                         </span>
-                        {entry.net < 0 && (
+                        {Math.abs(entry.net) >= 0.01 && (
                           <button
                             type="button"
                             className="btn btn-primary btn-sm"
@@ -786,11 +849,14 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                                   : entry.groupName,
                                 payee: selected.friend,
                                 suggestedAmount: Math.abs(entry.net),
+                                // Positive means they owe me, so the payment
+                                // comes from them — previously unrecordable.
+                                direction: entry.net > 0 ? 'THEY_PAY' : 'I_PAY',
                               });
                               setSelected(null);
                             }}
                           >
-                            Settle
+                            {entry.net > 0 ? 'Record payment' : 'Settle'}
                           </button>
                         )}
                       </span>
@@ -1037,6 +1103,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                     total={roundMoney(parseAmount(lendAmount))}
                     theirShareRaw={theirShare}
                     friendName={lendTo.display_name.split(' ')[0]}
+                    iPaid={iPaid}
                   />
                 </div>
               </>
@@ -1104,11 +1171,12 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
  * where an uneven split goes wrong, so the remainder is computed and displayed
  * before the record is saved — including when it does not add up.
  */
-const SplitPreview: React.FC<{ total: number; theirShareRaw: string; friendName: string }> = ({
-  total,
-  theirShareRaw,
-  friendName,
-}) => {
+const SplitPreview: React.FC<{
+  total: number;
+  theirShareRaw: string;
+  friendName: string;
+  iPaid: boolean;
+}> = ({ total, theirShareRaw, friendName, iPaid }) => {
   if (total <= 0) {
     return <span className="hint">Leave blank to split it down the middle.</span>;
   }
@@ -1118,20 +1186,51 @@ const SplitPreview: React.FC<{ total: number; theirShareRaw: string; friendName:
   const mine = roundMoney(total - theirs);
   const invalid = theirs < 0 || theirs > total;
 
+  // What actually changes hands: their share if I paid, my share if they did.
+  // This is the line that moves when you flip who paid — the shares alone do
+  // not, which made the payer toggle look like it did nothing.
+  const owed = iPaid ? theirs : mine;
+
   return (
     <div className="stack-sm" style={{ marginTop: 'var(--sp-2)' }}>
       <div className="row-between">
-        <span className="hint">{friendName}</span>
-        <span className={`tabular ${invalid ? 'text-negative' : ''}`} style={{ fontSize: '0.85rem', fontWeight: 700 }}>
+        <span className="hint">{friendName}&rsquo;s share</span>
+        <span
+          className={`tabular ${invalid ? 'text-negative' : ''}`}
+          style={{ fontSize: '0.85rem', fontWeight: 700 }}
+        >
           {formatLKR(theirs)}
         </span>
       </div>
       <div className="row-between">
-        <span className="hint">You</span>
-        <span className={`tabular ${invalid ? 'text-negative' : ''}`} style={{ fontSize: '0.85rem', fontWeight: 700 }}>
+        <span className="hint">Your share</span>
+        <span
+          className={`tabular ${invalid ? 'text-negative' : ''}`}
+          style={{ fontSize: '0.85rem', fontWeight: 700 }}
+        >
           {formatLKR(mine)}
         </span>
       </div>
+
+      {!invalid && (
+        <div
+          className="row-between card-divider"
+          style={{ paddingTop: 'var(--sp-2)', marginTop: 2 }}
+        >
+          <span className="hint">Result</span>
+          <span
+            className={`tabular ${owed < 0.01 ? 'text-neutral' : iPaid ? 'text-positive' : 'text-negative'}`}
+            style={{ fontSize: '0.85rem', fontWeight: 700 }}
+          >
+            {owed < 0.01
+              ? 'Nothing owed'
+              : iPaid
+                ? `${friendName} owes you ${formatLKR(owed)}`
+                : `You owe ${friendName} ${formatLKR(owed)}`}
+          </span>
+        </div>
+      )}
+
       <span className="hint">
         {invalid
           ? `That is more than the bill — ${friendName}'s share must be between Rs. 0 and ${formatLKR(total)}.`
