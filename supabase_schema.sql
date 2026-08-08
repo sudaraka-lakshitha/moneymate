@@ -264,16 +264,16 @@ $$;
 -- ========================================
 -- VIEWS
 -- ========================================
-
-CREATE OR REPLACE VIEW group_balances AS
-SELECT
-    group_id,
-    user_id,
-    COALESCE(SUM(amount), 0)                                            AS net_balance,
-    COALESCE(SUM(CASE WHEN amount > 0 THEN amount  ELSE 0 END), 0)     AS total_paid,
-    COALESCE(SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END), 0) AS total_owed
-FROM ledger_entries
-GROUP BY group_id, user_id;
+-- group_balances (net_balance/total_paid/total_owed per group_id+user_id) used
+-- to live here. Removed: it was never queried by the app — balances are
+-- computed client-side from ledger_entries directly — and plain views run
+-- with the CREATOR's privileges against their underlying tables, not the
+-- querying user's, so it silently bypassed ledger_entries' RLS. Exposed over
+-- the auto-generated REST API, that let any signed-in user read every group's
+-- balance data, not just their own. Flagged by Supabase's linter as
+-- "Security Definer View"; dropping removes the exposure entirely rather than
+-- patching it with `security_invoker = true`, since nothing needs it.
+DROP VIEW IF EXISTS public.group_balances;
 
 -- ========================================
 -- ROW LEVEL SECURITY — enable AFTER all tables exist
