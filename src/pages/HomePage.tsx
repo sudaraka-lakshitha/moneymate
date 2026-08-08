@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
+import { useLiveRefresh } from '../lib/realtime';
 import { DailyExpense, Expense, Group, User } from '../types';
 import { formatLKR, formatLKRSigned, roundMoney } from '../lib/currency';
 import { computeFriendBalances, GroupLedger, netByUser } from '../lib/balances';
@@ -109,6 +110,8 @@ export const HomePage: React.FC<HomePageProps> = ({ user, onNavigate }) => {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useLiveRefresh('home', ['expenses','ledger_entries','group_members','daily_expenses'], load);
 
   const netBalance = roundMoney(owedToMe - owedByMe);
   const isPositive = netBalance >= 0;

@@ -35,6 +35,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
   const [draftName, setDraftName] = useState(user.display_name);
   const [saving, setSaving] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const install = useInstall();
   const [showIosHelp, setShowIosHelp] = useState(false);
@@ -167,6 +168,38 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
       toast.error(friendlyDbError(error, 'Could not remove your picture.'));
     } finally {
       setUploadingPhoto(false);
+    }
+  };
+
+  const handleDeleteAccount = async () => {
+    const first = await confirm({
+      title: 'Delete your account?',
+      message:
+        'Your profile, personal expenses, budgets and friendships are erased permanently. Groups you share stay for the other members, and past shared bills remain on their records. This cannot be undone.',
+      confirmLabel: 'Continue',
+      danger: true,
+    });
+    if (!first) return;
+
+    // Two steps on purpose: this is the one action in the app with no way back.
+    const second = await confirm({
+      title: 'Really delete everything?',
+      message: `This will permanently close the account for ${user.email}. There is no undo and no recovery.`,
+      confirmLabel: 'Delete my account',
+      danger: true,
+    });
+    if (!second) return;
+
+    setDeleting(true);
+    try {
+      const { error } = await supabase.rpc('delete_my_account');
+      if (error) throw error;
+      await supabase.auth.signOut();
+      onSignedOut();
+    } catch (error) {
+      // The commonest refusal is an unsettled balance, and the server says so.
+      toast.error(friendlyDbError(error, 'Could not delete your account.'));
+      setDeleting(false);
     }
   };
 
@@ -453,6 +486,27 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
           </form>
         </Sheet>
       )}
+
+      <div className="card" style={{ borderColor: 'var(--negative)', marginTop: 'var(--sp-6)' }}>
+        <span className="row" style={{ gap: 8, marginBottom: 6 }}>
+          <Trash2 size={16} color="var(--negative)" />
+          <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Delete account</span>
+        </span>
+        <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+          Erases your profile, personal expenses, budgets and friendships for good. Settle every balance
+          first — an unsettled account cannot be deleted, because it would leave somebody else's books
+          short.
+        </p>
+        <button
+          type="button"
+          className="btn btn-danger btn-block"
+          onClick={handleDeleteAccount}
+          disabled={deleting}
+        >
+          {deleting && <Spinner />}
+          {deleting ? 'Deleting…' : 'Delete my account'}
+        </button>
+      </div>
 
       {showIosHelp && <IosInstallHelp onClose={() => setShowIosHelp(false)} />}
     </div>

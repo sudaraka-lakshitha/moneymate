@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
+import { useLiveRefresh } from '../lib/realtime';
 import { Expense, FriendRequest, Group, GroupSettlement, User } from '../types';
 import { formatLKR, formatLKRSigned, parseAmount, roundMoney } from '../lib/currency';
 import { computeFriendBalances, FriendBalanceDetail, GroupLedger, netByUser } from '../lib/balances';
@@ -227,6 +228,8 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useLiveRefresh('friends', ['expenses','ledger_entries','group_settlements','friend_requests','group_members'], load);
 
   const totals = useMemo(() => {
     let owedToMe = 0;

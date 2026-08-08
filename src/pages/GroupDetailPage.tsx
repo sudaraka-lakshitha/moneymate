@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
+import { useLiveRefresh } from '../lib/realtime';
 import { Expense, Group, GroupInvitation, GroupMember, GroupSettlement, SplitMethod, User } from '../types';
 import { formatLKR, formatLKRSigned } from '../lib/currency';
 import { simplifyDebts } from '../lib/debtSimplifier';
@@ -66,6 +67,8 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   const [invitingByEmail, setInvitingByEmail] = useState(false);
   const [inviteEmailError, setInviteEmailError] = useState<string | null>(null);
   const [cancellingInvite, setCancellingInvite] = useState<string | null>(null);
+  const [friends, setFriends] = useState<User[]>([]);
+  const [invitingFriend, setInvitingFriend] = useState<string | null>(null);
 
   const [showStats, setShowStats] = useState(false);
   const [stats, setStats] = useState<any[]>([]);
@@ -138,6 +141,19 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
         .order('created_at', { ascending: false });
       if (invitationError) console.error('Group invitations failed to load:', invitationError);
       setInvitations((invitationData ?? []) as unknown as GroupInvitation[]);
+
+      // Your connections, so inviting somebody you already know does not mean
+      // retyping an address the app already has.
+      const { data: friendData } = await supabase
+        .from('friend_requests')
+        .select('requester:users!friend_requests_requester_id_fkey(*), addressee:users!friend_requests_addressee_id_fkey(*), requester_id, addressee_id')
+        .or(`requester_id.eq.${user.id},addressee_id.eq.${user.id}`)
+        .eq('status', 'ACCEPTED');
+      setFriends(
+        (friendData ?? [])
+          .map((row: any) => (row.requester_id === user.id ? row.addressee : row.requester))
+          .filter(Boolean) as User[]
+      );
     } catch (error) {
       setLoadError(friendlyDbError(error, 'Could not load this group.'));
     } finally {
@@ -148,6 +164,8 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   useEffect(() => {
     void load();
   }, [load]);
+
+  useLiveRefresh(`group-detail:${groupId}`, ['expenses','expense_splits','ledger_entries','group_settlements','group_members','group_invitations','group_join_requests'], load);
 
   const userMap = useMemo(() => {
     const map: Record<string, User> = {};
@@ -417,6 +435,27 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
       setShowStats(false);
     } finally {
       setStatsLoading(false);
+    }
+  };
+
+  const handleInviteFriend = async (friend: User) => {
+    setInvitingFriend(friend.id);
+    try {
+      const { data, error } = await supabase.rpc('invite_friend_to_group', {
+        p_group_id: groupId,
+        p_friend_id: friend.id,
+      });
+      if (error) throw error;
+
+      const status = (data as { out_status: string }[])?.[0]?.out_status;
+      if (status === 'INVITED') toast.success(`Invited ${friend.display_name}.`);
+      else if (status === 'ALREADY_INVITED') toast.info(`${friend.display_name} already has an invite.`);
+      else if (status === 'ALREADY_MEMBER') toast.info(`${friend.display_name} is already in this group.`);
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not send that invite.'));
+    } finally {
+      setInvitingFriend(null);
     }
   };
 
@@ -1245,6 +1284,43 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                   <span className="hint">or invite directly</span>
                   <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
                 </div>
+
+                {(() => {
+                  const memberIds = new Set(members.map((m) => m.user_id));
+                  const invitedIds = new Set(invitations.map((i) => i.invited_user_id).filter(Boolean));
+                  const available = friends.filter(
+                    (f) => !memberIds.has(f.id) && !invitedIds.has(f.id)
+                  );
+                  if (available.length === 0) return null;
+                  return (
+                    <div style={{ textAlign: 'left' }}>
+                      <span className="label label-block">Your friends</span>
+                      <div className="stack-sm">
+                        {available.map((f) => (
+                          <div key={f.id} className="card row">
+                            <Avatar name={f.display_name} url={f.avatar_url} size={32} />
+                            <span className="grow truncate" style={{ fontSize: '0.88rem', fontWeight: 600 }}>
+                              {f.display_name}
+                            </span>
+                            <button
+                              type="button"
+                              className="btn btn-primary btn-sm"
+                              onClick={() => handleInviteFriend(f)}
+                              disabled={invitingFriend === f.id}
+                            >
+                              {invitingFriend === f.id ? <Spinner /> : 'Invite'}
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="row" style={{ margin: 'var(--sp-3) 0' }}>
+                        <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
+                        <span className="hint">or by email</span>
+                        <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 <form onSubmit={handleInviteByEmail} className="stack" style={{ textAlign: 'left' }}>
                   <div className="input-prefixed">

@@ -69,7 +69,23 @@ const AppShell: React.FC = () => {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [profileError, setProfileError] = useState<string | null>(null);
-  const [route, setRoute] = useState('home');
+  // Survive a reload. A refresh dropping you back to Home means losing your
+  // place mid-task, which is exactly when people refresh.
+  const [route, setRoute] = useState(() => {
+    try {
+      return sessionStorage.getItem('moneymate.route') || 'home';
+    } catch {
+      return 'home';
+    }
+  });
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem('moneymate.route', route);
+    } catch {
+      // Private mode — the app simply opens on Home next time.
+    }
+  }, [route]);
   const [recovering, setRecovering] = useState(false);
   const [syncNote, setSyncNote] = useState<string | null>(null);
 

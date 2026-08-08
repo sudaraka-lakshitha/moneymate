@@ -170,7 +170,27 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
   const changePercent = previousTotal > 0 ? ((windowTotal - previousTotal) / previousTotal) * 100 : null;
 
   const activeDays = trend.filter((p) => p.value > 0).length;
-  const dailyAverage = range > 0 ? roundMoney(windowTotal / range) : 0;
+  /**
+   * Averaged over the days you actually spent on, not every day in the window,
+   * and never over more than the last 30. Dividing by the whole range answers
+   * "how much per calendar day", which reads as a much smaller number than
+   * people expect and drifts lower the wider the range gets — the useful figure
+   * is what a spending day typically costs.
+   */
+  const dailyAverage = useMemo(() => {
+    const window = Math.min(range, 30);
+    const from = lastNDays(window)[0];
+    const days = Object.entries(byDate).filter(([date, value]) => date >= from && value > 0);
+    if (days.length === 0) return 0;
+    const total = days.reduce((sum, [, value]) => sum + value, 0);
+    return roundMoney(total / days.length);
+  }, [byDate, range]);
+
+  const averagedOverDays = useMemo(() => {
+    const window = Math.min(range, 30);
+    const from = lastNDays(window)[0];
+    return Object.entries(byDate).filter(([date, value]) => date >= from && value > 0).length;
+  }, [byDate, range]);
   const busiest = trend.reduce<TrendPoint | null>(
     (top, point) => (point.value > (top?.value ?? 0) ? point : top),
     null
@@ -364,8 +384,13 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
           style={{ gap: 'var(--sp-6)', marginTop: 'var(--sp-4)', paddingTop: 'var(--sp-4)' }}
         >
           <div>
-            <div className="label">Daily average</div>
+            <div className="label">Avg. spending day</div>
             <div className="amount-md tabular">{formatLKR(dailyAverage)}</div>
+            <div className="hint">
+              {averagedOverDays > 0
+                ? `over ${averagedOverDays} day${averagedOverDays === 1 ? '' : 's'}${range > 30 ? ', last 30' : ''}`
+                : 'no spending yet'}
+            </div>
           </div>
           <div>
             <div className="label">Days with spend</div>
