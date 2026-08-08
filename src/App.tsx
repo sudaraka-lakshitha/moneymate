@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Session } from '@supabase/supabase-js';
 import { supabase } from './lib/supabase';
 import { User } from './types';
-import { clearAuthParamsFromUrl, readOAuthError } from './lib/authErrors';
+import { clearAuthParamsFromUrl, messageFrom, readOAuthError } from './lib/authErrors';
 import { ThemeProvider } from './lib/theme';
 import { ToastProvider } from './components/Toast';
 import { ConfirmProvider } from './components/Confirm';
@@ -151,7 +151,7 @@ const AppShell: React.FC = () => {
       // Still let the user in with what the token tells us, so a profile
       // hiccup does not lock them out of the whole app.
       console.error('Profile load failed:', error);
-      setProfileError(error instanceof Error ? error.message : String(error));
+      setProfileError(messageFrom(error));
       setUser({
         id: authUser.id,
         display_name: fallbackName,

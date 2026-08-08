@@ -78,9 +78,40 @@ export const clearAuthParamsFromUrl = (): void => {
   }
 };
 
+/**
+ * Pulls a human-readable message out of anything Supabase might throw or
+ * return as `{ error }`.
+ *
+ * supabase-js is inconsistent here: auth failures (`AuthError`) do extend
+ * `Error`, but query and RPC failures (`PostgrestError`, from `.from(...)` and
+ * `.rpc(...)`) are plain `{ message, details, hint, code }` objects — not
+ * `Error` instances. Checking only `instanceof Error` falls through to
+ * `String(error)` for every one of those, which stringifies an object as the
+ * literal text "[object Object]" instead of its message.
+ */
+export const messageFrom = (error: unknown): string => {
+  if (error instanceof Error) return error.message;
+
+  if (error && typeof error === 'object') {
+    const record = error as Record<string, unknown>;
+    for (const key of ['message', 'error_description', 'msg', 'hint', 'details']) {
+      const value = record[key];
+      if (typeof value === 'string' && value.trim()) return value;
+    }
+    try {
+      const json = JSON.stringify(error);
+      if (json && json !== '{}') return json;
+    } catch {
+      // Circular or non-serializable — fall through to String() below.
+    }
+  }
+
+  return String(error ?? '');
+};
+
 /** Turns a Supabase auth exception into something worth showing a user. */
 export const friendlyAuthError = (error: unknown): string => {
-  const raw = (error instanceof Error ? error.message : String(error ?? '')).trim();
+  const raw = messageFrom(error).trim();
   const haystack = raw.toLowerCase();
 
   if (haystack.includes('provider is not enabled') || haystack.includes('unsupported provider')) {
@@ -112,7 +143,7 @@ export const friendlyAuthError = (error: unknown): string => {
 
 /** Shared wording for non-auth Supabase failures. */
 export const friendlyDbError = (error: unknown, fallback: string): string => {
-  const raw = (error instanceof Error ? error.message : String(error ?? '')).trim();
+  const raw = messageFrom(error).trim();
   const haystack = raw.toLowerCase();
 
   if (haystack.includes('infinite recursion')) {

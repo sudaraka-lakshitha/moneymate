@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Camera, Loader2, ScanLine, Trash2 } from 'lucide-react';
 import { ReceiptScope, ScanResult, deleteReceipt, receiptUrl, scanReceipt, uploadReceipt } from '../lib/receipts';
 import { useOnline } from '../lib/offline';
+import { messageFrom } from '../lib/authErrors';
 import { Alert } from './ui';
 
 interface ReceiptPickerProps {
@@ -73,8 +74,11 @@ export const ReceiptPicker: React.FC<ReceiptPickerProps> = ({ scope, value, onCh
       const path = await uploadReceipt(file, scope);
       onChange(path);
     } catch (err) {
+      // Storage errors aren't guaranteed to be Error instances either — same
+      // messageFrom() used everywhere else, so this never falls back to a
+      // stringified object.
       setError(
-        err instanceof Error && /bucket|not found/i.test(err.message)
+        /bucket|not found/i.test(messageFrom(err))
           ? 'Receipt storage is not set up yet — re-run supabase_schema.sql, which creates the receipts bucket.'
           : 'Could not upload the receipt image.'
       );
