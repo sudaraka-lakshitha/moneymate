@@ -36,12 +36,27 @@ export const SettleUpSheet: React.FC<SettleUpSheetProps> = ({ target, onClose, o
   const [amountStr, setAmountStr] = useState(
     target.suggestedAmount > 0 ? target.suggestedAmount.toFixed(2) : ''
   );
+  const [mode, setMode] = useState<'FULL' | 'PARTIAL'>('FULL');
   const [method, setMethod] = useState('CASH');
   const [note, setNote] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const amount = roundMoney(parseAmount(amountStr));
+  const remaining = roundMoney(target.suggestedAmount - amount);
+  const isPartial = mode === 'PARTIAL' && amount > 0 && remaining > 0.005;
+
+  const chooseMode = (next: 'FULL' | 'PARTIAL') => {
+    setMode(next);
+    setError(null);
+    // Switching back to Full restores the whole balance rather than leaving a
+    // part-amount behind that no longer matches the label.
+    if (next === 'FULL') {
+      setAmountStr(target.suggestedAmount > 0 ? target.suggestedAmount.toFixed(2) : '');
+    } else {
+      setAmountStr('');
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -62,11 +77,20 @@ export const SettleUpSheet: React.FC<SettleUpSheetProps> = ({ target, onClose, o
 
     // Money changing hands is worth one deliberate confirmation, and it is the
     // last point at which the direction can still be checked.
+    const outstanding = isPartial ? ` ${formatLKR(remaining)} stays outstanding.` : '';
     const ok = await confirm({
-      title: theyPay ? 'Record this payment?' : 'Record this settlement?',
+      title: isPartial
+        ? 'Record this part payment?'
+        : theyPay
+          ? 'Record this payment?'
+          : 'Record this settlement?',
       message: theyPay
-        ? `${target.payee.display_name} paid you ${formatLKR(amount)}. This reduces what they owe you.`
-        : `You paid ${target.payee.display_name} ${formatLKR(amount)}. This reduces what you owe them.`,
+        ? `${target.payee.display_name} paid you ${formatLKR(amount)}.${
+            outstanding || ' That clears what they owe you.'
+          }`
+        : `You paid ${target.payee.display_name} ${formatLKR(amount)}.${
+            outstanding || ' That clears what you owe them.'
+          }`,
       confirmLabel: 'Record it',
     });
     if (!ok) return;
@@ -122,6 +146,27 @@ export const SettleUpSheet: React.FC<SettleUpSheetProps> = ({ target, onClose, o
           </div>
         </div>
 
+        {target.suggestedAmount > 0 && (
+          <div className="segmented" role="group" aria-label="How much">
+            <button
+              type="button"
+              className={`segmented-option ${mode === 'FULL' ? 'is-active' : ''}`}
+              onClick={() => chooseMode('FULL')}
+              aria-pressed={mode === 'FULL'}
+            >
+              Full amount
+            </button>
+            <button
+              type="button"
+              className={`segmented-option ${mode === 'PARTIAL' ? 'is-active' : ''}`}
+              onClick={() => chooseMode('PARTIAL')}
+              aria-pressed={mode === 'PARTIAL'}
+            >
+              Part of it
+            </button>
+          </div>
+        )}
+
         <div className="field">
           <span className="label label-block">Amount</span>
           <div className="input-prefixed">
@@ -130,16 +175,34 @@ export const SettleUpSheet: React.FC<SettleUpSheetProps> = ({ target, onClose, o
               type="text"
               inputMode="decimal"
               className="input tabular"
+              placeholder={mode === 'PARTIAL' ? 'How much now?' : '0.00'}
               value={amountStr}
               onChange={(e) => setAmountStr(e.target.value)}
-              autoFocus
+              // Read-only rather than disabled on Full: the figure stays legible
+              // and selectable, it just cannot drift from the balance it claims
+              // to be.
+              readOnly={mode === 'FULL' && target.suggestedAmount > 0}
+              autoFocus={mode === 'PARTIAL'}
               required
             />
           </div>
-          {target.suggestedAmount > 0 && amount > 0 && amount < target.suggestedAmount && (
-            <span className="hint">
-              {formatLKR(target.suggestedAmount - amount)} will still be outstanding.
-            </span>
+
+          {mode === 'PARTIAL' && target.suggestedAmount > 0 && (
+            <div className="row-between" style={{ marginTop: 'var(--sp-2)' }}>
+              <span className="hint">
+                {amount > 0 ? 'Still outstanding after this' : `Outstanding now`}
+              </span>
+              <span
+                className={`tabular ${remaining > 0.005 ? 'text-negative' : 'text-positive'}`}
+                style={{ fontSize: '0.85rem', fontWeight: 700 }}
+              >
+                {formatLKR(Math.max(0, amount > 0 ? remaining : target.suggestedAmount))}
+              </span>
+            </div>
+          )}
+
+          {mode === 'FULL' && target.suggestedAmount > 0 && (
+            <span className="hint">Clears the balance in full. Choose "Part of it" to pay some now.</span>
           )}
         </div>
 
@@ -173,7 +236,11 @@ export const SettleUpSheet: React.FC<SettleUpSheetProps> = ({ target, onClose, o
 
         <button type="submit" className="btn btn-primary btn-block btn-lg" disabled={saving}>
           {saving && <Spinner />}
-          {saving ? 'Recording…' : `Record ${amount > 0 ? formatLKR(amount) : 'payment'}`}
+          {saving
+            ? 'Recording…'
+            : isPartial
+              ? `Record part payment of ${formatLKR(amount)}`
+              : `Record ${amount > 0 ? formatLKR(amount) : 'payment'}`}
         </button>
       </form>
     </Sheet>
