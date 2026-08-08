@@ -54,7 +54,7 @@ export const SearchPage: React.FC<SearchPageProps> = ({ user, onNavigate }) => {
       const [groupRes, personalRes] = await Promise.all([
         supabase
           .from('expenses')
-          .select('id, title, amount, category, created_at, notes, group_id, groups(name), paid_by_user:users!expenses_paid_by_fkey(display_name)')
+          .select('id, title, amount, category, created_at, notes, group_id, groups(name, is_direct), paid_by_user:users!expenses_paid_by_fkey(display_name)')
           .eq('is_deleted', false)
           .order('created_at', { ascending: false })
           .limit(500),
@@ -78,7 +78,9 @@ export const SearchPage: React.FC<SearchPageProps> = ({ user, onNavigate }) => {
         category: (row.category || 'OTHER') as ExpenseCategory,
         date: String(row.created_at).slice(0, 10),
         groupId: row.group_id,
-        groupName: row.groups?.name,
+        // Direct pair groups are an implementation detail of friend loans;
+        // showing "Between you and X" as a group label just confuses the result.
+        groupName: row.groups?.is_direct ? undefined : row.groups?.name,
         payerName: row.paid_by_user?.display_name,
         note: row.notes,
       }));

@@ -5,6 +5,12 @@ import { roundMoney } from './currency';
 export interface GroupLedger {
   groupId: string;
   groupName: string;
+  /**
+   * A hidden one-to-one group backing direct loans. It carries real balances,
+   * but it is not a group the two people "share" in any sense they would
+   * recognise, so it must not be counted or named as one.
+   */
+  isDirect?: boolean;
   /** userId -> net position in this group (positive = is owed). */
   balances: Record<string, number>;
   members: Record<string, User>;
@@ -74,7 +80,12 @@ export const computeFriendBalances = (groups: GroupLedger[], meId: string): Frie
     // Everyone you share a group with is a friend, settled or not.
     for (const [userId, user] of Object.entries(group.members)) {
       if (userId === meId) continue;
-      ensure(user).groups.add(group.groupId);
+      const entry = ensure(user);
+      // A direct pair group still creates the friend row and carries their
+      // balance, but must not count toward "N shared groups" — lending someone
+      // money does not put you in a group together, and saying otherwise
+      // contradicts the whole point of the direct flow.
+      if (!group.isDirect) entry.groups.add(group.groupId);
     }
 
     for (const edge of simplifyDebts(group.balances, group.members)) {
