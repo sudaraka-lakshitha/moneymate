@@ -99,6 +99,7 @@ export interface DailyExpense {
   category: ExpenseCategory;
   date: string;
   note?: string;
+  receipt_url?: string | null;
   is_deleted: boolean;
   created_at: string;
 }
