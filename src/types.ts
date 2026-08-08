@@ -56,6 +56,12 @@ export interface Expense {
   created_at: string;
   updated_at?: string;
   paid_by_user?: User;
+  /**
+   * Set when a settlement covered this bill, which freezes it. Editing it after
+   * that would reverse the expense while leaving the payment in place, so a
+   * settled group would silently show a debt again.
+   */
+  settled_at?: string | null;
 }
 
 export interface ExpenseSplit {

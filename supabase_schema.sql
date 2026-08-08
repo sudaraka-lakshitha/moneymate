@@ -1799,3 +1799,254 @@ BEGIN
     $p$;
 END
 $avatars$;
+
+-- ========================================
+-- SETTLEMENT LOCK
+-- ========================================
+-- Once somebody has paid up, the bills that payment was calculated from become
+-- history and stop being editable.
+--
+-- Why this has to exist: settlements are their own ledger entries, independent
+-- of any one expense. Edit or delete a bill after it has been settled and only
+-- the expense side is reversed — the payment stays. The balance does not return
+-- to zero, it swings the other way, so a group that was square silently shows a
+-- debt again. Reversing the payment instead would be worse: it would erase a
+-- record of money that genuinely changed hands.
+--
+-- Recording a payment stamps every open expense in the group as settled, and a
+-- stamped expense is frozen. A bill added *after* that payment is untouched,
+-- because no payment covered it yet. The way to fix a locked bill is a new
+-- correcting expense, which leaves both the original and the correction visible.
+--
+-- The stamp is an explicit column rather than a "is there a settlement newer
+-- than this expense" timestamp comparison. NOW() is transaction start time, so
+-- an expense and a settlement written in the same transaction compare as equal
+-- and the lock silently fails to apply — quite apart from clock skew and
+-- sub-millisecond ties. An explicit marker is deterministic, and it also lets
+-- the client read the lock straight off the expense row.
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ;
+
+-- Backfill for data that predates the column. Without this, bills already paid
+-- off before this feature shipped would still look editable, which is precisely
+-- the case that reopens a debt.
+--
+-- Timestamp comparison is fine *here*, unlike in the live rule above: these rows
+-- were written by separate transactions minutes or days apart, so there are no
+-- same-transaction ties to trip over. Only touches rows not already stamped, so
+-- re-running the script is safe.
+UPDATE expenses e
+SET settled_at = paid.first_settlement
+FROM (
+    SELECT ex.id, MIN(gs.created_at) AS first_settlement
+    FROM expenses ex
+    JOIN group_settlements gs
+      ON gs.group_id = ex.group_id
+     AND gs.created_at > ex.created_at
+    GROUP BY ex.id
+) AS paid
+WHERE e.id = paid.id
+  AND e.settled_at IS NULL;
+
+CREATE OR REPLACE FUNCTION public.expense_is_locked(p_expense_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM expenses WHERE id = p_expense_id AND settled_at IS NOT NULL
+    );
+$$;
+
+GRANT EXECUTE ON FUNCTION public.expense_is_locked(UUID) TO authenticated;
+
+-- Re-defined to stamp the expenses a payment covers. Body is otherwise
+-- identical to the original definition earlier in this file.
+CREATE OR REPLACE FUNCTION public.record_settlement(
+    p_group_id UUID,
+    p_to_user  UUID,
+    p_amount   DECIMAL,
+    p_note     TEXT DEFAULT '',
+    p_method   TEXT DEFAULT 'CASH'
+)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_cycle_id UUID;
+    v_settlement_id UUID;
+    v_from UUID := auth.uid();
+BEGIN
+    IF v_from IS NULL THEN
+        RAISE EXCEPTION 'Not authenticated';
+    END IF;
+    IF NOT public.is_group_member(p_group_id) THEN
+        RAISE EXCEPTION 'You are not a member of this group';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM group_members WHERE group_id = p_group_id AND user_id = p_to_user) THEN
+        RAISE EXCEPTION 'Recipient is not a member of this group';
+    END IF;
+    IF p_to_user = v_from THEN
+        RAISE EXCEPTION 'You cannot settle up with yourself';
+    END IF;
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Settlement amount must be greater than zero';
+    END IF;
+
+    SELECT id INTO v_cycle_id FROM settlement_cycles
+    WHERE group_id = p_group_id AND status = 'ACTIVE'
+    ORDER BY started_at DESC LIMIT 1;
+
+    IF v_cycle_id IS NULL THEN
+        INSERT INTO settlement_cycles (group_id, status, initiated_by)
+        VALUES (p_group_id, 'ACTIVE', v_from)
+        RETURNING id INTO v_cycle_id;
+    END IF;
+
+    INSERT INTO group_settlements (group_id, cycle_id, from_user, to_user, amount, note, payment_method, is_confirmed)
+    VALUES (p_group_id, v_cycle_id, v_from, p_to_user, p_amount, COALESCE(p_note, ''), COALESCE(p_method, 'CASH'), FALSE)
+    RETURNING id INTO v_settlement_id;
+
+    -- Paying down what you owe moves your balance up; being paid moves theirs down.
+    INSERT INTO ledger_entries (group_id, cycle_id, user_id, entry_type, amount, reference_id, description)
+    VALUES
+        (p_group_id, v_cycle_id, v_from,     'SETTLEMENT',  p_amount, v_settlement_id, 'Settlement paid'),
+        (p_group_id, v_cycle_id, p_to_user,  'SETTLEMENT', -p_amount, v_settlement_id, 'Settlement received');
+
+    -- Freeze the bills this payment was calculated from.
+    UPDATE expenses
+    SET settled_at = NOW()
+    WHERE group_id = p_group_id
+      AND settled_at IS NULL
+      AND is_deleted = FALSE;
+
+    RETURN v_settlement_id;
+END;
+$$;
+
+-- Re-defined with the lock guard. Body is otherwise identical to the original
+-- definition earlier in this file.
+CREATE OR REPLACE FUNCTION public.update_expense(
+    p_expense_id   UUID,
+    p_title        TEXT,
+    p_amount       DECIMAL,
+    p_paid_by      UUID,
+    p_category     TEXT,
+    p_split_method TEXT,
+    p_notes        TEXT,
+    p_splits       JSONB,
+    p_items        JSONB DEFAULT '[]'::jsonb
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_old      expenses%ROWTYPE;
+    v_old_snap JSONB;
+    v_new_snap JSONB;
+    v_summary  TEXT := '';
+BEGIN
+    SELECT * INTO v_old FROM expenses WHERE id = p_expense_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+    IF v_old.is_deleted THEN
+        RAISE EXCEPTION 'This expense has been deleted';
+    END IF;
+    IF v_old.created_by <> auth.uid() AND NOT public.is_group_admin(v_old.group_id) THEN
+        RAISE EXCEPTION 'Only the person who added this expense, or a group admin, can edit it';
+    END IF;
+    IF public.expense_is_locked(p_expense_id) THEN
+        RAISE EXCEPTION 'This expense has already been settled and cannot be changed. Add a new expense to correct it.';
+    END IF;
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+
+    v_old_snap := jsonb_build_object(
+        'title', v_old.title, 'amount', v_old.amount, 'paid_by', v_old.paid_by,
+        'category', v_old.category, 'split_method', v_old.split_method, 'notes', v_old.notes,
+        'splits', (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                       'user_id', user_id, 'amount', amount, 'is_included', is_included)), '[]'::jsonb)
+                   FROM expense_splits WHERE expense_id = p_expense_id)
+    );
+
+    IF v_old.title <> p_title THEN
+        v_summary := v_summary || format('title "%s" → "%s"; ', v_old.title, p_title);
+    END IF;
+    IF ROUND(v_old.amount, 2) <> ROUND(p_amount, 2) THEN
+        v_summary := v_summary || format('amount %s → %s; ', v_old.amount, p_amount);
+    END IF;
+    IF v_old.paid_by IS DISTINCT FROM p_paid_by THEN
+        v_summary := v_summary || 'payer changed; ';
+    END IF;
+    IF v_old.split_method <> p_split_method THEN
+        v_summary := v_summary || format('split %s → %s; ', v_old.split_method, p_split_method);
+    END IF;
+    IF v_summary = '' THEN
+        v_summary := 'splits adjusted';
+    END IF;
+
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    SELECT group_id, user_id, 'EDIT_REVERSAL', -amount, p_expense_id, 'Reversal for edit of ' || v_old.title
+    FROM ledger_entries
+    WHERE reference_id = p_expense_id
+      AND entry_type IN ('EXPENSE', 'SPLIT');
+
+    DELETE FROM expense_splits WHERE expense_id = p_expense_id;
+    DELETE FROM expense_items  WHERE expense_id = p_expense_id;
+
+    UPDATE expenses
+    SET title = p_title, amount = p_amount, paid_by = p_paid_by,
+        on_behalf_of = CASE WHEN p_paid_by <> auth.uid() THEN p_paid_by END,
+        category = COALESCE(p_category, 'OTHER'),
+        split_method = COALESCE(p_split_method, 'EQUAL'),
+        notes = COALESCE(p_notes, ''),
+        updated_at = NOW()
+    WHERE id = p_expense_id;
+
+    PERFORM public.write_expense_rows(p_expense_id, v_old.group_id, p_title, p_amount, p_paid_by, p_splits, p_items);
+
+    v_new_snap := jsonb_build_object(
+        'title', p_title, 'amount', p_amount, 'paid_by', p_paid_by,
+        'category', p_category, 'split_method', p_split_method, 'notes', p_notes,
+        'splits', p_splits
+    );
+
+    INSERT INTO expense_edits (expense_id, edited_by, old_snapshot, new_snapshot, change_summary)
+    VALUES (p_expense_id, auth.uid(), v_old_snap, v_new_snap, RTRIM(v_summary, '; '));
+END;
+$$;
+
+-- Same guard on delete.
+CREATE OR REPLACE FUNCTION public.delete_expense(p_expense_id UUID, p_reason TEXT DEFAULT '')
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_old expenses%ROWTYPE;
+BEGIN
+    SELECT * INTO v_old FROM expenses WHERE id = p_expense_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+    IF v_old.is_deleted THEN
+        RETURN;  -- already gone; nothing to reverse twice
+    END IF;
+    IF v_old.created_by <> auth.uid() AND NOT public.is_group_admin(v_old.group_id) THEN
+        RAISE EXCEPTION 'Only the person who added this expense, or a group admin, can delete it';
+    END IF;
+    IF public.expense_is_locked(p_expense_id) THEN
+        RAISE EXCEPTION 'This expense has already been settled and cannot be deleted. Add a new expense to correct it.';
+    END IF;
+
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    SELECT group_id, user_id, 'DELETE_REVERSAL', -amount, p_expense_id, 'Reversal of deleted expense'
+    FROM ledger_entries
+    WHERE reference_id = p_expense_id
+      AND entry_type IN ('EXPENSE', 'SPLIT');
+
+    UPDATE expenses
+    SET is_deleted = TRUE, deleted_at = NOW(), deleted_by = auth.uid(),
+        delete_reason = COALESCE(p_reason, '')
+    WHERE id = p_expense_id;
+END;
+$$;

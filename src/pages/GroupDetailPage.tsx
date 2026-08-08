@@ -13,7 +13,7 @@ import { useConfirm } from '../components/Confirm';
 import { AddExpenseModal } from './AddExpenseModal';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
 import {
-  ArrowLeft, ArrowRight, AtSign, Archive, ArchiveRestore, Check, Copy, Eraser, Mail, Pencil, Plus,
+  ArrowLeft, ArrowRight, AtSign, Archive, ArchiveRestore, Check, Copy, Eraser, Lock, Mail, Pencil, Plus,
   RefreshCw, Settings2, Share2, Trash2, UserCheck, X,
 } from 'lucide-react';
 
@@ -556,9 +556,18 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
             />
           ) : (
             <div className="stack-sm">
+              {expenses.some((e) => e.settled_at && !e.is_deleted) && (
+                <span className="hint" style={{ marginBottom: 2 }}>
+                  Bills marked Settled are locked, so paid-up balances cannot reopen. To correct one, add a
+                  new expense.
+                </span>
+              )}
               {expenses.map((expense) => {
                 const meta = categoryMeta(expense.category);
-                const canManage = expense.created_by === user.id || isAdmin;
+                // Frozen once a payment covered it — the server refuses the edit
+                // either way, this just stops offering a button that cannot work.
+                const isSettled = Boolean(expense.settled_at);
+                const canManage = (expense.created_by === user.id || isAdmin) && !isSettled;
                 return (
                   <div
                     key={expense.id}
@@ -574,6 +583,11 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                           {expense.title}
                         </span>
                         {expense.is_deleted && <span className="badge badge-negative">Deleted</span>}
+                        {isSettled && !expense.is_deleted && (
+                          <span className="badge" title="Settled — locked so balances stay correct">
+                            <Lock size={10} /> Settled
+                          </span>
+                        )}
                         {expense.split_method === 'ITEMIZED' && !expense.is_deleted && (
                           <span className="badge badge-primary">Itemized</span>
                         )}
