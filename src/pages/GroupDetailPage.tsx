@@ -96,21 +96,30 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
 
       if (!settlementRes.error) setSettlements((settlementRes.data ?? []) as GroupSettlement[]);
 
-      // Only admins can read these; a failure here is not worth surfacing.
-      const { data: requestData } = await supabase
+      // Non-admins are filtered to zero rows by RLS, which is an empty array and
+      // not an error — so a real error here means the query itself is wrong and
+      // must be logged, never swallowed.
+      //
+      // The !group_join_requests_user_id_fkey hint is required: this table has
+      // two foreign keys into users (user_id and reviewed_by), so a bare
+      // `users(*)` embed is ambiguous and PostgREST rejects the whole request
+      // rather than picking one.
+      const { data: requestData, error: requestError } = await supabase
         .from('group_join_requests')
-        .select('id, user_id, requested_at, users(*)')
+        .select('id, user_id, requested_at, users!group_join_requests_user_id_fkey(*)')
         .eq('group_id', groupId)
         .eq('status', 'PENDING');
+      if (requestError) console.error('Join requests failed to load:', requestError);
       setRequests((requestData ?? []) as unknown as JoinRequest[]);
 
-      // Same visibility rule as join requests — admin-only, quiet on failure.
-      const { data: invitationData } = await supabase
+      // Same visibility rule as join requests — RLS filters, errors are bugs.
+      const { data: invitationData, error: invitationError } = await supabase
         .from('group_invitations')
         .select('*, inviter:users!group_invitations_invited_by_fkey(*)')
         .eq('group_id', groupId)
         .eq('status', 'PENDING')
         .order('created_at', { ascending: false });
+      if (invitationError) console.error('Group invitations failed to load:', invitationError);
       setInvitations((invitationData ?? []) as unknown as GroupInvitation[]);
     } catch (error) {
       setLoadError(friendlyDbError(error, 'Could not load this group.'));
