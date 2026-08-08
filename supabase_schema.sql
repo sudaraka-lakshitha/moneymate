@@ -2050,3 +2050,209 @@ BEGIN
     WHERE id = p_expense_id;
 END;
 $$;
+
+-- ========================================
+-- GROUP MANAGEMENT (edit, delete, membership exits)
+-- ========================================
+-- Leaving or being removed while money is outstanding abandons a debt: the
+-- ledger keeps the entries but nobody is left in the group to chase or settle
+-- them, and the remaining members' balances no longer add up to anyone. So every
+-- exit path below is gated on that person being at exactly zero, and deleting a
+-- whole group is gated on everyone being at zero.
+--
+-- These are SECURITY DEFINER RPCs and the permissive DELETE policies on
+-- group_members are dropped, because a balance check cannot be expressed as a
+-- row policy — leaving them in place would let a direct delete walk straight
+-- past the rule.
+DROP POLICY IF EXISTS "Admins can remove members" ON group_members;
+DROP POLICY IF EXISTS "Members can leave groups" ON group_members;
+
+-- What is one person's net position in one group?
+CREATE OR REPLACE FUNCTION public.member_balance(p_group_id UUID, p_user_id UUID)
+RETURNS DECIMAL
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+    SELECT COALESCE(ROUND(SUM(amount), 2), 0)
+    FROM ledger_entries
+    WHERE group_id = p_group_id AND user_id = p_user_id;
+$$;
+
+-- Admin edits the group's own details. Deliberately does not touch invite_code,
+-- status or any financial column — this is the name/description/icon only.
+CREATE OR REPLACE FUNCTION public.update_group(
+    p_group_id    UUID,
+    p_name        TEXT,
+    p_description TEXT DEFAULT '',
+    p_icon_emoji  TEXT DEFAULT '💰'
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+    IF NOT public.is_group_admin(p_group_id) THEN
+        RAISE EXCEPTION 'Only a group admin can edit this group';
+    END IF;
+    IF p_name IS NULL OR LENGTH(TRIM(p_name)) = 0 THEN
+        RAISE EXCEPTION 'Give the group a name';
+    END IF;
+
+    UPDATE groups
+    SET name        = TRIM(p_name),
+        description = COALESCE(TRIM(p_description), ''),
+        icon_emoji   = COALESCE(NULLIF(TRIM(p_icon_emoji), ''), '💰'),
+        updated_at  = NOW()
+    WHERE id = p_group_id;
+END;
+$$;
+
+-- Admin deletes the group outright. Everything cascades from groups.id.
+CREATE OR REPLACE FUNCTION public.delete_group(p_group_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+    IF NOT public.is_group_admin(p_group_id) THEN
+        RAISE EXCEPTION 'Only a group admin can delete this group';
+    END IF;
+    IF NOT public.group_is_settled(p_group_id) THEN
+        RAISE EXCEPTION 'Settle every balance in this group before deleting it';
+    END IF;
+
+    DELETE FROM groups WHERE id = p_group_id;
+END;
+$$;
+
+-- Admin removes somebody else. Their own balance must be clear; the rest of the
+-- group may still owe each other, which is not this person's problem.
+CREATE OR REPLACE FUNCTION public.remove_group_member(p_group_id UUID, p_user_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_balance DECIMAL;
+    v_admins  INT;
+BEGIN
+    IF NOT public.is_group_admin(p_group_id) THEN
+        RAISE EXCEPTION 'Only a group admin can remove members';
+    END IF;
+    IF p_user_id = auth.uid() THEN
+        RAISE EXCEPTION 'Use "Leave group" to remove yourself';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM group_members WHERE group_id = p_group_id AND user_id = p_user_id) THEN
+        RAISE EXCEPTION 'That person is not in this group';
+    END IF;
+
+    v_balance := public.member_balance(p_group_id, p_user_id);
+    IF ABS(v_balance) >= 0.01 THEN
+        RAISE EXCEPTION 'Settle up with this member before removing them (currently %)', v_balance;
+    END IF;
+
+    -- Never strand the group without an admin.
+    SELECT COUNT(*) INTO v_admins FROM group_members WHERE group_id = p_group_id AND role = 'ADMIN';
+    IF v_admins <= 1 AND EXISTS (
+        SELECT 1 FROM group_members WHERE group_id = p_group_id AND user_id = p_user_id AND role = 'ADMIN'
+    ) THEN
+        RAISE EXCEPTION 'Make someone else an admin first';
+    END IF;
+
+    DELETE FROM group_members WHERE group_id = p_group_id AND user_id = p_user_id;
+END;
+$$;
+
+-- Admin promotes or demotes. Needed so the last admin has a way out that is not
+-- "abandon the group", and so leaving never has to guess who should take over.
+CREATE OR REPLACE FUNCTION public.set_member_role(p_group_id UUID, p_user_id UUID, p_role TEXT)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_admins INT;
+BEGIN
+    IF NOT public.is_group_admin(p_group_id) THEN
+        RAISE EXCEPTION 'Only a group admin can change roles';
+    END IF;
+    IF p_role NOT IN ('ADMIN', 'MEMBER') THEN
+        RAISE EXCEPTION 'Unknown role';
+    END IF;
+
+    IF p_role = 'MEMBER' THEN
+        SELECT COUNT(*) INTO v_admins FROM group_members WHERE group_id = p_group_id AND role = 'ADMIN';
+        IF v_admins <= 1 AND EXISTS (
+            SELECT 1 FROM group_members WHERE group_id = p_group_id AND user_id = p_user_id AND role = 'ADMIN'
+        ) THEN
+            RAISE EXCEPTION 'A group needs at least one admin';
+        END IF;
+    END IF;
+
+    UPDATE group_members SET role = p_role WHERE group_id = p_group_id AND user_id = p_user_id;
+END;
+$$;
+
+-- Leaving on your own account.
+--
+-- Returns what happened so the app can say so: LEFT, LEFT_AND_PROMOTED (you were
+-- the last admin, so the longest-standing member took over rather than leaving
+-- the group unmanageable), or DELETED_EMPTY (you were the last member, so an
+-- empty shell was not worth keeping).
+CREATE OR REPLACE FUNCTION public.leave_group(p_group_id UUID)
+RETURNS TEXT
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me        UUID := auth.uid();
+    v_balance   DECIMAL;
+    v_was_admin BOOLEAN;
+    v_admins    INT;
+    v_others    INT;
+    v_heir      UUID;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM group_members WHERE group_id = p_group_id AND user_id = v_me) THEN
+        RAISE EXCEPTION 'You are not in this group';
+    END IF;
+
+    v_balance := public.member_balance(p_group_id, v_me);
+    IF ABS(v_balance) >= 0.01 THEN
+        RAISE EXCEPTION 'Settle your balance before leaving (currently %)', v_balance;
+    END IF;
+
+    SELECT role = 'ADMIN' INTO v_was_admin
+    FROM group_members WHERE group_id = p_group_id AND user_id = v_me;
+
+    SELECT COUNT(*) INTO v_others
+    FROM group_members WHERE group_id = p_group_id AND user_id <> v_me;
+
+    DELETE FROM group_members WHERE group_id = p_group_id AND user_id = v_me;
+
+    IF v_others = 0 THEN
+        DELETE FROM groups WHERE id = p_group_id;
+        RETURN 'DELETED_EMPTY';
+    END IF;
+
+    IF v_was_admin THEN
+        SELECT COUNT(*) INTO v_admins
+        FROM group_members WHERE group_id = p_group_id AND role = 'ADMIN';
+
+        IF v_admins = 0 THEN
+            SELECT user_id INTO v_heir
+            FROM group_members
+            WHERE group_id = p_group_id
+            ORDER BY joined_at ASC
+            LIMIT 1;
+
+            UPDATE group_members SET role = 'ADMIN'
+            WHERE group_id = p_group_id AND user_id = v_heir;
+
+            RETURN 'LEFT_AND_PROMOTED';
+        END IF;
+    END IF;
+
+    RETURN 'LEFT';
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.member_balance(UUID, UUID)         TO authenticated;
+GRANT EXECUTE ON FUNCTION public.update_group(UUID, TEXT, TEXT, TEXT) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.delete_group(UUID)                 TO authenticated;
+GRANT EXECUTE ON FUNCTION public.remove_group_member(UUID, UUID)    TO authenticated;
+GRANT EXECUTE ON FUNCTION public.set_member_role(UUID, UUID, TEXT)  TO authenticated;
+GRANT EXECUTE ON FUNCTION public.leave_group(UUID)                  TO authenticated;
