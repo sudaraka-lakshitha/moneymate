@@ -107,6 +107,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       const ledgers: GroupLedger[] = groups.map((group) => ({
         groupId: group.id,
         groupName: group.name,
+        isDirect: Boolean(group.is_direct),
         balances: netByUser((ledgerRes.data ?? []).filter((row: any) => row.group_id === group.id)),
         members: Object.fromEntries(
           (memberRes.data ?? [])
@@ -569,7 +570,9 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                     <span className="hint">
                       {friend.shared_group_count > 0
                         ? `${friend.shared_group_count} shared group${friend.shared_group_count === 1 ? '' : 's'}`
-                        : 'No shared groups yet'}
+                        : Math.abs(friend.net_balance) >= 0.01
+                          ? 'Direct — no shared group'
+                          : 'No shared groups yet'}
                     </span>
                   </span>
                   <span style={{ textAlign: 'right', flexShrink: 0 }}>
@@ -685,7 +688,11 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                             onClick={() => {
                               setSettleTarget({
                                 groupId: entry.groupId,
-                                groupName: entry.groupName,
+                                // The pair group's internal name would read
+                                // "Between you and X" on X's own settle sheet.
+                                groupName: directGroupIds.has(entry.groupId)
+                                  ? undefined
+                                  : entry.groupName,
                                 payee: selected.friend,
                                 suggestedAmount: Math.abs(entry.net),
                               });

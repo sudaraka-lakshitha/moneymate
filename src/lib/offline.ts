@@ -153,8 +153,15 @@ export const flushQueue = async (): Promise<{ sent: number; failed: number }> =>
   return { sent, failed };
 };
 
-/** Flushes on reconnect and once on mount; reports how many rows went out. */
-export const useQueueFlush = (onFlushed?: (sent: number) => void): number => {
+/**
+ * Flushes on reconnect and once on mount, reporting both what went out and what
+ * was thrown away.
+ *
+ * Reporting `failed` is not cosmetic: a permanently rejected entry is dropped
+ * from the queue by design (retrying it would never succeed), so if that is not
+ * surfaced the row simply vanishes and the user believes it synced.
+ */
+export const useQueueFlush = (onFlushed?: (sent: number, failed: number) => void): number => {
   const online = useOnline();
   const [count, setCount] = useState(pendingCount);
 
@@ -166,10 +173,10 @@ export const useQueueFlush = (onFlushed?: (sent: number) => void): number => {
         setCount(pendingCount());
         return;
       }
-      const { sent } = await flushQueue();
+      const { sent, failed } = await flushQueue();
       if (cancelled) return;
       setCount(pendingCount());
-      if (sent > 0) onFlushed?.(sent);
+      if (sent > 0 || failed > 0) onFlushed?.(sent, failed);
     };
 
     void attempt();
