@@ -7,7 +7,7 @@ import { friendlyDbError } from '../lib/authErrors';
 import { Alert, Avatar, EmptyState, Sheet, SkeletonRows, Spinner } from '../components/ui';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
 import { useToast } from '../components/Toast';
-import { Check, Clock, UserPlus, Search, X } from 'lucide-react';
+import { Check, Clock, UserPlus, Search, X, Pin } from 'lucide-react';
 
 interface FriendsPageProps {
   user: User;
@@ -16,6 +16,7 @@ interface FriendsPageProps {
 /** A row shown in the list — either shared-balance data, a direct connection, or both. */
 interface DisplayFriend extends FriendBalanceDetail {
   isConnected: boolean;
+  isPinned: boolean;
 }
 
 const emailOf = (row: FriendRequest, meId: string): string =>
@@ -39,6 +40,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const [sending, setSending] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
   const [respondingTo, setRespondingTo] = useState<string | null>(null);
+  const [pinningId, setPinningId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -52,7 +54,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       const groups = (memberships ?? []).map((row: any) => row.groups).filter(Boolean) as Group[];
       const groupIds = groups.map((g) => g.id);
 
-      const [memberRes, ledgerRes, requestRes] = await Promise.all([
+      const [memberRes, ledgerRes, requestRes, pinRes] = await Promise.all([
         groupIds.length > 0
           ? supabase.from('group_members').select('group_id, user_id, users(*)').in('group_id', groupIds)
           : Promise.resolve({ data: [], error: null }),
@@ -66,11 +68,14 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
           )
           .or(`requester_id.eq.${user.id},addressee_id.eq.${user.id}`)
           .in('status', ['PENDING', 'ACCEPTED']),
+        supabase.from('friend_pins').select('friend_id').eq('user_id', user.id),
       ]);
 
       if (memberRes.error) throw memberRes.error;
       if (ledgerRes.error) throw ledgerRes.error;
       if (requestRes.error) throw requestRes.error;
+
+      const pinnedIds = new Set((pinRes.data ?? []).map((row: any) => row.friend_id as string));
 
       const ledgers: GroupLedger[] = groups.map((group) => ({
         groupId: group.id,
@@ -94,24 +99,41 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       const merged: DisplayFriend[] = balanceFriends.map((f) => ({
         ...f,
         isConnected: connectedIds.has(f.friend.id),
+        isPinned: pinnedIds.has(f.friend.id),
       }));
 
-      // Connected friends with no shared group show up here too, at zero balance.
+      // Every accepted friend appears, whether or not you share a group and
+      // whether or not there is money between you — a friend you added should
+      // never be invisible just because you are square. Falls back to the stored
+      // email when the profile row is unreadable, so the row still renders.
       for (const row of accepted) {
         const friendUser = row.requester_id === user.id ? row.addressee : row.requester;
-        if (!friendUser || merged.some((m) => m.friend.id === friendUser.id)) continue;
+        const friendId = row.requester_id === user.id ? row.addressee_id : row.requester_id;
+        if (merged.some((m) => m.friend.id === (friendUser?.id ?? friendId))) continue;
+
+        const resolved: User = friendUser ?? {
+          id: friendId ?? row.id,
+          display_name: row.addressee_email,
+          email: row.addressee_email,
+        };
+
         merged.push({
-          friend: friendUser,
+          friend: resolved,
           net_balance: 0,
           total_they_owe_me: 0,
           total_i_owe_them: 0,
           shared_group_count: 0,
           perGroup: [],
           isConnected: true,
+          isPinned: pinnedIds.has(resolved.id),
         });
       }
 
-      merged.sort((a, b) => Math.abs(b.net_balance) - Math.abs(a.net_balance));
+      // Pinned first, then by how much money is at stake, then settled friends.
+      merged.sort((a, b) => {
+        if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+        return Math.abs(b.net_balance) - Math.abs(a.net_balance);
+      });
       setFriends(merged);
       setIncoming(requests.filter((r) => r.status === 'PENDING' && r.addressee_id === user.id));
       setOutgoing(requests.filter((r) => r.status === 'PENDING' && r.requester_id === user.id));
@@ -227,6 +249,43 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       toast.error(friendlyDbError(err, 'Could not withdraw the request.'));
     } finally {
       setRespondingTo(null);
+    }
+  };
+
+  const handleTogglePin = async (friend: DisplayFriend) => {
+    setPinningId(friend.friend.id);
+
+    // Flip locally first: pinning is a list-ordering preference, and waiting on
+    // a round trip to reorder makes the tap feel broken.
+    const wasPinned = friend.isPinned;
+    setFriends((current) =>
+      current
+        .map((f) => (f.friend.id === friend.friend.id ? { ...f, isPinned: !wasPinned } : f))
+        .sort((a, b) => {
+          if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+          return Math.abs(b.net_balance) - Math.abs(a.net_balance);
+        })
+    );
+
+    try {
+      if (wasPinned) {
+        const { error: unpinError } = await supabase
+          .from('friend_pins')
+          .delete()
+          .eq('user_id', user.id)
+          .eq('friend_id', friend.friend.id);
+        if (unpinError) throw unpinError;
+      } else {
+        const { error: pinError } = await supabase
+          .from('friend_pins')
+          .insert({ user_id: user.id, friend_id: friend.friend.id });
+        if (pinError) throw pinError;
+      }
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not update the pin.'));
+      await load(); // put the list back the way the server sees it
+    } finally {
+      setPinningId(null);
     }
   };
 
@@ -378,38 +437,75 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
           {filtered.map((friend) => {
             const settled = Math.abs(friend.net_balance) < 0.01;
             return (
-              <button
-                key={friend.friend.id}
-                type="button"
-                className="card card-interactive row"
-                onClick={() => setSelected(friend)}
-              >
-                <Avatar name={friend.friend.display_name} url={friend.friend.avatar_url} size={42} />
-                <span className="grow" style={{ minWidth: 0 }}>
-                  <span className="row" style={{ gap: 5 }}>
-                    <span className="truncate" style={{ fontWeight: 700, fontSize: '0.93rem' }}>
-                      {friend.friend.display_name}
+              // A div, not a button: the pin is its own control and a button
+              // cannot legally nest inside another button.
+              <div key={friend.friend.id} className="card card-interactive row">
+                <button
+                  type="button"
+                  className="row grow"
+                  onClick={() => setSelected(friend)}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    padding: 0,
+                    minWidth: 0,
+                    textAlign: 'left',
+                    font: 'inherit',
+                    color: 'inherit',
+                    cursor: 'pointer',
+                  }}
+                >
+                  <Avatar name={friend.friend.display_name} url={friend.friend.avatar_url} size={42} />
+                  <span className="grow" style={{ minWidth: 0 }}>
+                    <span className="row" style={{ gap: 5 }}>
+                      <span className="truncate" style={{ fontWeight: 700, fontSize: '0.93rem' }}>
+                        {friend.friend.display_name}
+                      </span>
+                      {friend.isConnected && <span className="badge badge-info">Friend</span>}
                     </span>
-                    {friend.isConnected && <span className="badge badge-info">Friend</span>}
+                    <span className="hint">
+                      {friend.shared_group_count > 0
+                        ? `${friend.shared_group_count} shared group${friend.shared_group_count === 1 ? '' : 's'}`
+                        : 'No shared groups yet'}
+                    </span>
                   </span>
-                  <span className="hint">
-                    {friend.shared_group_count > 0
-                      ? `${friend.shared_group_count} shared group${friend.shared_group_count === 1 ? '' : 's'}`
-                      : 'No shared groups yet'}
+                  <span style={{ textAlign: 'right', flexShrink: 0 }}>
+                    <span
+                      className={`amount-md tabular ${settled ? 'text-neutral' : friend.net_balance > 0 ? 'text-positive' : 'text-negative'}`}
+                      style={{ display: 'block' }}
+                    >
+                      {settled ? 'Settled' : formatLKR(Math.abs(friend.net_balance))}
+                    </span>
+                    <span className="hint">
+                      {settled ? 'all square' : friend.net_balance > 0 ? 'owes you' : 'you owe'}
+                    </span>
                   </span>
-                </span>
-                <span style={{ textAlign: 'right', flexShrink: 0 }}>
-                  <span
-                    className={`amount-md tabular ${settled ? 'text-neutral' : friend.net_balance > 0 ? 'text-positive' : 'text-negative'}`}
-                    style={{ display: 'block' }}
-                  >
-                    {settled ? 'Settled' : formatLKR(Math.abs(friend.net_balance))}
-                  </span>
-                  <span className="hint">
-                    {settled ? 'all square' : friend.net_balance > 0 ? 'owes you' : 'you owe'}
-                  </span>
-                </span>
-              </button>
+                </button>
+
+                <button
+                  type="button"
+                  className="btn-icon"
+                  style={{ width: 30, height: 30, flexShrink: 0 }}
+                  onClick={() => handleTogglePin(friend)}
+                  disabled={pinningId === friend.friend.id}
+                  aria-pressed={friend.isPinned}
+                  aria-label={
+                    friend.isPinned
+                      ? `Unpin ${friend.friend.display_name}`
+                      : `Pin ${friend.friend.display_name} to the top`
+                  }
+                  title={friend.isPinned ? 'Unpin' : 'Pin to top'}
+                >
+                  {/* Same icon either way, filled when pinned. A crossed-out pin
+                      here would read as "pinning is disabled" rather than
+                      "tap to pin". */}
+                  <Pin
+                    size={14}
+                    fill={friend.isPinned ? 'currentColor' : 'none'}
+                    color={friend.isPinned ? 'var(--primary)' : 'var(--on-surface-faint)'}
+                  />
+                </button>
+              </div>
             );
           })}
         </div>

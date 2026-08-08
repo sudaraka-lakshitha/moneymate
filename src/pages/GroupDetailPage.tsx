@@ -13,7 +13,8 @@ import { useConfirm } from '../components/Confirm';
 import { AddExpenseModal } from './AddExpenseModal';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
 import {
-  ArrowLeft, ArrowRight, AtSign, Check, Copy, Mail, Pencil, Plus, RefreshCw, Share2, Trash2, UserCheck, X,
+  ArrowLeft, ArrowRight, AtSign, Archive, ArchiveRestore, Check, Copy, Eraser, Mail, Pencil, Plus,
+  RefreshCw, Settings2, Share2, Trash2, UserCheck, X,
 } from 'lucide-react';
 
 interface GroupDetailPageProps {
@@ -58,6 +59,9 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   const [invitingByEmail, setInvitingByEmail] = useState(false);
   const [inviteEmailError, setInviteEmailError] = useState<string | null>(null);
   const [cancellingInvite, setCancellingInvite] = useState<string | null>(null);
+
+  const [showManage, setShowManage] = useState(false);
+  const [cleaning, setCleaning] = useState(false);
 
   const load = useCallback(async () => {
     setLoadError(null);
@@ -203,6 +207,77 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
     }
   };
 
+  /**
+   * Everyone at exactly zero. This is the gate for both cleanup paths — the
+   * server enforces it too, this copy just keeps the buttons honest and lets the
+   * sheet explain *why* it is disabled instead of failing on tap.
+   */
+  const allSettled = useMemo(
+    () => Object.values(balances).every((amount) => Math.abs(amount) < 0.01),
+    [balances]
+  );
+
+  const handleToggleArchive = async () => {
+    const archiving = !group?.archived_at;
+
+    if (archiving) {
+      const ok = await confirm({
+        title: 'Archive this group?',
+        message:
+          'It moves out of your main list but nothing is deleted — every expense and balance stays, and you can restore it any time.',
+        confirmLabel: 'Archive',
+      });
+      if (!ok) return;
+    }
+
+    setCleaning(true);
+    try {
+      const { error } = await supabase.rpc('archive_group', {
+        p_group_id: groupId,
+        p_archive: archiving,
+      });
+      if (error) throw error;
+      toast.success(archiving ? 'Group archived.' : 'Group restored.');
+      setShowManage(false);
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not update the group.'));
+    } finally {
+      setCleaning(false);
+    }
+  };
+
+  const handlePurge = async () => {
+    const ok = await confirm({
+      title: 'Permanently delete this history?',
+      message:
+        'Every expense, split, receipt link, settlement and ledger entry in this group is erased for good. This cannot be undone and the record of who paid what will be gone. The group and its members stay, ready to use from scratch.',
+      confirmLabel: 'Delete for good',
+      danger: true,
+    });
+    if (!ok) return;
+
+    setCleaning(true);
+    try {
+      const { data, error } = await supabase.rpc('purge_group_history', { p_group_id: groupId });
+      if (error) throw error;
+
+      const result = (data as { out_expenses: number; out_settlements: number }[])?.[0];
+      const count = result?.out_expenses ?? 0;
+      toast.success(
+        count > 0
+          ? `Cleared ${count} expense${count === 1 ? '' : 's'} and their history.`
+          : 'History cleared.'
+      );
+      setShowManage(false);
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not clear the history.'));
+    } finally {
+      setCleaning(false);
+    }
+  };
+
   const handleRegenerateCode = async () => {
     setRegenerating(true);
     try {
@@ -311,12 +386,35 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
           <div className="truncate" style={{ fontWeight: 800, fontSize: '1.05rem' }}>
             {group?.icon_emoji} {group?.name ?? 'Group'}
           </div>
-          <div className="hint">{members.length} members</div>
+          <div className="hint">
+            {members.length} members{group?.archived_at ? ' · archived' : ''}
+          </div>
         </div>
-        <button type="button" className="btn-icon" onClick={() => setShowInvite(true)} aria-label="Invite members">
-          <Share2 size={18} color="var(--primary-light)" />
-        </button>
+        <span className="row" style={{ gap: 2, flexShrink: 0 }}>
+          <button type="button" className="btn-icon" onClick={() => setShowInvite(true)} aria-label="Invite members">
+            <Share2 size={18} color="var(--primary-light)" />
+          </button>
+          {isAdmin && (
+            <button
+              type="button"
+              className="btn-icon"
+              onClick={() => setShowManage(true)}
+              aria-label="Manage group"
+            >
+              <Settings2 size={18} />
+            </button>
+          )}
+        </span>
       </header>
+
+      {group?.archived_at && (
+        <div style={{ marginBottom: 'var(--sp-4)' }}>
+          <Alert variant="info">
+            This group is archived. Nothing has been deleted — restore it from Manage to bring it back to
+            your list.
+          </Alert>
+        </div>
+      )}
 
       {loadError && (
         <div style={{ marginBottom: 'var(--sp-4)' }}>
@@ -629,6 +727,65 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
             void load();
           }}
         />
+      )}
+
+      {showManage && group && (
+        <Sheet title="Manage group" onClose={() => setShowManage(false)}>
+          <div className="stack">
+            {!allSettled && (
+              <Alert variant="warning">
+                Someone in this group is still up or down. Settle every balance before archiving or clearing
+                the history — otherwise those debts would be silently written off.
+              </Alert>
+            )}
+
+            {/* ---- Archive: reversible ---- */}
+            <div className="card">
+              <span className="row" style={{ gap: 8, marginBottom: 6 }}>
+                {group.archived_at ? <ArchiveRestore size={16} /> : <Archive size={16} />}
+                <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>
+                  {group.archived_at ? 'Restore group' : 'Archive group'}
+                </span>
+              </span>
+              <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+                {group.archived_at
+                  ? 'Bring this group back into your main list. Everything is exactly as you left it.'
+                  : 'Tidies a finished trip out of your list. Nothing is deleted and you can restore it any time — the safe option.'}
+              </p>
+              <button
+                type="button"
+                className="btn btn-secondary btn-block"
+                onClick={handleToggleArchive}
+                disabled={cleaning || (!group.archived_at && !allSettled)}
+              >
+                {cleaning && <Spinner />}
+                {group.archived_at ? 'Restore group' : 'Archive group'}
+              </button>
+            </div>
+
+            {/* ---- Purge: irreversible ---- */}
+            <div className="card" style={{ borderColor: 'var(--negative)' }}>
+              <span className="row" style={{ gap: 8, marginBottom: 6 }}>
+                <Eraser size={16} color="var(--negative)" />
+                <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Clear history permanently</span>
+              </span>
+              <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+                Frees up storage by erasing every expense, split, settlement and ledger entry in this group.
+                The group and its members stay, ready to reuse. <strong>This cannot be undone</strong> — the
+                record of who paid what will be gone for good, so archive instead if you might ever need it.
+              </p>
+              <button
+                type="button"
+                className="btn btn-danger btn-block"
+                onClick={handlePurge}
+                disabled={cleaning || !allSettled || activeExpenses.length === 0}
+              >
+                {cleaning && <Spinner />}
+                {activeExpenses.length === 0 ? 'Nothing to clear' : 'Clear history permanently'}
+              </button>
+            </div>
+          </div>
+        </Sheet>
       )}
 
       {showInvite && group && (

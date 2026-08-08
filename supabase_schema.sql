@@ -238,6 +238,11 @@ $$;
 -- Whose profile may I read? Mine, anyone I share a group with, and anyone with a
 -- pending request into a group I administer (otherwise the approval list shows
 -- blank names).
+--
+-- NOTE: this is widened further down the file to cover friend connections, once
+-- the friend_requests table exists. It cannot be done here — a LANGUAGE sql body
+-- is validated at CREATE time, so naming a table defined later in this script
+-- would break a fresh install.
 CREATE OR REPLACE FUNCTION public.can_view_profile(p_user_id UUID)
 RETURNS BOOLEAN
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
@@ -1567,3 +1572,230 @@ GRANT EXECUTE ON FUNCTION public.cancel_group_invitation(UUID)             TO au
 GRANT EXECUTE ON FUNCTION public.send_friend_request(TEXT)                 TO authenticated;
 GRANT EXECUTE ON FUNCTION public.respond_to_friend_request(UUID, BOOLEAN)  TO authenticated;
 GRANT EXECUTE ON FUNCTION public.cancel_friend_request(UUID)               TO authenticated;
+
+-- ========================================
+-- PROFILE VISIBILITY — FRIENDS
+-- ========================================
+-- Widened now that friend_requests and group_invitations exist. This must live
+-- below those CREATE TABLEs: a LANGUAGE sql body is validated at CREATE time, so
+-- the earlier definition cannot name them without breaking a fresh install.
+--
+-- The friend clause is not cosmetic. A direct friend who shares no group failed
+-- the original check, so the `users` join in the friends query came back NULL and
+-- the client dropped the row entirely — a friend you had added simply never
+-- appeared in the list. PENDING is covered as well as ACCEPTED so an incoming
+-- request shows a real name and picture instead of an anonymous row.
+CREATE OR REPLACE FUNCTION public.can_view_profile(p_user_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+    SELECT
+        p_user_id = auth.uid()
+        OR EXISTS (
+            SELECT 1
+            FROM group_members mine
+            JOIN group_members theirs ON theirs.group_id = mine.group_id
+            WHERE mine.user_id = auth.uid() AND theirs.user_id = p_user_id
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM group_join_requests r
+            JOIN group_members admin ON admin.group_id = r.group_id
+            WHERE r.user_id = p_user_id
+              AND r.status = 'PENDING'
+              AND admin.user_id = auth.uid()
+              AND admin.role = 'ADMIN'
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM friend_requests fr
+            WHERE fr.status IN ('PENDING', 'ACCEPTED')
+              AND ((fr.requester_id = auth.uid() AND fr.addressee_id = p_user_id)
+                OR (fr.requester_id = p_user_id AND fr.addressee_id = auth.uid()))
+        )
+        OR EXISTS (
+            -- Someone I invited to a group I administer, before they respond.
+            SELECT 1
+            FROM group_invitations gi
+            WHERE gi.invited_user_id = p_user_id
+              AND gi.status = 'PENDING'
+              AND public.is_group_admin(gi.group_id)
+        );
+$$;
+
+-- ========================================
+-- PINNED FRIENDS
+-- ========================================
+-- Pinning is unilateral and private: I pin you, you are never told. That rules
+-- out a flag on friend_requests (one shared row, two people) — this needs its
+-- own row per (viewer, friend).
+CREATE TABLE IF NOT EXISTS friend_pins (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    friend_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (user_id, friend_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_friend_pins_user ON friend_pins(user_id);
+
+ALTER TABLE friend_pins ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users manage own friend pins" ON friend_pins;
+CREATE POLICY "Users manage own friend pins" ON friend_pins FOR ALL
+    USING (user_id = auth.uid())
+    WITH CHECK (user_id = auth.uid());
+
+-- ========================================
+-- GROUP CLEANUP (ARCHIVE / PURGE)
+-- ========================================
+ALTER TABLE groups ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+ALTER TABLE groups ADD COLUMN IF NOT EXISTS archived_by UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE groups ADD COLUMN IF NOT EXISTS purged_at   TIMESTAMPTZ;
+
+-- Is every member of this group at exactly zero?
+--
+-- This is the safety gate for both cleanup paths. Ledger entries for a balanced
+-- group sum to zero per person, so removing ALL of them leaves everyone at zero
+-- — the operation is balance-preserving. Removing a *subset*, or removing any
+-- amount while somebody is still up or down, would silently destroy a real debt.
+-- Hence: all-or-nothing, and only at zero.
+CREATE OR REPLACE FUNCTION public.group_is_settled(p_group_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+    SELECT NOT EXISTS (
+        SELECT 1
+        FROM ledger_entries
+        WHERE group_id = p_group_id
+        GROUP BY user_id
+        HAVING ROUND(SUM(amount), 2) <> 0
+    );
+$$;
+
+-- Reversible: hides the group from the main list. Nothing is deleted, so an
+-- archived group can be restored with every expense and ledger row intact.
+CREATE OR REPLACE FUNCTION public.archive_group(p_group_id UUID, p_archive BOOLEAN DEFAULT TRUE)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+    IF NOT public.is_group_admin(p_group_id) THEN
+        RAISE EXCEPTION 'Only a group admin can archive this group';
+    END IF;
+
+    IF p_archive AND NOT public.group_is_settled(p_group_id) THEN
+        RAISE EXCEPTION 'Settle every balance in this group before archiving it';
+    END IF;
+
+    UPDATE groups
+    SET archived_at = CASE WHEN p_archive THEN NOW() END,
+        archived_by = CASE WHEN p_archive THEN auth.uid() END,
+        updated_at  = NOW()
+    WHERE id = p_group_id;
+END;
+$$;
+
+-- Irreversible: drops the group's financial history to reclaim storage, keeping
+-- the group itself and its membership so it stays usable from a clean slate.
+--
+-- Returns the number of rows removed so the client can tell the user what it
+-- actually did. expense_splits, expense_items and expense_edits are not deleted
+-- explicitly — they are ON DELETE CASCADE from expenses.
+CREATE OR REPLACE FUNCTION public.purge_group_history(p_group_id UUID)
+RETURNS TABLE (out_expenses INT, out_ledger INT, out_settlements INT)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_expenses    INT := 0;
+    v_ledger      INT := 0;
+    v_settlements INT := 0;
+BEGIN
+    IF NOT public.is_group_admin(p_group_id) THEN
+        RAISE EXCEPTION 'Only a group admin can clear this group''s history';
+    END IF;
+
+    -- Re-checked inside the function, not just in the UI: this is the invariant
+    -- that makes deleting the ledger safe rather than destructive.
+    IF NOT public.group_is_settled(p_group_id) THEN
+        RAISE EXCEPTION 'Settle every balance in this group before clearing its history';
+    END IF;
+
+    SELECT COUNT(*) INTO v_settlements FROM group_settlements WHERE group_id = p_group_id;
+    SELECT COUNT(*) INTO v_ledger      FROM ledger_entries    WHERE group_id = p_group_id;
+    SELECT COUNT(*) INTO v_expenses    FROM expenses          WHERE group_id = p_group_id;
+
+    DELETE FROM ledger_entries    WHERE group_id = p_group_id;
+    DELETE FROM group_settlements WHERE group_id = p_group_id;
+    DELETE FROM balance_snapshots WHERE group_id = p_group_id;
+    DELETE FROM expenses          WHERE group_id = p_group_id;
+    DELETE FROM settlement_cycles WHERE group_id = p_group_id;
+
+    UPDATE groups
+    SET purged_at        = NOW(),
+        current_cycle_id = NULL,
+        status           = 'ACTIVE',
+        updated_at       = NOW()
+    WHERE id = p_group_id;
+
+    RETURN QUERY SELECT v_expenses, v_ledger, v_settlements;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.group_is_settled(UUID)             TO authenticated;
+GRANT EXECUTE ON FUNCTION public.archive_group(UUID, BOOLEAN)       TO authenticated;
+GRANT EXECUTE ON FUNCTION public.purge_group_history(UUID)          TO authenticated;
+
+-- ========================================
+-- AVATARS BUCKET (profile pictures)
+-- ========================================
+-- Public, unlike receipts: an avatar is shown next to a name in other people's
+-- friend lists and group screens, and a private bucket would need a signed URL
+-- per face per render. Writes stay locked to your own folder.
+DO $avatars$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = 'storage') THEN
+        RAISE NOTICE 'storage schema not present — skipping avatar bucket setup';
+        RETURN;
+    END IF;
+
+    INSERT INTO storage.buckets (id, name, public)
+    VALUES ('avatars', 'avatars', TRUE)
+    ON CONFLICT (id) DO UPDATE SET public = TRUE;
+
+    EXECUTE $p$ DROP POLICY IF EXISTS "Avatars are publicly readable" ON storage.objects $p$;
+    EXECUTE $p$ DROP POLICY IF EXISTS "Users upload their own avatar"  ON storage.objects $p$;
+    EXECUTE $p$ DROP POLICY IF EXISTS "Users update their own avatar"  ON storage.objects $p$;
+    EXECUTE $p$ DROP POLICY IF EXISTS "Users delete their own avatar"  ON storage.objects $p$;
+
+    EXECUTE $p$
+        CREATE POLICY "Avatars are publicly readable" ON storage.objects FOR SELECT
+            USING (bucket_id = 'avatars')
+    $p$;
+
+    -- Path is <user_id>/<file>, so folder[1] is the owner.
+    EXECUTE $p$
+        CREATE POLICY "Users upload their own avatar" ON storage.objects FOR INSERT
+            WITH CHECK (
+                bucket_id = 'avatars'
+                AND (storage.foldername(name))[1] = auth.uid()::TEXT
+            )
+    $p$;
+
+    EXECUTE $p$
+        CREATE POLICY "Users update their own avatar" ON storage.objects FOR UPDATE
+            USING (
+                bucket_id = 'avatars'
+                AND (storage.foldername(name))[1] = auth.uid()::TEXT
+            )
+    $p$;
+
+    EXECUTE $p$
+        CREATE POLICY "Users delete their own avatar" ON storage.objects FOR DELETE
+            USING (
+                bucket_id = 'avatars'
+                AND (storage.foldername(name))[1] = auth.uid()::TEXT
+            )
+    $p$;
+END
+$avatars$;

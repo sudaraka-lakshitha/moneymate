@@ -1,14 +1,15 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { User } from '../types';
-import { friendlyAuthError, friendlyDbError } from '../lib/authErrors';
+import { friendlyAuthError, friendlyDbError, messageFrom } from '../lib/authErrors';
+import { removeOldAvatar, uploadAvatar } from '../lib/avatars';
 import { ThemePreference, useTheme } from '../lib/theme';
 import { Alert, Avatar, Sheet, Spinner } from '../components/ui';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/Confirm';
 import {
   LogOut, Pencil, Globe, Shield, Database, ChevronRight,
-  Sun, Moon, Monitor, KeyRound,
+  Sun, Moon, Monitor, KeyRound, Camera, Trash2,
 } from 'lucide-react';
 
 const THEME_OPTIONS: { id: ThemePreference; label: string; icon: React.ElementType }[] = [
@@ -32,6 +33,9 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
   const [draftName, setDraftName] = useState(user.display_name);
   const [saving, setSaving] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
+
+  const photoInputRef = useRef<HTMLInputElement>(null);
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
 
   const [changingPassword, setChangingPassword] = useState(false);
   const [newPassword, setNewPassword] = useState('');
@@ -107,6 +111,60 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
     }
   };
 
+  const applyAvatar = async (nextUrl: string | null) => {
+    const previous = user.avatar_url;
+
+    const { data, error } = await supabase
+      .from('users')
+      .update({ avatar_url: nextUrl })
+      .eq('id', user.id)
+      .select()
+      .single();
+    if (error) throw error;
+
+    onUserUpdated(data as User);
+    // Only after the row points somewhere else is the old file safe to drop.
+    void removeOldAvatar(previous);
+  };
+
+  const handlePickPhoto = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    // Reset immediately so picking the same file twice still fires onChange.
+    e.target.value = '';
+    if (!file) return;
+
+    setUploadingPhoto(true);
+    try {
+      const url = await uploadAvatar(file, user.id);
+      await applyAvatar(url);
+      toast.success('Profile picture updated.');
+    } catch (error) {
+      toast.error(messageFrom(error) || 'Could not update your picture.');
+    } finally {
+      setUploadingPhoto(false);
+    }
+  };
+
+  const handleRemovePhoto = async () => {
+    const ok = await confirm({
+      title: 'Remove your picture?',
+      message: 'Your initial will be shown instead, in your groups and to your friends.',
+      confirmLabel: 'Remove',
+      danger: true,
+    });
+    if (!ok) return;
+
+    setUploadingPhoto(true);
+    try {
+      await applyAvatar(null);
+      toast.info('Picture removed.');
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not remove your picture.'));
+    } finally {
+      setUploadingPhoto(false);
+    }
+  };
+
   const handleSignOut = async () => {
     const ok = await confirm({
       title: 'Sign out?',
@@ -141,23 +199,64 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
 
       <section className="card" style={{ textAlign: 'center', padding: 'var(--sp-6)' }}>
         <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 'var(--sp-3)' }}>
-          <Avatar name={user.display_name} url={user.avatar_url} size={76} />
+          <span style={{ position: 'relative', display: 'inline-flex' }}>
+            <Avatar name={user.display_name} url={user.avatar_url} size={76} />
+            <button
+              type="button"
+              className="btn-icon"
+              onClick={() => photoInputRef.current?.click()}
+              disabled={uploadingPhoto}
+              aria-label="Change profile picture"
+              style={{
+                position: 'absolute',
+                right: -4,
+                bottom: -4,
+                width: 30,
+                height: 30,
+                background: 'var(--primary)',
+                color: '#fff',
+                border: '2px solid var(--surface)',
+              }}
+            >
+              {uploadingPhoto ? <Spinner size={13} /> : <Camera size={14} />}
+            </button>
+          </span>
         </div>
+
+        <input
+          ref={photoInputRef}
+          type="file"
+          accept="image/*"
+          onChange={handlePickPhoto}
+          style={{ display: 'none' }}
+        />
+
         <h2 style={{ fontSize: '1.2rem', fontWeight: 800 }}>{user.display_name}</h2>
         <p className="text-muted" style={{ fontSize: '0.85rem', marginTop: 2 }}>
           {user.email}
         </p>
-        <button
-          type="button"
-          className="btn btn-secondary btn-sm"
-          style={{ marginTop: 'var(--sp-4)' }}
-          onClick={() => {
-            setDraftName(user.display_name);
-            setEditing(true);
-          }}
-        >
-          <Pencil size={14} /> Edit profile
-        </button>
+        <div className="row" style={{ justifyContent: 'center', marginTop: 'var(--sp-4)' }}>
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm"
+            onClick={() => {
+              setDraftName(user.display_name);
+              setEditing(true);
+            }}
+          >
+            <Pencil size={14} /> Edit profile
+          </button>
+          {user.avatar_url && (
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              onClick={handleRemovePhoto}
+              disabled={uploadingPhoto}
+            >
+              <Trash2 size={14} /> Remove photo
+            </button>
+          )}
+        </div>
       </section>
 
       <h2 className="section-title" style={{ marginTop: 'var(--sp-6)', marginBottom: 'var(--sp-3)' }}>
