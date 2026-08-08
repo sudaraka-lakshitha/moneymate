@@ -2441,6 +2441,25 @@ BEGIN
         RAISE EXCEPTION 'That person does not have an account';
     END IF;
 
+    -- You must already be connected to them. The app only ever offers this from
+    -- a friend's own screen, but the check has to live here: without it anyone
+    -- holding an account id could open a pair record with a stranger and post
+    -- "you owe me" against them, which would then appear on that stranger's
+    -- Friends screen. Sharing a group counts — you are already splitting bills.
+    IF NOT EXISTS (
+        SELECT 1 FROM friend_requests fr
+        WHERE fr.status = 'ACCEPTED'
+          AND ((fr.requester_id = v_me AND fr.addressee_id = p_friend_id)
+            OR (fr.requester_id = p_friend_id AND fr.addressee_id = v_me))
+    ) AND NOT EXISTS (
+        SELECT 1
+        FROM group_members mine
+        JOIN group_members theirs ON theirs.group_id = mine.group_id
+        WHERE mine.user_id = v_me AND theirs.user_id = p_friend_id
+    ) THEN
+        RAISE EXCEPTION 'You are not connected to that person';
+    END IF;
+
     -- An existing direct group containing exactly these two people.
     SELECT g.id INTO v_group
     FROM groups g

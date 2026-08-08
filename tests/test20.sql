@@ -6,7 +6,8 @@ GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO authenticated;
 DO $s$ BEGIN
   INSERT INTO auth.users (id,email,raw_user_meta_data) VALUES
    ('70000000-0000-0000-0000-00000000000a','s_ann@t.lk','{"full_name":"Ann"}'),
-   ('70000000-0000-0000-0000-00000000000b','s_ben@t.lk','{"full_name":"Ben"}')
+   ('70000000-0000-0000-0000-00000000000b','s_ben@t.lk','{"full_name":"Ben"}'),
+   ('70000000-0000-0000-0000-00000000000c','s_cara@t.lk','{"full_name":"Cara"}')
   ON CONFLICT (id) DO NOTHING;
 END $s$;
 SET ROLE authenticated;
@@ -14,7 +15,8 @@ DO $t$
 DECLARE
   ANN UUID:='70000000-0000-0000-0000-00000000000a';
   BEN UUID:='70000000-0000-0000-0000-00000000000b';
-  G UUID; E1 UUID; E2 UUID; D UUID; v BOOLEAN; n INT;
+  CAR UUID:='70000000-0000-0000-0000-00000000000c';
+  G UUID; E1 UUID; E2 UUID; D UUID; v BOOLEAN; n INT; blocked BOOLEAN;
 BEGIN
   PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
   G := (create_group('Stats','','📊')).id;
@@ -110,6 +112,35 @@ BEGIN
    WHERE s.user_id=BEN AND e.created_by=ANN AND s.include_in_stats IS NOT NULL;
   RAISE NOTICE 'P10 backfill answers nothing on Ben''s behalf | pass=%', n=0;
   IF n<>0 THEN RAISE EXCEPTION 'P10 FAILED: backfill decided % splits for Ben', n; END IF;
+
+  -- P11: you cannot open a pair record with somebody you have no connection to.
+  -- Otherwise anyone holding an account id could post "you owe me" against a
+  -- stranger and have it appear on that stranger's Friends screen.
+  PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
+  blocked := FALSE;
+  BEGIN
+    PERFORM add_direct_expense(CAR, 5000, 'Made up', TRUE, 5000);
+  EXCEPTION WHEN OTHERS THEN
+    blocked := TRUE;
+  END;
+  RAISE NOTICE 'P11 a stranger cannot be given a debt | pass=%', blocked;
+  IF NOT blocked THEN
+    RAISE EXCEPTION 'P11 FAILED: posted a debt against someone with no connection';
+  END IF;
+
+  -- P12: the same door one level down. direct_group_with is granted to
+  -- authenticated in its own right, so gating only the expense wrapper would
+  -- still let a stranger be pulled into a pair group.
+  blocked := FALSE;
+  BEGIN
+    PERFORM direct_group_with(CAR);
+  EXCEPTION WHEN OTHERS THEN
+    blocked := TRUE;
+  END;
+  RAISE NOTICE 'P12 no pair group can be opened with a stranger | pass=%', blocked;
+  IF NOT blocked THEN
+    RAISE EXCEPTION 'P12 FAILED: opened a pair group with someone unconnected';
+  END IF;
 
   RAISE NOTICE 'ALL STATS-DECISION TESTS PASSED';
 END $t$;
