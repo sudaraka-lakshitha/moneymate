@@ -7,9 +7,11 @@ import { ThemePreference, useTheme } from '../lib/theme';
 import { Alert, Avatar, Sheet, Spinner } from '../components/ui';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/Confirm';
+import { useInstall } from '../lib/install';
+import { IosInstallHelp } from '../components/InstallPrompt';
 import {
   LogOut, Pencil, Globe, Shield, Database, ChevronRight,
-  Sun, Moon, Monitor, KeyRound, Camera, Trash2,
+  Sun, Moon, Monitor, KeyRound, Camera, Trash2, Download, Check,
 } from 'lucide-react';
 
 const THEME_OPTIONS: { id: ThemePreference; label: string; icon: React.ElementType }[] = [
@@ -33,6 +35,9 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
   const [draftName, setDraftName] = useState(user.display_name);
   const [saving, setSaving] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
+
+  const install = useInstall();
+  const [showIosHelp, setShowIosHelp] = useState(false);
 
   const photoInputRef = useRef<HTMLInputElement>(null);
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
@@ -259,6 +264,49 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
         </div>
       </section>
 
+      {/* Always present, so dismissing the install banner is never a dead end. */}
+      <h2 className="section-title" style={{ marginTop: 'var(--sp-6)', marginBottom: 'var(--sp-3)' }}>
+        App
+      </h2>
+      <div className="card row">
+        <span
+          className="icon-tile"
+          style={{ width: 38, height: 38, background: 'var(--primary-container)', color: 'var(--primary)' }}
+        >
+          {install.isInstalled ? <Check size={18} /> : <Download size={18} />}
+        </span>
+        <span className="grow" style={{ minWidth: 0 }}>
+          <span style={{ display: 'block', fontWeight: 700, fontSize: '0.88rem' }}>
+            {install.isInstalled ? 'Installed' : 'Install MoneyMate'}
+          </span>
+          <span className="hint">
+            {install.isInstalled
+              ? 'Running as an installed app.'
+              : install.canInstall
+                ? 'Adds it to your app drawer and runs it full screen.'
+                : install.needsIosInstructions
+                  ? 'Add it to your Home Screen from Safari.'
+                  : install.isIosUnsupportedBrowser
+                    ? 'Open this site in Safari to install it.'
+                    : 'Your browser has not offered install yet — keep using the app, or try Chrome.'}
+          </span>
+        </span>
+        {!install.isInstalled &&
+          (install.canInstall ? (
+            <button
+              type="button"
+              className="btn btn-primary btn-sm"
+              onClick={() => void install.promptInstall()}
+            >
+              Install
+            </button>
+          ) : (
+            <button type="button" className="btn btn-secondary btn-sm" onClick={() => setShowIosHelp(true)}>
+              How
+            </button>
+          ))}
+      </div>
+
       <h2 className="section-title" style={{ marginTop: 'var(--sp-6)', marginBottom: 'var(--sp-3)' }}>
         Appearance
       </h2>
@@ -405,6 +453,8 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
           </form>
         </Sheet>
       )}
+
+      {showIosHelp && <IosInstallHelp onClose={() => setShowIosHelp(false)} />}
     </div>
   );
 };
