@@ -14,7 +14,7 @@ import { AddExpenseModal } from './AddExpenseModal';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
 import {
   ArrowLeft, ArrowRight, AtSign, Archive, ArchiveRestore, Check, Copy, Eraser, Lock, Mail, Pencil, Plus,
-  RefreshCw, Settings2, Share2, Trash2, UserCheck, X,
+  LogOut, RefreshCw, Settings2, Share2, Trash2, UserCheck, X,
 } from 'lucide-react';
 
 interface GroupDetailPageProps {
@@ -24,6 +24,9 @@ interface GroupDetailPageProps {
 }
 
 type Tab = 'expenses' | 'balances' | 'activity';
+
+/** Same set the create-group sheet offers, so editing cannot pick an odd one. */
+const GROUP_EMOJIS = ['💰', '🏠', '🎉', '✈️', '🍔', '🚗', '🎓', '💼', '🏖️', '🎮', '🛍️', '💊'];
 
 interface JoinRequest {
   id: string;
@@ -62,6 +65,13 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
 
   const [showManage, setShowManage] = useState(false);
   const [cleaning, setCleaning] = useState(false);
+
+  const [showEdit, setShowEdit] = useState(false);
+  const [draftName, setDraftName] = useState('');
+  const [draftDesc, setDraftDesc] = useState('');
+  const [draftEmoji, setDraftEmoji] = useState('💰');
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [busyMember, setBusyMember] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoadError(null);
@@ -287,6 +297,107 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
     }
   };
 
+  const openEdit = () => {
+    setDraftName(group?.name ?? '');
+    setDraftDesc(group?.description ?? '');
+    setDraftEmoji(group?.icon_emoji ?? '💰');
+    setShowManage(false);
+    setShowEdit(true);
+  };
+
+  const handleSaveEdit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSavingEdit(true);
+    try {
+      const { error } = await supabase.rpc('update_group', {
+        p_group_id: groupId,
+        p_name: draftName.trim(),
+        p_description: draftDesc.trim(),
+        p_icon_emoji: draftEmoji,
+      });
+      if (error) throw error;
+      toast.success('Group updated.');
+      setShowEdit(false);
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not update the group.'));
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  const handleDeleteGroup = async () => {
+    const ok = await confirm({
+      title: 'Delete this group?',
+      message:
+        'The group and every expense, settlement and balance in it are erased for everyone, permanently. This cannot be undone.',
+      confirmLabel: 'Delete group',
+      danger: true,
+    });
+    if (!ok) return;
+
+    setCleaning(true);
+    try {
+      const { error } = await supabase.rpc('delete_group', { p_group_id: groupId });
+      if (error) throw error;
+      toast.success('Group deleted.');
+      onBack();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not delete the group.'));
+      setCleaning(false);
+    }
+  };
+
+  const handleRemoveMember = async (member: GroupMember) => {
+    const name = member.user?.display_name ?? 'this member';
+    const ok = await confirm({
+      title: `Remove ${name}?`,
+      message: `${name} loses access to this group. Their past expenses stay on the record.`,
+      confirmLabel: 'Remove',
+      danger: true,
+    });
+    if (!ok) return;
+
+    setBusyMember(member.user_id);
+    try {
+      const { error } = await supabase.rpc('remove_group_member', {
+        p_group_id: groupId,
+        p_user_id: member.user_id,
+      });
+      if (error) throw error;
+      toast.success(`${name} removed.`);
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not remove that member.'));
+    } finally {
+      setBusyMember(null);
+    }
+  };
+
+  const handleLeave = async () => {
+    const ok = await confirm({
+      title: 'Leave this group?',
+      message: 'You lose access to its expenses. Your past entries stay on the record for everyone else.',
+      confirmLabel: 'Leave',
+      danger: true,
+    });
+    if (!ok) return;
+
+    setCleaning(true);
+    try {
+      const { data, error } = await supabase.rpc('leave_group', { p_group_id: groupId });
+      if (error) throw error;
+
+      if (data === 'DELETED_EMPTY') toast.info('You were the last member — the group was removed.');
+      else if (data === 'LEFT_AND_PROMOTED') toast.success('You left. Another member is now admin.');
+      else toast.success('You left the group.');
+      onBack();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not leave the group.'));
+      setCleaning(false);
+    }
+  };
+
   const handleRegenerateCode = async () => {
     setRegenerating(true);
     try {
@@ -403,16 +514,16 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
           <button type="button" className="btn-icon" onClick={() => setShowInvite(true)} aria-label="Invite members">
             <Share2 size={18} color="var(--primary-light)" />
           </button>
-          {isAdmin && (
-            <button
-              type="button"
-              className="btn-icon"
-              onClick={() => setShowManage(true)}
-              aria-label="Manage group"
-            >
-              <Settings2 size={18} />
-            </button>
-          )}
+          {/* Open to every member: admins get the management controls, everyone
+              gets the members list and a way to leave. */}
+          <button
+            type="button"
+            className="btn-icon"
+            onClick={() => setShowManage(true)}
+            aria-label="Manage group"
+          >
+            <Settings2 size={18} />
+          </button>
         </span>
       </header>
 
@@ -755,59 +866,202 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
       {showManage && group && (
         <Sheet title="Manage group" onClose={() => setShowManage(false)}>
           <div className="stack">
-            {!allSettled && (
-              <Alert variant="warning">
-                Someone in this group is still up or down. Settle every balance before archiving or clearing
-                the history — otherwise those debts would be silently written off.
-              </Alert>
+            {isAdmin && (
+              <button type="button" className="btn btn-secondary btn-block" onClick={openEdit}>
+                <Pencil size={15} /> Edit name, description & icon
+              </button>
             )}
 
-            {/* ---- Archive: reversible ---- */}
+            {/* ---- Members ---- */}
+            <div>
+              <span className="label label-block">Members</span>
+              <div className="card card-flush">
+                {members.map((member) => {
+                  const balance = balances[member.user_id] ?? 0;
+                  const isMe = member.user_id === user.id;
+                  const owes = Math.abs(balance) >= 0.01;
+                  return (
+                    <div key={member.id} className="list-row">
+                      <Avatar name={member.user?.display_name} url={member.user?.avatar_url} size={32} />
+                      <span className="grow" style={{ minWidth: 0 }}>
+                        <span className="row" style={{ gap: 5 }}>
+                          <span className="truncate" style={{ fontSize: '0.88rem', fontWeight: 600 }}>
+                            {isMe ? 'You' : member.user?.display_name ?? 'Member'}
+                          </span>
+                          {member.role === 'ADMIN' && <span className="badge badge-warning">Admin</span>}
+                        </span>
+                        <span className={`hint ${owes ? 'text-negative' : ''}`}>
+                          {owes ? `${formatLKRSigned(balance)} — must settle first` : 'Settled'}
+                        </span>
+                      </span>
+                      {isAdmin && !isMe && (
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-sm"
+                          onClick={() => handleRemoveMember(member)}
+                          disabled={owes || busyMember === member.user_id}
+                          title={owes ? 'Settle up with them first' : 'Remove from group'}
+                        >
+                          {busyMember === member.user_id ? <Spinner /> : 'Remove'}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {isAdmin && (
+              <>
+              {!allSettled && (
+                <Alert variant="warning">
+                  Someone in this group is still up or down. Settle every balance before archiving or clearing
+                  the history — otherwise those debts would be silently written off.
+                </Alert>
+              )}
+
+              {/* ---- Archive: reversible ---- */}
+              <div className="card">
+                <span className="row" style={{ gap: 8, marginBottom: 6 }}>
+                  {group.archived_at ? <ArchiveRestore size={16} /> : <Archive size={16} />}
+                  <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>
+                    {group.archived_at ? 'Restore group' : 'Archive group'}
+                  </span>
+                </span>
+                <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+                  {group.archived_at
+                    ? 'Bring this group back into your main list. Everything is exactly as you left it.'
+                    : 'Tidies a finished trip out of your list. Nothing is deleted and you can restore it any time — the safe option.'}
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-block"
+                  onClick={handleToggleArchive}
+                  disabled={cleaning || (!group.archived_at && !allSettled)}
+                >
+                  {cleaning && <Spinner />}
+                  {group.archived_at ? 'Restore group' : 'Archive group'}
+                </button>
+              </div>
+
+              {/* ---- Purge: irreversible ---- */}
+              <div className="card" style={{ borderColor: 'var(--negative)' }}>
+                <span className="row" style={{ gap: 8, marginBottom: 6 }}>
+                  <Eraser size={16} color="var(--negative)" />
+                  <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Clear history permanently</span>
+                </span>
+                <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+                  Frees up storage by erasing every expense, split, settlement and ledger entry in this group.
+                  The group and its members stay, ready to reuse. <strong>This cannot be undone</strong> — the
+                  record of who paid what will be gone for good, so archive instead if you might ever need it.
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-danger btn-block"
+                  onClick={handlePurge}
+                  disabled={cleaning || !allSettled || activeExpenses.length === 0}
+                >
+                  {cleaning && <Spinner />}
+                  {activeExpenses.length === 0 ? 'Nothing to clear' : 'Clear history permanently'}
+                </button>
+              </div>
+
+              {/* ---- Delete the whole group ---- */}
+              <div className="card" style={{ borderColor: 'var(--negative)' }}>
+                <span className="row" style={{ gap: 8, marginBottom: 6 }}>
+                  <Trash2 size={16} color="var(--negative)" />
+                  <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Delete group</span>
+                </span>
+                <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+                  Removes the group and everything in it, for every member. <strong>This cannot be undone.</strong>
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-danger btn-block"
+                  onClick={handleDeleteGroup}
+                  disabled={cleaning || !allSettled}
+                >
+                  {cleaning && <Spinner />}
+                  Delete group
+                </button>
+              </div>
+              </>
+            )}
+
+            {/* ---- Leave: available to every member ---- */}
             <div className="card">
               <span className="row" style={{ gap: 8, marginBottom: 6 }}>
-                {group.archived_at ? <ArchiveRestore size={16} /> : <Archive size={16} />}
-                <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>
-                  {group.archived_at ? 'Restore group' : 'Archive group'}
-                </span>
+                <LogOut size={16} />
+                <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Leave group</span>
               </span>
               <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
-                {group.archived_at
-                  ? 'Bring this group back into your main list. Everything is exactly as you left it.'
-                  : 'Tidies a finished trip out of your list. Nothing is deleted and you can restore it any time — the safe option.'}
+                {Math.abs(myBalance) >= 0.01
+                  ? 'Settle your own balance first — leaving with money outstanding would strand the debt.'
+                  : 'You lose access to this group. Your past expenses stay on the record for everyone else.'}
               </p>
               <button
                 type="button"
                 className="btn btn-secondary btn-block"
-                onClick={handleToggleArchive}
-                disabled={cleaning || (!group.archived_at && !allSettled)}
+                onClick={handleLeave}
+                disabled={cleaning || Math.abs(myBalance) >= 0.01}
               >
                 {cleaning && <Spinner />}
-                {group.archived_at ? 'Restore group' : 'Archive group'}
-              </button>
-            </div>
-
-            {/* ---- Purge: irreversible ---- */}
-            <div className="card" style={{ borderColor: 'var(--negative)' }}>
-              <span className="row" style={{ gap: 8, marginBottom: 6 }}>
-                <Eraser size={16} color="var(--negative)" />
-                <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Clear history permanently</span>
-              </span>
-              <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
-                Frees up storage by erasing every expense, split, settlement and ledger entry in this group.
-                The group and its members stay, ready to reuse. <strong>This cannot be undone</strong> — the
-                record of who paid what will be gone for good, so archive instead if you might ever need it.
-              </p>
-              <button
-                type="button"
-                className="btn btn-danger btn-block"
-                onClick={handlePurge}
-                disabled={cleaning || !allSettled || activeExpenses.length === 0}
-              >
-                {cleaning && <Spinner />}
-                {activeExpenses.length === 0 ? 'Nothing to clear' : 'Clear history permanently'}
+                Leave group
               </button>
             </div>
           </div>
+        </Sheet>
+      )}
+
+      {showEdit && group && (
+        <Sheet title="Edit group" onClose={() => setShowEdit(false)}>
+          <form onSubmit={handleSaveEdit} className="stack">
+            <div className="field">
+              <span className="label label-block">Icon</span>
+              <div className="row" style={{ flexWrap: 'wrap', gap: 'var(--sp-2)' }}>
+                {GROUP_EMOJIS.map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    className={`emoji-btn ${draftEmoji === option ? 'is-selected' : ''}`}
+                    onClick={() => setDraftEmoji(option)}
+                    aria-label={`Icon ${option}`}
+                    aria-pressed={draftEmoji === option}
+                  >
+                    {option}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <input
+              type="text"
+              className="input"
+              placeholder="Group name"
+              value={draftName}
+              onChange={(e) => setDraftName(e.target.value)}
+              maxLength={60}
+              required
+              autoFocus
+            />
+            <input
+              type="text"
+              className="input"
+              placeholder="Description (optional)"
+              value={draftDesc}
+              onChange={(e) => setDraftDesc(e.target.value)}
+              maxLength={140}
+            />
+
+            <button
+              type="submit"
+              className="btn btn-primary btn-block btn-lg"
+              disabled={savingEdit || !draftName.trim()}
+            >
+              {savingEdit && <Spinner />}
+              {savingEdit ? 'Saving…' : 'Save changes'}
+            </button>
+          </form>
         </Sheet>
       )}
 
