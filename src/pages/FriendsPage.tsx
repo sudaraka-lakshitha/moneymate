@@ -9,7 +9,7 @@ import { Alert, Avatar, EmptyState, Sheet, SkeletonRows, Spinner } from '../comp
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/Confirm';
-import { Check, Clock, HandCoins, Pencil, Trash2, UserPlus, Search, X, Pin } from 'lucide-react';
+import { Check, Clock, HandCoins, Pencil, Trash2, UserMinus, UserPlus, Search, X, Pin } from 'lucide-react';
 
 interface FriendsPageProps {
   user: User;
@@ -63,6 +63,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   /** expenseId -> friendId -> their stored share, so editing never guesses. */
   const [directShares, setDirectShares] = useState<Record<string, Record<string, number>>>({});
   const [busyEntry, setBusyEntry] = useState<string | null>(null);
+  const [removingFriend, setRemovingFriend] = useState(false);
 
   const load = useCallback(async () => {
     setError(null);
@@ -481,6 +482,34 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       setLendError(friendlyDbError(err, 'Could not record that.'));
     } finally {
       setLending(false);
+    }
+  };
+
+  const handleRemoveFriend = async (friend: DisplayFriend) => {
+    const owing = Math.abs(friend.net_balance) >= 0.01;
+    const ok = await confirm({
+      title: `Remove ${friend.friend.display_name}?`,
+      message: owing
+        ? `There is still ${formatLKR(Math.abs(friend.net_balance))} between you. Settle up first.`
+        : 'You will no longer be connected. Past records stay on both sides, and you can add them again later.',
+      confirmLabel: owing ? 'OK' : 'Remove',
+      danger: !owing,
+    });
+    if (!ok || owing) return;
+
+    setRemovingFriend(true);
+    try {
+      const { error: rpcError } = await supabase.rpc('remove_friend', {
+        p_friend_id: friend.friend.id,
+      });
+      if (rpcError) throw rpcError;
+      toast.info(`${friend.friend.display_name} removed.`);
+      setSelected(null);
+      await load();
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not remove that friend.'));
+    } finally {
+      setRemovingFriend(false);
     }
   };
 
@@ -932,6 +961,18 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                   Settled records are locked, so a paid-up balance cannot reopen.
                 </span>
               </>
+            )}
+
+            {selected.isConnected && (
+              <button
+                type="button"
+                className="btn btn-ghost btn-block"
+                onClick={() => handleRemoveFriend(selected)}
+                disabled={removingFriend}
+                style={{ color: 'var(--negative)' }}
+              >
+                {removingFriend ? <Spinner /> : <UserMinus size={15} />} Remove friend
+              </button>
             )}
 
             {selectedHistory.length > 0 && (

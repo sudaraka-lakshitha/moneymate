@@ -12,8 +12,9 @@ import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/Confirm';
 import { AddExpenseModal } from './AddExpenseModal';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
+import { DonutChart } from '../components/Charts';
 import {
-  ArrowLeft, ArrowRight, AtSign, Archive, ArchiveRestore, Check, Copy, Eraser, Lock, Mail, Pencil, Plus,
+  ArrowLeft, ArrowRight, AtSign, Archive, ArchiveRestore, Check, Copy, Eraser, Lock, Mail, Pencil, PieChart, Plus,
   LogOut, RefreshCw, Settings2, Share2, Trash2, UserCheck, X,
 } from 'lucide-react';
 
@@ -24,6 +25,9 @@ interface GroupDetailPageProps {
 }
 
 type Tab = 'expenses' | 'balances' | 'activity';
+
+/** Distinct hues for the contribution donut, readable in both themes. */
+const SLICE_COLORS = ['#6C63FF', '#1baf7a', '#eda100', '#eb6834', '#e87ba4', '#2a78d6', '#9085e9', '#008300'];
 
 /** Same set the create-group sheet offers, so editing cannot pick an odd one. */
 const GROUP_EMOJIS = ['💰', '🏠', '🎉', '✈️', '🍔', '🚗', '🎓', '💼', '🏖️', '🎮', '🛍️', '💊'];
@@ -63,6 +67,9 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   const [inviteEmailError, setInviteEmailError] = useState<string | null>(null);
   const [cancellingInvite, setCancellingInvite] = useState<string | null>(null);
 
+  const [showStats, setShowStats] = useState(false);
+  const [stats, setStats] = useState<any[]>([]);
+  const [statsLoading, setStatsLoading] = useState(false);
   const [showManage, setShowManage] = useState(false);
   const [cleaning, setCleaning] = useState(false);
 
@@ -398,6 +405,21 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
     }
   };
 
+  const openStats = async () => {
+    setShowStats(true);
+    setStatsLoading(true);
+    try {
+      const { data, error } = await supabase.rpc('group_contribution_stats', { p_group_id: groupId });
+      if (error) throw error;
+      setStats((data ?? []) as any[]);
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not load the group stats.'));
+      setShowStats(false);
+    } finally {
+      setStatsLoading(false);
+    }
+  };
+
   const handleRegenerateCode = async () => {
     setRegenerating(true);
     try {
@@ -516,6 +538,9 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
           </button>
           {/* Open to every member: admins get the management controls, everyone
               gets the members list and a way to leave. */}
+          <button type="button" className="btn-icon" onClick={openStats} aria-label="Group stats">
+            <PieChart size={18} />
+          </button>
           <button
             type="button"
             className="btn-icon"
@@ -861,6 +886,110 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
             void load();
           }}
         />
+      )}
+
+      {showStats && group && (
+        <Sheet title={`${group.icon_emoji} ${group.name} · stats`} onClose={() => setShowStats(false)}>
+          {statsLoading ? (
+            <SkeletonRows count={4} />
+          ) : (
+            (() => {
+              const contributors = stats.filter((r: any) => Number(r.out_paid) > 0);
+              const total = contributors.reduce((sum: number, r: any) => sum + Number(r.out_paid), 0);
+              const slices = contributors.map((r: any, i: number) => ({
+                label: r.out_display_name as string,
+                value: Number(r.out_paid),
+                color: SLICE_COLORS[i % SLICE_COLORS.length],
+              }));
+
+              if (total <= 0) {
+                return (
+                  <EmptyState
+                    icon="📊"
+                    title="Nothing spent yet"
+                    text="Add a bill and this will show who has been fronting the money."
+                  />
+                );
+              }
+
+              return (
+                <div className="stack">
+                  <div style={{ display: 'flex', justifyContent: 'center' }}>
+                    <DonutChart data={slices} total={total} centerLabel={formatLKR(total)} />
+                  </div>
+                  <span className="hint" style={{ textAlign: 'center' }}>
+                    Who has paid out on the group&rsquo;s behalf, as a share of {formatLKR(total)} spent.
+                    Settling up is not counted — paying someone back is not group spending.
+                  </span>
+
+                  <span className="label label-block">Contributions</span>
+                  <div className="stack-sm">
+                    {contributors.map((row: any, i: number) => {
+                      const paid = Number(row.out_paid);
+                      const share = Number(row.out_share);
+                      const net = Number(row.out_net);
+                      const pct = Math.round((paid / total) * 100);
+                      return (
+                        <div key={row.out_user_id} className="card row">
+                          <span
+                            aria-hidden="true"
+                            style={{
+                              width: 10,
+                              height: 10,
+                              borderRadius: 3,
+                              flexShrink: 0,
+                              background: SLICE_COLORS[i % SLICE_COLORS.length],
+                            }}
+                          />
+                          <Avatar name={row.out_display_name} url={row.out_avatar_url} size={32} />
+                          <span className="grow" style={{ minWidth: 0 }}>
+                            {/* display:block on both — .truncate and .hint set no
+                                display, so as bare spans the name and the figures
+                                run together on one line. */}
+                            <span
+                              className="truncate"
+                              style={{ display: 'block', fontSize: '0.88rem', fontWeight: 600 }}
+                            >
+                              {row.out_user_id === user.id ? 'You' : row.out_display_name}
+                            </span>
+                            <span className="hint" style={{ display: 'block' }}>
+                              paid {formatLKR(paid)} · own share {formatLKR(share)}
+                            </span>
+                          </span>
+                          <span style={{ textAlign: 'right', flexShrink: 0 }}>
+                            <span className="amount-md tabular" style={{ display: 'block' }}>
+                              {pct}%
+                            </span>
+                            <span
+                              className={`hint ${net > 0 ? 'text-positive' : net < 0 ? 'text-negative' : ''}`}
+                            >
+                              {Math.abs(net) < 0.01
+                                ? 'even'
+                                : net > 0
+                                  ? `+${formatLKR(net)}`
+                                  : `-${formatLKR(Math.abs(net))}`}
+                            </span>
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {stats.some((r: any) => Number(r.out_paid) === 0) && (
+                    <span className="hint">
+                      {stats
+                        .filter((r: any) => Number(r.out_paid) === 0)
+                        .map((r: any) => (r.out_user_id === user.id ? 'You' : r.out_display_name))
+                        .join(', ')}{' '}
+                      {stats.filter((r: any) => Number(r.out_paid) === 0).length === 1 ? 'has' : 'have'} not
+                      paid for anything yet.
+                    </span>
+                  )}
+                </div>
+              );
+            })()
+          )}
+        </Sheet>
       )}
 
       {showManage && group && (

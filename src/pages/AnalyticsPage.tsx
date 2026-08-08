@@ -4,11 +4,11 @@ import { ExpenseCategory, User } from '../types';
 import { formatLKR, roundMoney } from '../lib/currency';
 import { CATEGORIES, categoryMeta } from '../lib/categories';
 import { useTheme } from '../lib/theme';
-import { lastNDays, toISODate } from '../lib/dates';
+import { friendlyDate, lastNDays, toISODate } from '../lib/dates';
 import { friendlyDbError } from '../lib/authErrors';
-import { Alert, EmptyState, Skeleton } from '../components/ui';
+import { Alert, EmptyState, Skeleton, Spinner } from '../components/ui';
 import { CategoryBars, CategoryDatum, TrendChart, TrendPoint } from '../components/Charts';
-import { TrendingDown, TrendingUp } from 'lucide-react';
+import { HelpCircle, TrendingDown, TrendingUp } from 'lucide-react';
 
 interface AnalyticsPageProps {
   user: User;
@@ -38,6 +38,8 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
   const [error, setError] = useState<string | null>(null);
   const [range, setRange] = useState<Range>(30);
   const [source, setSource] = useState<Source>('all');
+  const [pending, setPending] = useState<any[]>([]);
+  const [deciding, setDeciding] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -52,20 +54,36 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
           .eq('user_id', user.id)
           .eq('is_deleted', false)
           .gte('date', since),
-        // Your share of group bills, carrying the bill's own category. This is
-        // what the breakdown used to miss: group spending was summed into a
-        // single figure and never split by category.
+        // Only the shared bills you have explicitly opted in to. Group spending
+        // is not yours to be charted by default — somebody else adding a bill
+        // must not change your figures — so include_in_stats has to be TRUE,
+        // never merely unset.
         supabase
           .from('expense_splits')
-          .select('amount, expenses!inner(category, created_at, is_deleted)')
+          .select('amount, include_in_stats, expenses!inner(category, created_at, is_deleted)')
           .eq('user_id', user.id)
           .eq('is_included', true)
+          .eq('include_in_stats', true)
           .eq('expenses.is_deleted', false)
           .gte('expenses.created_at', since),
       ]);
 
       if (dailyRes.error) throw dailyRes.error;
       if (splitRes.error) throw splitRes.error;
+
+      // Shares somebody else's bill gave you that you have not ruled on yet.
+      // They are already real expenses and already affect what you owe; the only
+      // open question is whether they belong in your charts.
+      const { data: pendingData } = await supabase
+        .from('expense_splits')
+        .select('expense_id, amount, expenses!inner(title, category, created_at, is_deleted, group_id, groups(name, is_direct))')
+        .eq('user_id', user.id)
+        .eq('is_included', true)
+        .is('include_in_stats', null)
+        .eq('expenses.is_deleted', false)
+        .order('expense_id')
+        .limit(50);
+      setPending(pendingData ?? []);
 
       const personal: SpendRow[] = (dailyRes.data ?? []).map((row: any) => ({
         date: row.date,
@@ -94,6 +112,37 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
   useEffect(() => {
     void load();
   }, [load]);
+
+  const decide = async (expenseId: string, include: boolean) => {
+    setDeciding(expenseId);
+    try {
+      const { error: rpcError } = await supabase.rpc('set_split_stats_choice', {
+        p_expense_id: expenseId,
+        p_include: include,
+      });
+      if (rpcError) throw rpcError;
+      await load();
+    } catch (err) {
+      setError(friendlyDbError(err, 'Could not save that choice.'));
+    } finally {
+      setDeciding(null);
+    }
+  };
+
+  const decideAll = async (include: boolean) => {
+    setDeciding('ALL');
+    try {
+      const { error: rpcError } = await supabase.rpc('set_all_pending_stats_choices', {
+        p_include: include,
+      });
+      if (rpcError) throw rpcError;
+      await load();
+    } catch (err) {
+      setError(friendlyDbError(err, 'Could not save those choices.'));
+    } finally {
+      setDeciding(null);
+    }
+  };
 
   const visible = useMemo(
     () => (source === 'all' ? rows : rows.filter((row) => row.source === source)),
@@ -200,6 +249,83 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
           </button>
         ))}
       </div>
+
+      {pending.length > 0 && (
+        <section className="card" style={{ borderColor: 'var(--warning)', marginBottom: 'var(--sp-4)' }}>
+          <span className="row" style={{ gap: 8, marginBottom: 6 }}>
+            <HelpCircle size={16} color="var(--warning)" />
+            <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>
+              {pending.length} shared {pending.length === 1 ? 'expense' : 'expenses'} to rule on
+            </span>
+          </span>
+          <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+            Someone added these with your name on them. They already count toward what you owe — this is
+            only about whether your share shows up in the charts below.
+          </p>
+
+          <div className="stack-sm">
+            {pending.map((row: any) => (
+              <div key={row.expense_id} className="card row">
+                <span className="grow" style={{ minWidth: 0 }}>
+                  <span
+                    className="truncate"
+                    style={{ display: 'block', fontSize: '0.88rem', fontWeight: 600 }}
+                  >
+                    {row.expenses?.title ?? 'Expense'}
+                  </span>
+                  <span className="hint">
+                    {friendlyDate(String(row.expenses?.created_at ?? '').slice(0, 10))}
+                    {row.expenses?.groups && !row.expenses.groups.is_direct
+                      ? ` · ${row.expenses.groups.name}`
+                      : ''}
+                    {' · your share '}
+                    {formatLKR(Number(row.amount))}
+                  </span>
+                </span>
+                <span className="row" style={{ gap: 6, flexShrink: 0 }}>
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => decide(row.expense_id, false)}
+                    disabled={deciding !== null}
+                  >
+                    Skip
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-sm"
+                    onClick={() => decide(row.expense_id, true)}
+                    disabled={deciding !== null}
+                  >
+                    {deciding === row.expense_id ? <Spinner /> : 'Count it'}
+                  </button>
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {pending.length > 1 && (
+            <div className="row" style={{ marginTop: 'var(--sp-3)' }}>
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm grow"
+                onClick={() => decideAll(false)}
+                disabled={deciding !== null}
+              >
+                Skip all
+              </button>
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm grow"
+                onClick={() => decideAll(true)}
+                disabled={deciding !== null}
+              >
+                Count all
+              </button>
+            </div>
+          )}
+        </section>
+      )}
 
       <div className="chip-grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)', marginBottom: 'var(--sp-4)' }}>
         {(['all', 'personal', 'group'] as Source[]).map((option) => (

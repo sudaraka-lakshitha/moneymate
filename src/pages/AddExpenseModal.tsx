@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { Expense, ExpenseCategory, GroupMember, SplitMethod, User } from '../types';
 import { allocate, formatLKR, parseAmount, roundMoney, splitEvenly } from '../lib/currency';
@@ -86,11 +86,15 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
   const [paidBy, setPaidBy] = useState(expense?.paid_by ?? user.id);
   const [notes, setNotes] = useState(expense?.notes ?? '');
 
+  // When editing, these start neutral and are replaced by the expense's stored
+  // splits in the effect below. Defaulting everyone to `true` here is what made
+  // an edit silently re-include people the bill had deliberately left out.
   const [included, setIncluded] = useState<Record<string, boolean>>(() =>
     Object.fromEntries(
-      memberIds.map((id) => [id, isEditing ? true : (defaults?.included[id] ?? true)])
+      memberIds.map((id) => [id, isEditing ? false : (defaults?.included[id] ?? true)])
     )
   );
+  const [loadingSplits, setLoadingSplits] = useState(isEditing);
   const [customAmounts, setCustomAmounts] = useState<Record<string, string>>({});
   const [percentages, setPercentages] = useState<Record<string, string>>({});
   const [shares, setShares] = useState<Record<string, string>>(() =>
@@ -107,6 +111,54 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [statsChoice, setStatsChoice] = useState(false);
+
+  // Rebuild the form from what was actually saved: who was in, and the exact
+  // per-person figures for whichever split method was used. Without this an edit
+  // reopens as an even split across everybody and saving rewrites the bill.
+  useEffect(() => {
+    if (!expense) return;
+    let active = true;
+
+    void (async () => {
+      const { data, error: splitError } = await supabase
+        .from('expense_splits')
+        .select('user_id, is_included, amount, percentage, shares, include_in_stats')
+        .eq('expense_id', expense.id);
+
+      if (!active) return;
+      if (splitError || !data) {
+        setLoadingSplits(false);
+        return;
+      }
+
+      const inc: Record<string, boolean> = {};
+      const amts: Record<string, string> = {};
+      const pcts: Record<string, string> = {};
+      const shr: Record<string, string> = {};
+
+      for (const row of data as any[]) {
+        inc[row.user_id] = Boolean(row.is_included);
+        amts[row.user_id] = String(Number(row.amount));
+        pcts[row.user_id] = String(Number(row.percentage ?? 0));
+        shr[row.user_id] = String(Number(row.shares ?? 1));
+        if (row.user_id === user.id) setStatsChoice(row.include_in_stats === true);
+      }
+
+      // A member added to the group after this bill has no split row at all.
+      for (const id of memberIds) if (!(id in inc)) inc[id] = false;
+
+      setIncluded(inc);
+      setCustomAmounts(amts);
+      setPercentages(pcts);
+      setShares(shr);
+      setLoadingSplits(false);
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, [expense?.id, memberIds, user.id]);
 
   const amount = roundMoney(parseAmount(amountStr));
   const includedMembers = members.filter((m) => included[m.user_id]);
@@ -271,6 +323,9 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
         amount: isIncluded ? share : 0,
         percentage: splitMethod === 'PERCENTAGE' ? parseAmount(percentages[m.user_id] ?? '') : 0,
         shares: splitMethod === 'SHARES' ? parseInt(shares[m.user_id] ?? '1', 10) || 0 : 1,
+        // Answered here only for myself. Everyone else's split is left undecided
+        // so their own charts are never changed by a bill I typed.
+        stats: m.user_id === user.id ? statsChoice : undefined,
       };
     });
 
@@ -666,6 +721,25 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
           value={notes}
           onChange={(e) => setNotes(e.target.value)}
         />
+
+        {includedMembers.some((m) => m.user_id === user.id) && (
+          <label className="card row" style={{ cursor: 'pointer', gap: 'var(--sp-3)' }}>
+            <input
+              type="checkbox"
+              className="checkbox"
+              checked={statsChoice}
+              onChange={(e) => setStatsChoice(e.target.checked)}
+            />
+            <span className="grow" style={{ minWidth: 0 }}>
+              <span style={{ display: 'block', fontWeight: 600, fontSize: '0.88rem' }}>
+                Count my share in my stats
+              </span>
+              <span className="hint">
+                Only affects your own charts. Everyone else decides for themselves.
+              </span>
+            </span>
+          </label>
+        )}
 
         {error && <Alert variant="error">{error}</Alert>}
 
