@@ -1,14 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { FriendRequest, Group, GroupSettlement, User } from '../types';
-import { formatLKR, formatLKRSigned } from '../lib/currency';
+import { formatLKR, formatLKRSigned, parseAmount, roundMoney } from '../lib/currency';
 import { computeFriendBalances, FriendBalanceDetail, GroupLedger, netByUser } from '../lib/balances';
 import { friendlyDbError } from '../lib/authErrors';
 import { friendlyDate } from '../lib/dates';
 import { Alert, Avatar, EmptyState, Sheet, SkeletonRows, Spinner } from '../components/ui';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
 import { useToast } from '../components/Toast';
-import { Check, Clock, UserPlus, Search, X, Pin } from 'lucide-react';
+import { Check, Clock, HandCoins, UserPlus, Search, X, Pin } from 'lucide-react';
 
 interface FriendsPageProps {
   user: User;
@@ -30,6 +30,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const [friends, setFriends] = useState<DisplayFriend[]>([]);
   const [settlements, setSettlements] = useState<GroupSettlement[]>([]);
   const [groupNames, setGroupNames] = useState<Record<string, string>>({});
+  const [directGroupIds, setDirectGroupIds] = useState<Set<string>>(new Set());
   const [incoming, setIncoming] = useState<FriendRequest[]>([]);
   const [outgoing, setOutgoing] = useState<FriendRequest[]>([]);
   const [loading, setLoading] = useState(true);
@@ -44,6 +45,15 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const [addError, setAddError] = useState<string | null>(null);
   const [respondingTo, setRespondingTo] = useState<string | null>(null);
   const [pinningId, setPinningId] = useState<string | null>(null);
+
+  const [lendTo, setLendTo] = useState<User | null>(null);
+  const [lendAmount, setLendAmount] = useState('');
+  const [lendNote, setLendNote] = useState('');
+  const [lendMode, setLendMode] = useState<'LENT' | 'BORROWED' | 'SHARED'>('LENT');
+  const [iPaid, setIPaid] = useState(true);
+  const [theirShare, setTheirShare] = useState('');
+  const [lending, setLending] = useState(false);
+  const [lendError, setLendError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -92,6 +102,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       const pinnedIds = new Set((pinRes.data ?? []).map((row: any) => row.friend_id as string));
       setSettlements((settlementRes.data ?? []) as GroupSettlement[]);
       setGroupNames(Object.fromEntries(groups.map((g) => [g.id, g.name])));
+      setDirectGroupIds(new Set(groups.filter((g) => g.is_direct).map((g) => g.id)));
 
       const ledgers: GroupLedger[] = groups.map((group) => ({
         groupId: group.id,
@@ -276,6 +287,71 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       toast.error(friendlyDbError(err, 'Could not withdraw the request.'));
     } finally {
       setRespondingTo(null);
+    }
+  };
+
+  const openLend = (friend: User) => {
+    setLendTo(friend);
+    setLendAmount('');
+    setLendNote('');
+    setLendMode('LENT');
+    setIPaid(true);
+    setTheirShare('');
+    setLendError(null);
+    setSelected(null);
+  };
+
+  const handleLend = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!lendTo) return;
+
+    const amount = roundMoney(parseAmount(lendAmount));
+    if (amount <= 0) {
+      setLendError('Enter an amount greater than zero.');
+      return;
+    }
+
+    // Every case is "who paid" plus "how much of it is theirs".
+    //   lent     -> I paid, all of it is theirs
+    //   borrowed -> they paid, none of it is theirs
+    //   shared   -> whoever paid, split (evenly unless overridden)
+    const paidByMe = lendMode === 'SHARED' ? iPaid : lendMode === 'LENT';
+    let share: number;
+    if (lendMode === 'LENT') share = amount;
+    else if (lendMode === 'BORROWED') share = 0;
+    else share = theirShare.trim() ? roundMoney(parseAmount(theirShare)) : roundMoney(amount / 2);
+
+    if (share < 0 || share > amount) {
+      setLendError(`Their share must be between Rs. 0 and ${formatLKR(amount)}.`);
+      return;
+    }
+
+    setLending(true);
+    try {
+      const { error: rpcError } = await supabase.rpc('add_direct_expense', {
+        p_friend_id: lendTo.id,
+        p_amount: amount,
+        p_note: lendNote.trim(),
+        p_i_paid: paidByMe,
+        p_their_share: share,
+      });
+      if (rpcError) throw rpcError;
+
+      // What changes hands is their share when I paid, my share when they did.
+      const delta = paidByMe ? share : amount - share;
+      toast.success(
+        delta === 0
+          ? 'Recorded.'
+          : paidByMe
+            ? `Recorded — ${lendTo.display_name} owes you ${formatLKR(delta)}.`
+            : `Recorded — you owe ${lendTo.display_name} ${formatLKR(delta)}.`
+      );
+      setLendTo(null);
+      await load();
+    } catch (err) {
+      setLendError(friendlyDbError(err, 'Could not record that.'));
+    } finally {
+      setLending(false);
     }
   };
 
@@ -564,13 +640,21 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
               </span>
             </div>
 
+            <button
+              type="button"
+              className="btn btn-primary btn-block"
+              onClick={() => openLend(selected.friend)}
+            >
+              <HandCoins size={16} /> Add expense or loan
+            </button>
+
             {selected.perGroup.length === 0 ? (
               <EmptyState
                 icon="✅"
                 title="Nothing outstanding"
                 text={
                   selected.shared_group_count === 0
-                    ? 'You are connected, but have not shared a group or bill yet.'
+                    ? 'Nothing between you yet — record a loan above, or split a bill in a group.'
                     : 'No open balances with this friend.'
                 }
               />
@@ -582,7 +666,9 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                     <div key={entry.groupId} className="card row-between">
                       <span className="grow" style={{ minWidth: 0 }}>
                         <span className="truncate" style={{ display: 'block', fontWeight: 600, fontSize: '0.9rem' }}>
-                          {entry.groupName}
+                          {/* Inside this friend's own sheet the pair group's name
+                              ("Between you and X") just repeats the heading. */}
+                          {directGroupIds.has(entry.groupId) ? 'Money lent directly' : entry.groupName}
                         </span>
                         <span className="hint">{entry.net > 0 ? 'owes you' : 'you owe'}</span>
                       </span>
@@ -641,7 +727,9 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                           </span>
                           <span className="hint">
                             {friendlyDate(payment.created_at.slice(0, 10))}
-                            {groupNames[payment.group_id] ? ` · ${groupNames[payment.group_id]}` : ''}
+                            {!directGroupIds.has(payment.group_id) && groupNames[payment.group_id]
+                              ? ` · ${groupNames[payment.group_id]}`
+                              : ''}
                             {payment.payment_method ? ` · ${payment.payment_method.toLowerCase()}` : ''}
                             {payment.note ? ` · ${payment.note}` : ''}
                           </span>
@@ -672,6 +760,131 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
             void load();
           }}
         />
+      )}
+
+      {lendTo && (
+        <Sheet title={`You and ${lendTo.display_name}`} onClose={() => setLendTo(null)}>
+          <form onSubmit={handleLend} className="stack">
+            <div className="segmented" role="group" aria-label="What happened">
+              {([
+                ['LENT', 'I lent'],
+                ['BORROWED', 'I borrowed'],
+                ['SHARED', 'Shared'],
+              ] as const).map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  className={`segmented-option ${lendMode === id ? 'is-active' : ''}`}
+                  onClick={() => {
+                    setLendMode(id);
+                    setLendError(null);
+                  }}
+                  aria-pressed={lendMode === id}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            <p className="hint">
+              {lendMode === 'LENT'
+                ? `You gave ${lendTo.display_name} money — they will owe you all of it.`
+                : lendMode === 'BORROWED'
+                  ? `${lendTo.display_name} gave you money — you will owe them all of it.`
+                  : 'A bill the two of you shared. Split evenly unless you say otherwise.'}
+            </p>
+
+            <div className="input-prefixed">
+              <span className="input-prefix">Rs.</span>
+              <input
+                type="text"
+                inputMode="decimal"
+                className="input tabular"
+                placeholder="0.00"
+                value={lendAmount}
+                onChange={(e) => {
+                  setLendAmount(e.target.value);
+                  setLendError(null);
+                }}
+                autoFocus
+                required
+              />
+            </div>
+
+            <input
+              type="text"
+              className="input"
+              placeholder="What was it for? (optional)"
+              value={lendNote}
+              onChange={(e) => setLendNote(e.target.value)}
+              maxLength={140}
+            />
+
+            {lendMode === 'SHARED' && (
+              <>
+                <div className="segmented" role="group" aria-label="Who paid">
+                  <button
+                    type="button"
+                    className={`segmented-option ${iPaid ? 'is-active' : ''}`}
+                    onClick={() => setIPaid(true)}
+                    aria-pressed={iPaid}
+                  >
+                    I paid
+                  </button>
+                  <button
+                    type="button"
+                    className={`segmented-option ${!iPaid ? 'is-active' : ''}`}
+                    onClick={() => setIPaid(false)}
+                    aria-pressed={!iPaid}
+                  >
+                    {lendTo.display_name.split(' ')[0]} paid
+                  </button>
+                </div>
+
+                <div className="field">
+                  <label className="label label-block" htmlFor="their-share">
+                    {lendTo.display_name.split(' ')[0]}&rsquo;s share
+                  </label>
+                  <div className="input-prefixed">
+                    <span className="input-prefix">Rs.</span>
+                    <input
+                      id="their-share"
+                      type="text"
+                      inputMode="decimal"
+                      className="input tabular"
+                      placeholder={
+                        parseAmount(lendAmount) > 0
+                          ? (roundMoney(parseAmount(lendAmount) / 2)).toFixed(2)
+                          : 'Half'
+                      }
+                      value={theirShare}
+                      onChange={(e) => {
+                        setTheirShare(e.target.value);
+                        setLendError(null);
+                      }}
+                    />
+                  </div>
+                  <span className="hint">Leave blank to split it down the middle.</span>
+                </div>
+              </>
+            )}
+
+            {lendError && <Alert variant="error">{lendError}</Alert>}
+
+            <button
+              type="submit"
+              className="btn btn-primary btn-block btn-lg"
+              disabled={lending || !lendAmount.trim()}
+            >
+              {lending && <Spinner />}
+              {lending ? 'Saving…' : 'Record it'}
+            </button>
+
+            <span className="hint">
+              Kept just between the two of you — this does not appear in any group.
+            </span>
+          </form>
+        </Sheet>
       )}
 
       {showAdd && (

@@ -2398,3 +2398,240 @@ ALTER TABLE daily_expenses ADD CONSTRAINT daily_expenses_title_sane
 -- not re-check rows already stored. Applying this to a live database therefore
 -- cannot fail partway on historical data — which for a schema meant to be
 -- re-run against production matters more than retroactively rejecting old rows.
+
+-- ========================================
+-- DIRECT LENDING BETWEEN FRIENDS
+-- ========================================
+-- "I lent Kavya Rs. 5,000" had no home: settlements are recorded against a
+-- group, so a friend you share no group with could not be lent to at all, and
+-- the only workaround was to create a group and hand-craft an unequal split
+-- where their share was the whole bill.
+--
+-- Rather than add a second, parallel loan ledger — which would have to be merged
+-- with the group ledger everywhere balances are shown, and could drift out of
+-- step with it — a loan is stored as an ordinary expense in a hidden one-to-one
+-- group between the two people. Settling, payment history, debt simplification
+-- and the settle-before-you-leave rule then all work on it unchanged, because to
+-- every other part of the system it simply is a group expense.
+ALTER TABLE groups ADD COLUMN IF NOT EXISTS is_direct BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE INDEX IF NOT EXISTS idx_groups_direct ON groups(is_direct) WHERE is_direct;
+
+-- The 1:1 group for a pair, created on first use. Deterministic in the pair, so
+-- every later loan between the same two people lands in the same ledger rather
+-- than scattering across a new group each time.
+CREATE OR REPLACE FUNCTION public.direct_group_with(p_friend_id UUID)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me       UUID := auth.uid();
+    v_group    UUID;
+    v_code     TEXT;
+    v_attempts INT := 0;
+    v_name     TEXT;
+BEGIN
+    IF v_me IS NULL THEN
+        RAISE EXCEPTION 'Not authenticated';
+    END IF;
+    IF p_friend_id = v_me THEN
+        RAISE EXCEPTION 'You cannot lend to yourself';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM users WHERE id = p_friend_id) THEN
+        RAISE EXCEPTION 'That person does not have an account';
+    END IF;
+
+    -- An existing direct group containing exactly these two people.
+    SELECT g.id INTO v_group
+    FROM groups g
+    WHERE g.is_direct
+      AND EXISTS (SELECT 1 FROM group_members m WHERE m.group_id = g.id AND m.user_id = v_me)
+      AND EXISTS (SELECT 1 FROM group_members m WHERE m.group_id = g.id AND m.user_id = p_friend_id)
+      AND (SELECT COUNT(*) FROM group_members m WHERE m.group_id = g.id) = 2
+    LIMIT 1;
+
+    IF v_group IS NOT NULL THEN
+        RETURN v_group;
+    END IF;
+
+    LOOP
+        v_attempts := v_attempts + 1;
+        v_code := UPPER(SUBSTRING(REPLACE(gen_random_uuid()::TEXT, '-', '') FROM 1 FOR 6));
+        EXIT WHEN NOT EXISTS (SELECT 1 FROM groups WHERE invite_code = v_code);
+        IF v_attempts > 20 THEN
+            RAISE EXCEPTION 'Could not allocate a unique invite code';
+        END IF;
+    END LOOP;
+
+    SELECT COALESCE(NULLIF(TRIM(display_name), ''), 'friend') INTO v_name
+    FROM users WHERE id = p_friend_id;
+
+    -- Expired code on purpose: this group is not joinable, it exists only to
+    -- carry the pair's ledger.
+    INSERT INTO groups (name, description, icon_emoji, created_by, invite_code,
+                        invite_code_expires_at, is_direct)
+    VALUES ('Between you and ' || v_name, '', '🤝', v_me, v_code, NOW() - INTERVAL '1 day', TRUE)
+    RETURNING id INTO v_group;
+
+    INSERT INTO group_members (group_id, user_id, role)
+    VALUES (v_group, v_me, 'ADMIN'), (v_group, p_friend_id, 'ADMIN');
+
+    RETURN v_group;
+END;
+$$;
+
+-- Records a loan in either direction.
+--
+-- p_i_lent TRUE  -> I gave them money, so they owe me.
+-- p_i_lent FALSE -> I borrowed from them, so I owe them.
+--
+-- Implemented as an expense the lender "paid" and the borrower owes in full:
+-- the lender is credited, the borrower debited, and the pair nets to zero, the
+-- same shape every other expense has.
+CREATE OR REPLACE FUNCTION public.lend_to_friend(
+    p_friend_id UUID,
+    p_amount    DECIMAL,
+    p_note      TEXT DEFAULT '',
+    p_i_lent    BOOLEAN DEFAULT TRUE
+)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me       UUID := auth.uid();
+    v_group    UUID;
+    v_lender   UUID;
+    v_borrower UUID;
+    v_title    TEXT;
+    v_expense  UUID;
+BEGIN
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+
+    v_group := public.direct_group_with(p_friend_id);
+
+    IF p_i_lent THEN
+        v_lender := v_me;      v_borrower := p_friend_id;
+    ELSE
+        v_lender := p_friend_id; v_borrower := v_me;
+    END IF;
+
+    v_title := COALESCE(NULLIF(TRIM(p_note), ''), 'Loan');
+
+    INSERT INTO expenses (group_id, title, amount, paid_by, created_by,
+                          category, split_method, notes)
+    VALUES (v_group, v_title, p_amount, v_lender, v_me, 'OTHER', 'UNEQUAL', COALESCE(p_note, ''))
+    RETURNING id INTO v_expense;
+
+    -- The borrower carries the whole amount; the lender's share is zero.
+    PERFORM public.write_expense_rows(
+        v_expense, v_group, v_title, p_amount, v_lender,
+        jsonb_build_array(
+            jsonb_build_object('user_id', v_borrower, 'amount', p_amount, 'is_included', TRUE),
+            jsonb_build_object('user_id', v_lender,   'amount', 0,        'is_included', TRUE)
+        ),
+        '[]'::jsonb
+    );
+
+    RETURN v_expense;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.direct_group_with(UUID)                    TO authenticated;
+GRANT EXECUTE ON FUNCTION public.lend_to_friend(UUID, DECIMAL, TEXT, BOOLEAN) TO authenticated;
+
+-- ========================================
+-- DIRECT EXPENSES BETWEEN TWO PEOPLE
+-- ========================================
+-- Generalises lending: a pair should be able to record a shared bill too,
+-- without inventing a group for two people.
+--
+-- One primitive covers every case, because "who paid" and "how much of it is
+-- theirs" are the only two facts that matter:
+--
+--   I lent them 5000      -> I paid,    their share = 5000  (all theirs)
+--   I borrowed 5000       -> they paid, their share = 0     (all mine)
+--   Dinner 1000, I paid   -> I paid,    their share = 500   (split)
+--   Dinner 1000, they paid-> they paid, their share = 500   (split)
+--
+-- A loan is just the case where their share is the whole amount, so lend_to_friend
+-- below becomes a thin wrapper rather than a second code path that could drift.
+CREATE OR REPLACE FUNCTION public.add_direct_expense(
+    p_friend_id   UUID,
+    p_amount      DECIMAL,
+    p_note        TEXT    DEFAULT '',
+    p_i_paid      BOOLEAN DEFAULT TRUE,
+    p_their_share DECIMAL DEFAULT NULL
+)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me     UUID := auth.uid();
+    v_group  UUID;
+    v_payer  UUID;
+    v_theirs DECIMAL;
+    v_mine   DECIMAL;
+    v_title  TEXT;
+    v_id     UUID;
+BEGIN
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+
+    -- Default to an even split, which is what a shared bill usually is.
+    v_theirs := ROUND(COALESCE(p_their_share, p_amount / 2), 2);
+
+    IF v_theirs < 0 OR v_theirs > ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Their share must be between zero and the full amount';
+    END IF;
+
+    v_mine  := ROUND(p_amount, 2) - v_theirs;
+    v_group := public.direct_group_with(p_friend_id);
+    v_payer := CASE WHEN p_i_paid THEN v_me ELSE p_friend_id END;
+    v_title := COALESCE(NULLIF(TRIM(p_note), ''), 'Shared expense');
+
+    INSERT INTO expenses (group_id, title, amount, paid_by, created_by,
+                          category, split_method, notes)
+    VALUES (v_group, v_title, p_amount, v_payer, v_me, 'OTHER',
+            CASE WHEN v_theirs * 2 = ROUND(p_amount, 2) THEN 'EQUAL' ELSE 'UNEQUAL' END,
+            COALESCE(p_note, ''))
+    RETURNING id INTO v_id;
+
+    PERFORM public.write_expense_rows(
+        v_id, v_group, v_title, p_amount, v_payer,
+        jsonb_build_array(
+            jsonb_build_object('user_id', p_friend_id, 'amount', v_theirs, 'is_included', TRUE),
+            jsonb_build_object('user_id', v_me,        'amount', v_mine,   'is_included', TRUE)
+        ),
+        '[]'::jsonb
+    );
+
+    RETURN v_id;
+END;
+$$;
+
+-- Kept as the loan-shaped entry point, now delegating so there is one
+-- implementation rather than two that could diverge.
+CREATE OR REPLACE FUNCTION public.lend_to_friend(
+    p_friend_id UUID,
+    p_amount    DECIMAL,
+    p_note      TEXT DEFAULT '',
+    p_i_lent    BOOLEAN DEFAULT TRUE
+)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+    RETURN public.add_direct_expense(
+        p_friend_id,
+        p_amount,
+        COALESCE(NULLIF(TRIM(p_note), ''), 'Loan'),
+        p_i_lent,                                        -- lender is the payer
+        CASE WHEN p_i_lent THEN p_amount ELSE 0 END      -- borrower carries all of it
+    );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.add_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL) TO authenticated;
