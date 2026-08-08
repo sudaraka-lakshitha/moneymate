@@ -11,7 +11,7 @@ import { ReceiptPicker } from '../components/ReceiptPicker';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/Confirm';
 import { queueWrite, readCache, useOnline, writeCache } from '../lib/offline';
-import { Plus, Repeat, Trash2, Wallet } from 'lucide-react';
+import { Pencil, Plus, Repeat, Trash2, Wallet } from 'lucide-react';
 
 const FREQUENCIES = [
   { id: 'DAILY', label: 'Daily' },
@@ -44,6 +44,7 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
   const [error, setError] = useState<string | null>(null);
 
   const [showAdd, setShowAdd] = useState(false);
+  const [editing, setEditing] = useState<DailyExpense | null>(null);
   const [showBudgets, setShowBudgets] = useState(false);
 
   const [title, setTitle] = useState('');
@@ -162,11 +163,61 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
     setFrequency('MONTHLY');
   };
 
-  const handleAdd = async (e: React.FormEvent) => {
+  const openAdd = () => {
+    setEditing(null);
+    resetForm();
+    setShowAdd(true);
+  };
+
+  const openEdit = (expense: DailyExpense) => {
+    setEditing(expense);
+    setTitle(expense.title);
+    setAmountStr(String(expense.amount));
+    setCategory(expense.category);
+    setDate(expense.date);
+    setNote(expense.note ?? '');
+    setReceiptPath(expense.receipt_url ?? null);
+    setShowAdd(true);
+  };
+
+  const closeForm = () => {
+    setShowAdd(false);
+    setEditing(null);
+    resetForm();
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const amount = roundMoney(parseAmount(amountStr));
     if (!title.trim()) return toast.error('Give the expense a title.');
     if (amount <= 0) return toast.error('Enter an amount greater than zero.');
+
+    if (editing) {
+      if (!online) return toast.error('Editing requires an internet connection.');
+      setSaving(true);
+      try {
+        const { error: updateError } = await supabase
+          .from('daily_expenses')
+          .update({
+            title: title.trim(),
+            amount,
+            category,
+            date,
+            note: note.trim(),
+            receipt_url: receiptPath,
+          })
+          .eq('id', editing.id);
+        if (updateError) throw updateError;
+        toast.success('Updated.');
+        closeForm();
+        await load();
+      } catch (err) {
+        toast.error(friendlyDbError(err, 'Could not update the entry.'));
+      } finally {
+        setSaving(false);
+      }
+      return;
+    }
 
     const payload = {
       user_id: user.id,
@@ -186,8 +237,7 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
         [{ ...payload, id: `pending-${Date.now()}`, is_deleted: false, created_at: new Date().toISOString() } as DailyExpense, ...current]
       );
       toast.info('Saved offline — it will sync when you are back online.');
-      setShowAdd(false);
-      resetForm();
+      closeForm();
       return;
     }
 
@@ -211,8 +261,7 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
       }
 
       toast.success(recurring ? `Logged and repeating ${frequency.toLowerCase()}.` : 'Logged.');
-      setShowAdd(false);
-      resetForm();
+      closeForm();
       await load();
     } catch (err) {
       toast.error(friendlyDbError(err, 'Could not save the expense.'));
@@ -310,7 +359,7 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
           <h1 className="page-title">Tracker</h1>
           <p className="page-subtitle">{monthLabel(currentMonth)}</p>
         </div>
-        <button type="button" className="btn btn-primary btn-sm" onClick={() => setShowAdd(true)}>
+        <button type="button" className="btn btn-primary btn-sm" onClick={openAdd}>
           <Plus size={15} /> Log
         </button>
       </header>
@@ -416,7 +465,7 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
           title="Nothing logged yet"
           text="Track a coffee, a tuk ride, anything — it all feeds your analytics."
           action={
-            <button type="button" className="btn btn-primary" onClick={() => setShowAdd(true)}>
+            <button type="button" className="btn btn-primary" onClick={openAdd}>
               Log an expense
             </button>
           }
@@ -446,15 +495,26 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
                           <span className="hint">{expense.note || meta.name}</span>
                         </span>
                         <span className="amount-md tabular">{formatLKR(expense.amount)}</span>
-                        <button
-                          type="button"
-                          className="btn-icon"
-                          style={{ width: 30, height: 30 }}
-                          onClick={() => handleDelete(expense)}
-                          aria-label={`Delete ${expense.title}`}
-                        >
-                          <Trash2 size={13} />
-                        </button>
+                        <span className="row" style={{ gap: 4, flexShrink: 0 }}>
+                          <button
+                            type="button"
+                            className="btn-icon"
+                            style={{ width: 30, height: 30 }}
+                            onClick={() => openEdit(expense)}
+                            aria-label={`Edit ${expense.title}`}
+                          >
+                            <Pencil size={13} />
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-icon"
+                            style={{ width: 30, height: 30 }}
+                            onClick={() => handleDelete(expense)}
+                            aria-label={`Delete ${expense.title}`}
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </span>
                       </div>
                     );
                   })}
@@ -466,8 +526,8 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
       )}
 
       {showAdd && (
-        <Sheet title="Log an expense" onClose={() => setShowAdd(false)}>
-          <form onSubmit={handleAdd} className="stack">
+        <Sheet title={editing ? 'Edit expense' : 'Log an expense'} onClose={closeForm}>
+          <form onSubmit={handleSubmit} className="stack">
             <input
               type="text"
               className="input"
@@ -542,41 +602,43 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
               }}
             />
 
-            <div className="field">
-              <label className="row" style={{ cursor: 'pointer' }}>
-                <input
-                  type="checkbox"
-                  className="checkbox"
-                  checked={recurring}
-                  onChange={(e) => setRecurring(e.target.checked)}
-                />
-                <Repeat size={15} color="var(--primary)" />
-                <span style={{ fontSize: '0.9rem', fontWeight: 500 }}>Repeat this entry</span>
-              </label>
+            {!editing && (
+              <div className="field">
+                <label className="row" style={{ cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    className="checkbox"
+                    checked={recurring}
+                    onChange={(e) => setRecurring(e.target.checked)}
+                  />
+                  <Repeat size={15} color="var(--primary)" />
+                  <span style={{ fontSize: '0.9rem', fontWeight: 500 }}>Repeat this entry</span>
+                </label>
 
-              {recurring && (
-                <>
-                  <div className="chip-grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
-                    {FREQUENCIES.map((option) => (
-                      <button
-                        key={option.id}
-                        type="button"
-                        className={`chip ${frequency === option.id ? 'is-selected' : ''}`}
-                        style={{ display: 'flex', justifyContent: 'center' }}
-                        onClick={() => setFrequency(option.id)}
-                      >
-                        {option.label}
-                      </button>
-                    ))}
-                  </div>
-                  <span className="hint">Good for rent, subscriptions and season tickets.</span>
-                </>
-              )}
-            </div>
+                {recurring && (
+                  <>
+                    <div className="chip-grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+                      {FREQUENCIES.map((option) => (
+                        <button
+                          key={option.id}
+                          type="button"
+                          className={`chip ${frequency === option.id ? 'is-selected' : ''}`}
+                          style={{ display: 'flex', justifyContent: 'center' }}
+                          onClick={() => setFrequency(option.id)}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                    <span className="hint">Good for rent, subscriptions and season tickets.</span>
+                  </>
+                )}
+              </div>
+            )}
 
             <button type="submit" className="btn btn-primary btn-block btn-lg" disabled={saving}>
               {saving && <Spinner />}
-              {saving ? 'Saving…' : online ? 'Save entry' : 'Save offline'}
+              {saving ? 'Saving…' : editing ? 'Save changes' : online ? 'Save entry' : 'Save offline'}
             </button>
           </form>
         </Sheet>
