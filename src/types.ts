@@ -128,6 +128,33 @@ export interface GroupSettlement {
   payee?: User;
 }
 
+export type SocialStatus = 'PENDING' | 'ACCEPTED' | 'DECLINED' | 'CANCELLED';
+
+export interface GroupInvitation {
+  id: string;
+  group_id: string;
+  invited_email: string;
+  invited_user_id?: string;
+  invited_by?: string;
+  status: SocialStatus;
+  created_at: string;
+  responded_at?: string;
+  groups?: { name: string; icon_emoji: string };
+  inviter?: User;
+}
+
+export interface FriendRequest {
+  id: string;
+  requester_id: string;
+  addressee_id?: string;
+  addressee_email: string;
+  status: SocialStatus;
+  created_at: string;
+  responded_at?: string;
+  requester?: User;
+  addressee?: User;
+}
+
 export interface DebtSimplification {
   from: User;
   to: User;

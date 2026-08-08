@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { Group, InviteLookup, User } from '../types';
+import { Group, GroupInvitation, InviteLookup, User } from '../types';
 import { formatLKRSigned } from '../lib/currency';
 import { friendlyDbError } from '../lib/authErrors';
 import { Alert, EmptyState, Sheet, SkeletonRows, Spinner } from '../components/ui';
 import { useToast } from '../components/Toast';
-import { Plus, Search, Users2 } from 'lucide-react';
+import { Check, Plus, Search, Users2, X } from 'lucide-react';
 
 interface GroupsPageProps {
   user: User;
@@ -19,6 +19,8 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
 
   const [groups, setGroups] = useState<Group[]>([]);
   const [balances, setBalances] = useState<Record<string, number>>({});
+  const [invitations, setInvitations] = useState<GroupInvitation[]>([]);
+  const [respondingTo, setRespondingTo] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   const [showCreate, setShowCreate] = useState(false);
@@ -63,6 +65,14 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
         }
         setBalances(perGroup);
       }
+
+      const { data: inviteData } = await supabase
+        .from('group_invitations')
+        .select('*, groups(name, icon_emoji), inviter:users!group_invitations_invited_by_fkey(*)')
+        .eq('invited_user_id', user.id)
+        .eq('status', 'PENDING')
+        .order('created_at', { ascending: false });
+      setInvitations((inviteData ?? []) as unknown as GroupInvitation[]);
     } catch (error) {
       toast.error(friendlyDbError(error, 'Could not load your groups.'));
     } finally {
@@ -73,6 +83,28 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
   useEffect(() => {
     void loadGroups();
   }, [loadGroups]);
+
+  const handleRespondToInvitation = async (invitation: GroupInvitation, accept: boolean) => {
+    setRespondingTo(invitation.id);
+    try {
+      const { error } = await supabase.rpc('respond_to_group_invitation', {
+        p_invitation_id: invitation.id,
+        p_accept: accept,
+      });
+      if (error) throw error;
+
+      if (accept) {
+        toast.success(`You joined "${invitation.groups?.name ?? 'the group'}".`);
+      } else {
+        toast.info('Invitation declined.');
+      }
+      await loadGroups();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not respond to the invitation.'));
+    } finally {
+      setRespondingTo(null);
+    }
+  };
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -196,6 +228,53 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
           </button>
         </div>
       </header>
+
+      {invitations.length > 0 && (
+        <div className="stack-sm" style={{ marginBottom: 'var(--sp-5)' }}>
+          <span className="label">
+            {invitations.length} group invitation{invitations.length === 1 ? '' : 's'}
+          </span>
+          {invitations.map((inv) => (
+            <div key={inv.id} className="card row">
+              <span
+                className="icon-tile"
+                style={{ width: 42, height: 42, fontSize: 20, background: 'var(--primary-container)' }}
+              >
+                {inv.groups?.icon_emoji ?? '💰'}
+              </span>
+              <span className="grow" style={{ minWidth: 0 }}>
+                <span className="truncate" style={{ display: 'block', fontWeight: 700, fontSize: '0.92rem' }}>
+                  {inv.groups?.name ?? 'A group'}
+                </span>
+                <span className="hint truncate" style={{ display: 'block' }}>
+                  {inv.inviter ? `Invited by ${inv.inviter.display_name}` : 'You were invited'}
+                </span>
+              </span>
+              <span className="row" style={{ gap: 6, flexShrink: 0 }}>
+                <button
+                  type="button"
+                  className="btn-icon"
+                  style={{ width: 32, height: 32 }}
+                  onClick={() => handleRespondToInvitation(inv, false)}
+                  disabled={respondingTo === inv.id}
+                  aria-label={`Decline invitation to ${inv.groups?.name ?? 'group'}`}
+                >
+                  <X size={15} />
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  onClick={() => handleRespondToInvitation(inv, true)}
+                  disabled={respondingTo === inv.id}
+                >
+                  {respondingTo === inv.id ? <Spinner /> : <Check size={14} />}
+                  Join
+                </button>
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
 
       {loading ? (
         <SkeletonRows count={3} height={82} />
