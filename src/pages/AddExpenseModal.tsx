@@ -111,7 +111,10 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [statsChoice, setStatsChoice] = useState(false);
+  // On by default: a bill you are entering yourself and are part of is your own
+  // spending. The confirmation flow exists for what other people add, not for
+  // making you tick a box to see your own expenses in your own charts.
+  const [statsChoice, setStatsChoice] = useState(true);
 
   // Rebuild the form from what was actually saved: who was in, and the exact
   // per-person figures for whichever split method was used. Without this an edit

@@ -2603,7 +2603,10 @@ BEGIN
         v_id, v_group, v_title, p_amount, v_payer,
         jsonb_build_array(
             jsonb_build_object('user_id', p_friend_id, 'amount', v_theirs, 'is_included', TRUE),
-            jsonb_build_object('user_id', v_me,        'amount', v_mine,   'is_included', TRUE)
+            -- You typed this record yourself, so your own answer is already given.
+            -- Leaving it undecided would put your own entry in your own
+            -- confirmation queue, which is only meant for other people's bills.
+            jsonb_build_object('user_id', v_me, 'amount', v_mine, 'is_included', TRUE, 'stats', TRUE)
         ),
         '[]'::jsonb
     );
@@ -2695,7 +2698,7 @@ BEGIN
         COALESCE(p_note, ''),
         jsonb_build_array(
             jsonb_build_object('user_id', v_friend, 'amount', v_theirs, 'is_included', TRUE),
-            jsonb_build_object('user_id', v_me,     'amount', v_mine,   'is_included', TRUE)
+            jsonb_build_object('user_id', v_me, 'amount', v_mine, 'is_included', TRUE, 'stats', TRUE)
         ),
         '[]'::jsonb
     );
@@ -2742,6 +2745,7 @@ DECLARE
     v_old_snap JSONB;
     v_new_snap JSONB;
     v_summary  TEXT := '';
+    v_choices  JSONB;
 BEGIN
     SELECT * INTO v_old FROM expenses WHERE id = p_expense_id;
     IF NOT FOUND THEN
@@ -2784,6 +2788,18 @@ BEGIN
         v_summary := 'splits adjusted';
     END IF;
 
+    -- Remember what everyone else already decided about their own statistics.
+    -- The splits are about to be deleted and rewritten, and without this an edit
+    -- by one person would quietly reset everybody else's answer to "undecided" —
+    -- their share would drop out of their charts and reappear in their
+    -- confirmation queue because somebody else fixed a typo.
+    SELECT COALESCE(jsonb_object_agg(user_id::TEXT, include_in_stats), '{}'::jsonb)
+    INTO v_choices
+    FROM expense_splits
+    WHERE expense_id = p_expense_id
+      AND user_id <> auth.uid()
+      AND include_in_stats IS NOT NULL;
+
     -- Zero out whatever this expense currently contributes, however many edits
     -- it has already been through. Nothing is deleted: the ledger stays
     -- append-only and auditable.
@@ -2817,6 +2833,13 @@ BEGIN
 
     INSERT INTO expense_edits (expense_id, edited_by, old_snapshot, new_snapshot, change_summary)
     VALUES (p_expense_id, auth.uid(), v_old_snap, v_new_snap, RTRIM(v_summary, '; '));
+
+    -- Put everybody else's answer back. Only theirs — the editor's own choice
+    -- arrives on the splits they just submitted.
+    UPDATE expense_splits s
+    SET include_in_stats = (v_choices ->> s.user_id::TEXT)::BOOLEAN
+    WHERE s.expense_id = p_expense_id
+      AND v_choices ? s.user_id::TEXT;
 END;
 $$;
 
@@ -3001,6 +3024,18 @@ ALTER TABLE expense_splits ADD COLUMN IF NOT EXISTS include_in_stats BOOLEAN;
 CREATE INDEX IF NOT EXISTS idx_splits_stats_pending
     ON expense_splits(user_id) WHERE include_in_stats IS NULL;
 
+-- Bills you entered yourself are already answered. Without this every expense
+-- that existed before the column did — including your own — would land in your
+-- confirmation queue and drop out of your charts until you re-approved it, which
+-- is not what "ask me about other people's bills" means. Only NULLs are touched,
+-- so re-running this never overrides a decision anybody has made.
+UPDATE expense_splits s
+SET include_in_stats = TRUE
+FROM expenses e
+WHERE e.id = s.expense_id
+  AND s.user_id = e.created_by
+  AND s.include_in_stats IS NULL;
+
 -- Answer the question for one expense, for yourself only.
 CREATE OR REPLACE FUNCTION public.set_split_stats_choice(p_expense_id UUID, p_include BOOLEAN)
 RETURNS VOID
@@ -3078,21 +3113,40 @@ AS $$
         JOIN expenses e ON e.id = s.expense_id
         WHERE e.group_id = p_group_id AND NOT e.is_deleted AND s.is_included
         GROUP BY s.user_id
+    ),
+    -- Everyone the chart has to account for. Current members are not enough:
+    -- somebody who paid for a dinner and later left the group — or deleted their
+    -- account — still paid for that dinner, and driving the rows off
+    -- group_members alone silently drops their spending, so the slices stop
+    -- adding up to what the group actually spent. A deleted account leaves
+    -- paid_by NULL, which collects into one unnamed row rather than vanishing.
+    people AS (
+        SELECT user_id FROM group_members WHERE group_id = p_group_id
+        UNION
+        SELECT user_id FROM paid
+        UNION
+        SELECT user_id FROM owed
     )
     SELECT
-        m.user_id,
-        COALESCE(u.display_name, 'Member'),
+        pe.user_id,
+        CASE
+            WHEN u.id IS NULL          THEN 'Former member'
+            WHEN m.user_id IS NULL     THEN COALESCE(u.display_name, 'Member') || ' (left)'
+            ELSE COALESCE(u.display_name, 'Member')
+        END,
         u.avatar_url,
         ROUND(COALESCE(p.total, 0), 2),
         ROUND(COALESCE(o.total, 0), 2),
         ROUND(COALESCE(p.total, 0) - COALESCE(o.total, 0), 2),
         COALESCE(p.cnt, 0)
-    FROM group_members m
-    LEFT JOIN users u ON u.id = m.user_id
-    LEFT JOIN paid  p ON p.user_id = m.user_id
-    LEFT JOIN owed  o ON o.user_id = m.user_id
-    WHERE m.group_id = p_group_id
-      AND public.is_group_member(p_group_id)
+    FROM people pe
+    LEFT JOIN users u ON u.id = pe.user_id
+    LEFT JOIN group_members m ON m.group_id = p_group_id AND m.user_id = pe.user_id
+    -- IS NOT DISTINCT FROM, not `=`: the deleted-account bucket joins NULL to
+    -- NULL, and `=` would leave it with no total at all.
+    LEFT JOIN paid  p ON p.user_id IS NOT DISTINCT FROM pe.user_id
+    LEFT JOIN owed  o ON o.user_id IS NOT DISTINCT FROM pe.user_id
+    WHERE public.is_group_member(p_group_id)
     ORDER BY COALESCE(p.total, 0) DESC;
 $$;
 

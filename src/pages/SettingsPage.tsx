@@ -10,9 +10,11 @@ import { useConfirm } from '../components/Confirm';
 import { useInstall } from '../lib/install';
 import { IosInstallHelp } from '../components/InstallPrompt';
 import {
-  LogOut, Pencil, Globe, Shield, Database, ChevronRight,
+  LogOut, Pencil, Globe, Info, ChevronRight,
   Sun, Moon, Monitor, KeyRound, Camera, Trash2, Download, Check,
 } from 'lucide-react';
+
+const APP_VERSION = '1.0.0';
 
 const THEME_OPTIONS: { id: ThemePreference; label: string; icon: React.ElementType }[] = [
   { id: 'light', label: 'Light', icon: Sun },
@@ -223,10 +225,12 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
     }
   };
 
+  // Only things a person using the app would want to know. What the backend is
+  // called and which database features are switched on are our concerns, not
+  // theirs — and listing them reads like a debug screen.
   const infoRows = [
     { icon: Globe, label: 'Currency', value: 'LKR (Rs.)' },
-    { icon: Database, label: 'Sync', value: 'Supabase, live' },
-    { icon: Shield, label: 'Row Level Security', value: 'Enabled' },
+    { icon: Info, label: 'Version', value: APP_VERSION },
   ];
 
   return (

@@ -969,7 +969,9 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                       const net = Number(row.out_net);
                       const pct = Math.round((paid / total) * 100);
                       return (
-                        <div key={row.out_user_id} className="card row">
+                        // Spending by a deleted account has no user id — it is
+                        // one aggregate row, so a fixed key is unique.
+                        <div key={row.out_user_id ?? 'former'} className="card row">
                           <span
                             aria-hidden="true"
                             style={{

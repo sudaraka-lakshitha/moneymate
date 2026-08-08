@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
+import { useLiveRefresh } from '../lib/realtime';
 import { Budget, DailyExpense, ExpenseCategory, User } from '../types';
 import { formatLKR, parseAmount, roundMoney } from '../lib/currency';
 import { CATEGORIES, categoryMeta } from '../lib/categories';
@@ -107,6 +108,10 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Your own entries, but the same phone-in-a-pocket problem: reopening the app
+  // should show what you added on another device rather than a stale month.
+  useLiveRefresh('tracker', ['daily_expenses'], load);
 
   const today = todayISO();
   const todayTotal = useMemo(

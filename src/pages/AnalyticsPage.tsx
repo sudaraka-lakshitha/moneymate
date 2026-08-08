@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
+import { useLiveRefresh } from '../lib/realtime';
 import { ExpenseCategory, User } from '../types';
 import { formatLKR, roundMoney } from '../lib/currency';
 import { CATEGORIES, categoryMeta } from '../lib/categories';
@@ -74,13 +75,19 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
       // Shares somebody else's bill gave you that you have not ruled on yet.
       // They are already real expenses and already affect what you owe; the only
       // open question is whether they belong in your charts.
+      //
+      // Explicitly somebody else's: a bill you entered yourself carries your
+      // answer already, and being asked to confirm your own typing is noise.
       const { data: pendingData } = await supabase
         .from('expense_splits')
-        .select('expense_id, amount, expenses!inner(title, category, created_at, is_deleted, group_id, groups(name, is_direct))')
+        .select(
+          'expense_id, amount, expenses!inner(title, category, created_at, created_by, is_deleted, group_id, groups(name, is_direct))'
+        )
         .eq('user_id', user.id)
         .eq('is_included', true)
         .is('include_in_stats', null)
         .eq('expenses.is_deleted', false)
+        .neq('expenses.created_by', user.id)
         .order('expense_id')
         .limit(50);
       setPending(pendingData ?? []);
@@ -112,6 +119,10 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Somebody else adding a bill puts a decision in your queue; it should appear
+  // without you having to leave the screen and come back.
+  useLiveRefresh('analytics', ['expense_splits', 'expenses', 'daily_expenses'], load);
 
   const decide = async (expenseId: string, include: boolean) => {
     setDeciding(expenseId);

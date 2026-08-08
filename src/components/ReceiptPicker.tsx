@@ -77,9 +77,11 @@ export const ReceiptPicker: React.FC<ReceiptPickerProps> = ({ scope, value, onCh
       // Storage errors aren't guaranteed to be Error instances either — same
       // messageFrom() used everywhere else, so this never falls back to a
       // stringified object.
+      // Whichever way it fails, the person holding the phone can only retry —
+      // telling them to re-run a setup script is an instruction for us, not them.
       setError(
         /bucket|not found/i.test(messageFrom(err))
-          ? 'Receipt storage is not set up yet — re-run supabase_schema.sql, which creates the receipts bucket.'
+          ? 'Receipt uploads are unavailable right now. The expense will still save without the image.'
           : 'Could not upload the receipt image.'
       );
       setPreview(null);
