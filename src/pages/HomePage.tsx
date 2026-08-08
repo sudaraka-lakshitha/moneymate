@@ -128,7 +128,7 @@ export const HomePage: React.FC<HomePageProps> = ({ user, onNavigate }) => {
   const quickActions = [
     { icon: Plus, label: 'Add bill', route: 'groups' },
     { icon: Users2, label: 'New group', route: 'groups' },
-    { icon: Search, label: 'Join code', route: 'groups' },
+    { icon: Search, label: 'Search', route: 'search' },
     { icon: Wallet, label: 'Settle up', route: 'friends' },
   ];
 
@@ -141,14 +141,24 @@ export const HomePage: React.FC<HomePageProps> = ({ user, onNavigate }) => {
           <span className="hint">Welcome back,</span>
           <h1 className="page-title truncate">{firstName}</h1>
         </div>
-        <button
-          type="button"
-          onClick={() => onNavigate('settings')}
-          aria-label="Open your profile"
-          style={{ display: 'flex' }}
-        >
-          <Avatar name={user.display_name} url={user.avatar_url} size={44} />
-        </button>
+        <span className="row" style={{ gap: 'var(--sp-2)', flexShrink: 0 }}>
+          <button
+            type="button"
+            className="btn-icon"
+            onClick={() => onNavigate('search')}
+            aria-label="Search expenses"
+          >
+            <Search size={18} />
+          </button>
+          <button
+            type="button"
+            onClick={() => onNavigate('settings')}
+            aria-label="Open your profile"
+            style={{ display: 'flex' }}
+          >
+            <Avatar name={user.display_name} url={user.avatar_url} size={44} />
+          </button>
+        </span>
       </header>
 
       {error && (

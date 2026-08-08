@@ -6,8 +6,11 @@ import { clearAuthParamsFromUrl, readOAuthError } from './lib/authErrors';
 import { ThemeProvider } from './lib/theme';
 import { ToastProvider } from './components/Toast';
 import { ConfirmProvider } from './components/Confirm';
+import { useOnline, useQueueFlush } from './lib/offline';
+import { InstallPrompt } from './components/InstallPrompt';
 import { AuthPage } from './pages/AuthPage';
 import { ResetPasswordPage } from './pages/ResetPasswordPage';
+import { SearchPage } from './pages/SearchPage';
 import { HomePage } from './pages/HomePage';
 import { GroupsPage } from './pages/GroupsPage';
 import { GroupDetailPage } from './pages/GroupDetailPage';
@@ -15,8 +18,10 @@ import { FriendsPage } from './pages/FriendsPage';
 import { TrackerPage } from './pages/TrackerPage';
 import { AnalyticsPage } from './pages/AnalyticsPage';
 import { SettingsPage } from './pages/SettingsPage';
-import { Home, Users, UserCheck, Calendar, BarChart3, Settings } from 'lucide-react';
+import { Home, Users, UserCheck, Calendar, BarChart3, Settings, WifiOff, RefreshCw } from 'lucide-react';
 
+// Search is a utility, not a destination — it lives as a header action on Home
+// rather than taking one of six already-tight nav slots from a core screen.
 const NAV_ITEMS = [
   { id: 'home', label: 'Home', icon: Home },
   { id: 'groups', label: 'Groups', icon: Users },
@@ -66,6 +71,35 @@ const AppShell: React.FC = () => {
   const [profileError, setProfileError] = useState<string | null>(null);
   const [route, setRoute] = useState('home');
   const [recovering, setRecovering] = useState(false);
+  const [syncNote, setSyncNote] = useState<string | null>(null);
+
+  const online = useOnline();
+  const queued = useQueueFlush((sent) =>
+    setSyncNote(`Synced ${sent} offline ${sent === 1 ? 'entry' : 'entries'}.`)
+  );
+
+  // Clear the sync confirmation after a moment.
+  useEffect(() => {
+    if (!syncNote) return;
+    const timer = window.setTimeout(() => setSyncNote(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [syncNote]);
+
+  /**
+   * Posts any recurring expenses that fell due while the app was closed. The
+   * function is idempotent — next_run only moves forward — so running it on
+   * every launch is safe.
+   */
+  useEffect(() => {
+    if (!user || !online) return;
+    void supabase
+      .rpc('run_due_recurring')
+      .then(({ data, error }) => {
+        if (!error && typeof data === 'number' && data > 0) {
+          setSyncNote(`Added ${data} recurring ${data === 1 ? 'expense' : 'expenses'}.`);
+        }
+      });
+  }, [user?.id, online]);
 
   /**
    * Loads the profile row for a signed-in account, creating it if the
@@ -229,6 +263,8 @@ const AppShell: React.FC = () => {
     switch (route) {
       case 'groups':
         return <GroupsPage user={user} onNavigate={setRoute} />;
+      case 'search':
+        return <SearchPage user={user} onNavigate={setRoute} />;
       case 'friends':
         return <FriendsPage user={user} />;
       case 'tracker':
@@ -245,6 +281,20 @@ const AppShell: React.FC = () => {
   return (
     <ToastProvider>
       <ConfirmProvider>
+        {!online && (
+          <div className="offline-bar">
+            <WifiOff size={13} />
+            Offline{queued > 0 ? ` · ${queued} waiting to sync` : ' · showing saved data'}
+          </div>
+        )}
+        {online && syncNote && (
+          <div className="offline-bar is-syncing">
+            <RefreshCw size={13} /> {syncNote}
+          </div>
+        )}
+
+        <InstallPrompt />
+
         {profileError && (
           <div style={{ padding: 'var(--sp-3) var(--sp-4) 0' }}>
             <div className="alert alert-warning">

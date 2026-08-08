@@ -16,6 +16,8 @@ export interface Group {
   status: 'ACTIVE' | 'SETTLING' | 'SETTLED';
   current_cycle_id?: string;
   created_at: string;
+  /** Saved split arrangement, applied to each new bill. */
+  default_split_method?: SplitMethod;
   /** Derived client-side. */
   my_balance?: number;
   members_count?: number;
@@ -27,6 +29,8 @@ export interface GroupMember {
   user_id: string;
   role: 'ADMIN' | 'MEMBER';
   joined_at: string;
+  default_split_share?: number;
+  include_by_default?: boolean;
   user?: User;
 }
 

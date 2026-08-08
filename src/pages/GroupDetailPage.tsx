@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { Expense, Group, GroupMember, GroupSettlement, User } from '../types';
+import { Expense, Group, GroupMember, GroupSettlement, SplitMethod, User } from '../types';
 import { formatLKR, formatLKRSigned } from '../lib/currency';
 import { simplifyDebts } from '../lib/debtSimplifier';
 import { netByUser } from '../lib/balances';
@@ -109,6 +109,16 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
     for (const m of members) if (m.user) map[m.user_id] = m.user;
     return map;
   }, [members]);
+
+  // Saved split arrangement for this group, used to pre-fill each new bill.
+  const splitDefaults = useMemo(
+    () => ({
+      method: (group?.default_split_method ?? 'EQUAL') as SplitMethod,
+      shares: Object.fromEntries(members.map((m) => [m.user_id, m.default_split_share ?? 1])),
+      included: Object.fromEntries(members.map((m) => [m.user_id, m.include_by_default ?? true])),
+    }),
+    [group?.default_split_method, members]
+  );
 
   const isAdmin = members.some((m) => m.user_id === user.id && m.role === 'ADMIN');
   const myBalance = balances[user.id] ?? 0;
@@ -513,6 +523,7 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
           groupId={groupId}
           user={user}
           members={members}
+          defaults={splitDefaults}
           onClose={() => setShowAdd(false)}
           onSaved={() => {
             setShowAdd(false);

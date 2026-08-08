@@ -948,6 +948,226 @@ GRANT EXECUTE ON FUNCTION public.update_expense(UUID, TEXT, DECIMAL, UUID, TEXT,
 GRANT EXECUTE ON FUNCTION public.delete_expense(UUID, TEXT) TO authenticated;
 
 -- ========================================
+-- SPLIT DEFAULTS
+-- ========================================
+-- group_members.default_split_share already existed but nothing wrote or read
+-- it. These give a group a remembered split so a recurring dinner crowd is not
+-- re-configured on every bill.
+
+ALTER TABLE groups        ADD COLUMN IF NOT EXISTS default_split_method TEXT DEFAULT 'EQUAL';
+ALTER TABLE group_members ADD COLUMN IF NOT EXISTS include_by_default BOOLEAN DEFAULT TRUE;
+
+CREATE OR REPLACE FUNCTION public.save_split_defaults(
+    p_group_id UUID,
+    p_method   TEXT,
+    p_members  JSONB   -- [{user_id, share, included}]
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_member JSONB;
+BEGIN
+    IF NOT public.is_group_member(p_group_id) THEN
+        RAISE EXCEPTION 'You are not a member of this group';
+    END IF;
+
+    UPDATE groups SET default_split_method = COALESCE(p_method, 'EQUAL'), updated_at = NOW()
+    WHERE id = p_group_id;
+
+    FOR v_member IN SELECT * FROM jsonb_array_elements(p_members) LOOP
+        UPDATE group_members
+        SET default_split_share = GREATEST(COALESCE((v_member->>'share')::INT, 1), 0),
+            include_by_default  = COALESCE((v_member->>'included')::BOOLEAN, TRUE)
+        WHERE group_id = p_group_id
+          AND user_id  = (v_member->>'user_id')::UUID;
+    END LOOP;
+END;
+$$;
+
+-- ========================================
+-- RECURRING EXPENSES
+-- ========================================
+-- Templates, not expenses. group_id NULL means a personal tracker entry.
+
+CREATE TABLE IF NOT EXISTS recurring_expenses (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    group_id     UUID REFERENCES groups(id) ON DELETE CASCADE,
+    title        TEXT NOT NULL,
+    amount       DECIMAL(14, 2) NOT NULL CHECK (amount > 0),
+    category     TEXT DEFAULT 'OTHER',
+    notes        TEXT DEFAULT '',
+    paid_by      UUID REFERENCES users(id) ON DELETE SET NULL,
+    split_method TEXT DEFAULT 'EQUAL',
+    splits       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    frequency    TEXT NOT NULL CHECK (frequency IN ('DAILY', 'WEEKLY', 'MONTHLY')),
+    next_run     DATE NOT NULL,
+    last_run     DATE,
+    is_active    BOOLEAN DEFAULT TRUE,
+    created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_recurring_user ON recurring_expenses(user_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_recurring_due  ON recurring_expenses(next_run) WHERE is_active;
+
+ALTER TABLE recurring_expenses ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Owner manages recurring" ON recurring_expenses;
+DROP POLICY IF EXISTS "Members read group recurring" ON recurring_expenses;
+
+CREATE POLICY "Owner manages recurring" ON recurring_expenses FOR ALL
+    USING (user_id = auth.uid())
+    WITH CHECK (user_id = auth.uid());
+CREATE POLICY "Members read group recurring" ON recurring_expenses FOR SELECT
+    USING (group_id IS NOT NULL AND public.is_group_member(group_id));
+
+CREATE OR REPLACE FUNCTION public.advance_date(p_date DATE, p_frequency TEXT)
+RETURNS DATE
+LANGUAGE sql IMMUTABLE
+AS $$
+    SELECT CASE p_frequency
+        WHEN 'DAILY'   THEN p_date + INTERVAL '1 day'
+        WHEN 'WEEKLY'  THEN p_date + INTERVAL '7 days'
+        WHEN 'MONTHLY' THEN p_date + INTERVAL '1 month'
+        ELSE p_date + INTERVAL '1 month'
+    END::DATE;
+$$;
+
+-- Posts every occurrence that has fallen due since the last run, so a template
+-- stays correct even if the app was not opened for weeks. Idempotent: next_run
+-- only ever moves forward, so a second call the same day creates nothing.
+CREATE OR REPLACE FUNCTION public.run_due_recurring()
+RETURNS INT
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_template recurring_expenses%ROWTYPE;
+    v_created  INT := 0;
+    v_guard    INT;
+    v_expense  UUID;
+BEGIN
+    IF auth.uid() IS NULL THEN
+        RAISE EXCEPTION 'Not authenticated';
+    END IF;
+
+    FOR v_template IN
+        SELECT * FROM recurring_expenses
+        WHERE user_id = auth.uid() AND is_active AND next_run <= CURRENT_DATE
+    LOOP
+        v_guard := 0;
+
+        WHILE v_template.next_run <= CURRENT_DATE AND v_guard < 60 LOOP
+            IF v_template.group_id IS NULL THEN
+                INSERT INTO daily_expenses (user_id, title, amount, category, date, note)
+                VALUES (v_template.user_id, v_template.title, v_template.amount,
+                        v_template.category, v_template.next_run, v_template.notes);
+            ELSE
+                -- Skip silently if the user has since left the group, rather
+                -- than blocking every other template behind an exception.
+                IF public.is_group_member_of(v_template.group_id, v_template.user_id) THEN
+                    INSERT INTO expenses (group_id, title, amount, paid_by, created_by,
+                                          category, split_method, notes, is_recurring, recurrence_rule)
+                    VALUES (v_template.group_id, v_template.title, v_template.amount,
+                            COALESCE(v_template.paid_by, v_template.user_id), v_template.user_id,
+                            v_template.category, v_template.split_method, v_template.notes,
+                            TRUE, v_template.frequency)
+                    RETURNING id INTO v_expense;
+
+                    PERFORM public.write_expense_rows(
+                        v_expense, v_template.group_id, v_template.title, v_template.amount,
+                        COALESCE(v_template.paid_by, v_template.user_id), v_template.splits, '[]'::jsonb
+                    );
+                END IF;
+            END IF;
+
+            v_created := v_created + 1;
+            v_guard   := v_guard + 1;
+            v_template.last_run := v_template.next_run;
+            v_template.next_run := public.advance_date(v_template.next_run, v_template.frequency);
+        END LOOP;
+
+        UPDATE recurring_expenses
+        SET next_run = v_template.next_run, last_run = v_template.last_run
+        WHERE id = v_template.id;
+    END LOOP;
+
+    RETURN v_created;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.save_split_defaults(UUID, TEXT, JSONB) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.advance_date(DATE, TEXT)               TO authenticated;
+GRANT EXECUTE ON FUNCTION public.run_due_recurring()                    TO authenticated;
+
+-- ========================================
+-- RECEIPT STORAGE
+-- ========================================
+-- Paths are groups/<group_id>/<file> or personal/<user_id>/<file>, so a policy
+-- can decide access from the path alone.
+
+CREATE OR REPLACE FUNCTION public.safe_uuid(p_text TEXT)
+RETURNS UUID
+LANGUAGE plpgsql IMMUTABLE
+AS $$
+BEGIN
+    RETURN p_text::UUID;
+EXCEPTION WHEN OTHERS THEN
+    RETURN NULL;   -- a non-uuid path segment simply never matches
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.safe_uuid(TEXT) TO authenticated;
+
+-- Guarded so this file still runs against a plain Postgres without Supabase's
+-- storage schema (local testing, CI).
+DO $storage$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = 'storage') THEN
+        RAISE NOTICE 'storage schema not present — skipping receipt bucket setup';
+        RETURN;
+    END IF;
+
+    INSERT INTO storage.buckets (id, name, public)
+    VALUES ('receipts', 'receipts', FALSE)
+    ON CONFLICT (id) DO NOTHING;
+
+    EXECUTE $p$ DROP POLICY IF EXISTS "Receipts are readable by owner or group" ON storage.objects $p$;
+    EXECUTE $p$ DROP POLICY IF EXISTS "Receipts are writable by owner or group" ON storage.objects $p$;
+    EXECUTE $p$ DROP POLICY IF EXISTS "Receipts are deletable by owner" ON storage.objects $p$;
+
+    EXECUTE $p$
+        CREATE POLICY "Receipts are readable by owner or group" ON storage.objects FOR SELECT
+        USING (
+            bucket_id = 'receipts' AND (
+                ((storage.foldername(name))[1] = 'personal'
+                 AND (storage.foldername(name))[2] = auth.uid()::TEXT)
+                OR ((storage.foldername(name))[1] = 'groups'
+                 AND public.is_group_member(public.safe_uuid((storage.foldername(name))[2])))
+            )
+        )
+    $p$;
+
+    EXECUTE $p$
+        CREATE POLICY "Receipts are writable by owner or group" ON storage.objects FOR INSERT
+        WITH CHECK (
+            bucket_id = 'receipts' AND (
+                ((storage.foldername(name))[1] = 'personal'
+                 AND (storage.foldername(name))[2] = auth.uid()::TEXT)
+                OR ((storage.foldername(name))[1] = 'groups'
+                 AND public.is_group_member(public.safe_uuid((storage.foldername(name))[2])))
+            )
+        )
+    $p$;
+
+    EXECUTE $p$
+        CREATE POLICY "Receipts are deletable by owner" ON storage.objects FOR DELETE
+        USING (bucket_id = 'receipts' AND owner = auth.uid())
+    $p$;
+END
+$storage$;
+
+-- ========================================
 -- AUTO-CREATE USER ON SIGN-UP / GOOGLE SIGN-IN
 -- ========================================
 CREATE OR REPLACE FUNCTION handle_new_user()

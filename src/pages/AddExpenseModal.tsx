@@ -5,8 +5,10 @@ import { allocate, formatLKR, parseAmount, roundMoney, splitEvenly } from '../li
 import { CATEGORIES } from '../lib/categories';
 import { friendlyDbError } from '../lib/authErrors';
 import { Alert, Avatar, Sheet, Spinner } from '../components/ui';
+import { ReceiptPicker } from '../components/ReceiptPicker';
 import { useToast } from '../components/Toast';
-import { Plus, Trash2 } from 'lucide-react';
+import { todayISO } from '../lib/dates';
+import { Plus, Repeat, Save, Trash2 } from 'lucide-react';
 
 interface AddExpenseModalProps {
   groupId: string;
@@ -14,9 +16,21 @@ interface AddExpenseModalProps {
   members: GroupMember[];
   /** When present the modal edits this expense instead of creating one. */
   expense?: Expense | null;
+  /** Group defaults, used to pre-fill a brand new bill. */
+  defaults?: {
+    method: SplitMethod;
+    shares: Record<string, number>;
+    included: Record<string, boolean>;
+  };
   onClose: () => void;
   onSaved: () => void;
 }
+
+const FREQUENCIES = [
+  { id: 'DAILY', label: 'Daily' },
+  { id: 'WEEKLY', label: 'Weekly' },
+  { id: 'MONTHLY', label: 'Monthly' },
+] as const;
 
 const SPLIT_METHODS: { id: SplitMethod; label: string; hint: string }[] = [
   { id: 'EQUAL', label: 'Equal', hint: 'Split evenly between everyone included.' },
@@ -40,11 +54,21 @@ const newLineItem = (memberIds: string[]): LineItem => ({
   sharedBy: memberIds,
 });
 
+/** First date after `from` on the given cadence. */
+const nextRunAfter = (from: string, frequency: 'DAILY' | 'WEEKLY' | 'MONTHLY'): string => {
+  const date = new Date(`${from}T00:00:00`);
+  if (frequency === 'DAILY') date.setDate(date.getDate() + 1);
+  else if (frequency === 'WEEKLY') date.setDate(date.getDate() + 7);
+  else date.setMonth(date.getMonth() + 1);
+  return date.toISOString().slice(0, 10);
+};
+
 export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
   groupId,
   user,
   members,
   expense,
+  defaults,
   onClose,
   onSaved,
 }) => {
@@ -55,19 +79,31 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
   const [title, setTitle] = useState(expense?.title ?? '');
   const [amountStr, setAmountStr] = useState(expense ? String(expense.amount) : '');
   const [category, setCategory] = useState<ExpenseCategory>(expense?.category ?? 'OTHER');
-  const [splitMethod, setSplitMethod] = useState<SplitMethod>(expense?.split_method ?? 'EQUAL');
+  // A new bill starts from the group's saved default; an edit keeps its own.
+  const [splitMethod, setSplitMethod] = useState<SplitMethod>(
+    expense?.split_method ?? defaults?.method ?? 'EQUAL'
+  );
   const [paidBy, setPaidBy] = useState(expense?.paid_by ?? user.id);
   const [notes, setNotes] = useState(expense?.notes ?? '');
 
   const [included, setIncluded] = useState<Record<string, boolean>>(() =>
-    Object.fromEntries(memberIds.map((id) => [id, true]))
+    Object.fromEntries(
+      memberIds.map((id) => [id, isEditing ? true : (defaults?.included[id] ?? true)])
+    )
   );
   const [customAmounts, setCustomAmounts] = useState<Record<string, string>>({});
   const [percentages, setPercentages] = useState<Record<string, string>>({});
   const [shares, setShares] = useState<Record<string, string>>(() =>
-    Object.fromEntries(memberIds.map((id) => [id, '1']))
+    Object.fromEntries(
+      memberIds.map((id) => [id, String(isEditing ? 1 : (defaults?.shares[id] ?? 1))])
+    )
   );
   const [items, setItems] = useState<LineItem[]>(() => [newLineItem(memberIds)]);
+
+  const [receiptPath, setReceiptPath] = useState<string | null>(null);
+  const [recurring, setRecurring] = useState(false);
+  const [frequency, setFrequency] = useState<'DAILY' | 'WEEKLY' | 'MONTHLY'>('MONTHLY');
+  const [savingDefaults, setSavingDefaults] = useState(false);
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -174,6 +210,28 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
   const toggleIncluded = (userId: string) =>
     setIncluded((prev) => ({ ...prev, [userId]: !prev[userId] }));
 
+  /** Remembers this configuration so the next bill in this group starts here. */
+  const handleSaveDefaults = async () => {
+    setSavingDefaults(true);
+    try {
+      const { error: rpcError } = await supabase.rpc('save_split_defaults', {
+        p_group_id: groupId,
+        p_method: splitMethod,
+        p_members: members.map((m) => ({
+          user_id: m.user_id,
+          share: parseInt(shares[m.user_id] ?? '1', 10) || 1,
+          included: Boolean(included[m.user_id]),
+        })),
+      });
+      if (rpcError) throw rpcError;
+      toast.success('Saved as this group’s default split.');
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not save the default split.'));
+    } finally {
+      setSavingDefaults(false);
+    }
+  };
+
   const toggleItemMember = (itemKey: string, userId: string) =>
     setItems((prev) =>
       prev.map((item) =>
@@ -242,13 +300,46 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
 
       // Both RPCs write the expense, its splits, its items and the ledger pair
       // in one transaction — a partial save can never corrupt balances.
-      const { error: rpcError } = isEditing
+      const { data: savedId, error: rpcError } = isEditing
         ? await supabase.rpc('update_expense', { p_expense_id: expense!.id, ...args })
         : await supabase.rpc('save_expense', { p_group_id: groupId, ...args });
 
       if (rpcError) throw rpcError;
 
-      toast.success(isEditing ? 'Expense updated.' : 'Expense added.');
+      // The receipt is attached after the row exists, so a failed save never
+      // leaves an orphaned image reference.
+      const expenseId = isEditing ? expense!.id : (savedId as string);
+      if (receiptPath && expenseId) {
+        await supabase.from('expenses').update({ receipt_url: receiptPath }).eq('id', expenseId);
+      }
+
+      if (recurring && !isEditing) {
+        const { error: recurringError } = await supabase.from('recurring_expenses').insert({
+          user_id: user.id,
+          group_id: groupId,
+          title: title.trim(),
+          amount: total,
+          category,
+          notes: notes.trim(),
+          paid_by: paidBy,
+          split_method: splitMethod,
+          splits,
+          frequency,
+          // The bill just posted counts as this period, so schedule the next.
+          next_run: nextRunAfter(todayISO(), frequency),
+        });
+        if (recurringError) {
+          toast.error('Expense saved, but the repeat schedule could not be created.');
+        }
+      }
+
+      toast.success(
+        isEditing
+          ? 'Expense updated.'
+          : recurring
+            ? `Expense added and set to repeat ${frequency.toLowerCase()}.`
+            : 'Expense added.'
+      );
       onSaved();
     } catch (err) {
       setError(friendlyDbError(err, 'Could not save the expense.'));
@@ -505,6 +596,68 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
         )}
 
         {computed.problem && <Alert variant="warning">{computed.problem}</Alert>}
+
+        {/* Saving the arrangement is only useful for a fresh bill. */}
+        {!isEditing && splitMethod !== 'ITEMIZED' && (
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            onClick={handleSaveDefaults}
+            disabled={savingDefaults}
+            style={{ alignSelf: 'flex-start' }}
+          >
+            {savingDefaults ? <Spinner /> : <Save size={14} />}
+            Save this as the group’s default split
+          </button>
+        )}
+
+        <ReceiptPicker
+          scope={{ kind: 'group', groupId }}
+          value={receiptPath}
+          onChange={setReceiptPath}
+          onScanned={(result) => {
+            // Only fill blanks — never overwrite something already typed.
+            if (result.amount && !amountStr) setAmountStr(result.amount.toFixed(2));
+            if (result.merchant && !title) setTitle(result.merchant);
+          }}
+        />
+
+        {!isEditing && (
+          <div className="field">
+            <label className="row" style={{ cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                className="checkbox"
+                checked={recurring}
+                onChange={(e) => setRecurring(e.target.checked)}
+              />
+              <Repeat size={15} color="var(--primary)" />
+              <span style={{ fontSize: '0.9rem', fontWeight: 500 }}>Repeat this bill</span>
+            </label>
+
+            {recurring && (
+              <>
+                <div className="chip-grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+                  {FREQUENCIES.map((option) => (
+                    <button
+                      key={option.id}
+                      type="button"
+                      className={`chip ${frequency === option.id ? 'is-selected' : ''}`}
+                      style={{ display: 'flex', justifyContent: 'center' }}
+                      onClick={() => setFrequency(option.id)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+                <span className="hint">
+                  Posts automatically with this same split. If the app is not opened for a while, any
+                  missed occurrences are filled in on the next visit.
+                </span>
+              </>
+            )}
+          </div>
+        )}
 
         <textarea
           className="input"

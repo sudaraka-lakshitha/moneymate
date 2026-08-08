@@ -460,6 +460,27 @@ a { color: var(--primary-light); }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* For icons that should spin in place (lucide icons, not the ring spinner). */
+.spin { animation: spin 0.9s linear infinite; }
+
+/* Connectivity banner */
+.offline-bar {
+  position: sticky;
+  top: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: 7px var(--sp-4);
+  font-size: 0.78rem;
+  font-weight: 600;
+  background: var(--warning-dim);
+  color: var(--warning);
+  border-bottom: 1px solid var(--warning);
+}
+.offline-bar.is-syncing { background: var(--info-dim); color: var(--info); border-bottom-color: var(--info); }
+
 /* ==========================================================================
    Forms
    ========================================================================== */

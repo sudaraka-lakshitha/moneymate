@@ -7,7 +7,7 @@ import { Alert, Avatar, Sheet, Spinner } from '../components/ui';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/Confirm';
 import {
-  LogOut, Pencil, Globe, Shield, Database, Github, ChevronRight,
+  LogOut, Pencil, Globe, Shield, Database, ChevronRight,
   Sun, Moon, Monitor, KeyRound,
 } from 'lucide-react';
 
@@ -216,19 +216,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
             <span className="hint">{row.value}</span>
           </div>
         ))}
-        <a
-          className="list-row list-row-interactive"
-          href="https://github.com/sudaraka-lakshitha/moneymate"
-          target="_blank"
-          rel="noreferrer"
-          style={{ color: 'inherit', textDecoration: 'none' }}
-        >
-          <Github size={18} color="var(--primary-light)" />
-          <span className="grow" style={{ fontSize: '0.9rem', fontWeight: 500 }}>
-            Source code
-          </span>
-          <ChevronRight size={16} color="var(--on-surface-faint)" />
-        </a>
       </div>
 
       <button
