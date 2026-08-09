@@ -1022,8 +1022,11 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                 <span className="label label-block">Breakdown by group</span>
                 <div className="stack-sm">
                   {selected.perGroup.map((entry) => (
-                    <div key={entry.groupId} className="card row-between">
-                      <span className="grow" style={{ minWidth: 0 }}>
+                    // The group name gets the full width; the figure and the
+                    // button sit underneath. Side by side, all three fought over
+                    // a 390px row and the name lost — "Boarding …".
+                    <div key={entry.groupId} className="card">
+                      <span style={{ minWidth: 0 }}>
                         <span className="truncate" style={{ display: 'block', fontWeight: 600, fontSize: '0.9rem' }}>
                           {/* Inside this friend's own sheet the pair group's name
                               ("Between you and X") just repeats the heading. */}
@@ -1031,7 +1034,10 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                         </span>
                         <span className="hint">{entry.net > 0 ? 'owes you' : 'you owe'}</span>
                       </span>
-                      <span className="row" style={{ gap: 'var(--sp-3)', flexShrink: 0 }}>
+                      <span
+                        className="row-between"
+                        style={{ gap: 'var(--sp-3)', marginTop: 'var(--sp-2)' }}
+                      >
                         <span
                           className={`amount-md tabular ${entry.net > 0 ? 'text-positive' : 'text-negative'}`}
                         >
@@ -1098,16 +1104,28 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                     )?.role;
                     const canEdit = entry.created_by === user.id || myRole === 'ADMIN';
                     return (
-                      <div key={entry.id} className="card row">
-                        <span className="icon-tile" style={{ width: 34, height: 34, fontSize: 15 }}>
+                      // Amount on the title line and the buttons on the last one,
+                      // rather than all three competing for the right-hand edge:
+                      // on a phone that squeezed the title down to a few letters
+                      // and wrapped the date onto three lines.
+                      <div key={entry.id} className="card row" style={{ alignItems: 'flex-start' }}>
+                        <span
+                          className="icon-tile"
+                          style={{ width: 34, height: 34, fontSize: 15, flexShrink: 0 }}
+                        >
                           {record.isDirect ? '🤝' : meta.emoji}
                         </span>
                         <span className="grow" style={{ minWidth: 0 }}>
-                          <span className="row" style={{ gap: 5 }}>
-                            <span className="truncate" style={{ fontSize: '0.88rem', fontWeight: 600 }}>
-                              {entry.title}
+                          <span className="row-between" style={{ gap: 'var(--sp-2)' }}>
+                            <span className="row" style={{ gap: 5, minWidth: 0 }}>
+                              <span className="truncate" style={{ fontSize: '0.88rem', fontWeight: 600 }}>
+                                {entry.title}
+                              </span>
+                              {locked && <span className="badge">Settled</span>}
                             </span>
-                            {locked && <span className="badge">Settled</span>}
+                            <span className="amount-md tabular" style={{ flexShrink: 0 }}>
+                              {formatLKR(entry.amount)}
+                            </span>
                           </span>
                           <span className="hint" style={{ display: 'block' }}>
                             {friendlyDate(entry.created_at.slice(0, 10))} ·{' '}
@@ -1116,13 +1134,10 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                           </span>
                           {/* The totals people actually argue about: not what the
                               bill came to, but what each of you carried of it. */}
-                          <span className="hint" style={{ display: 'block' }}>
-                            your share {formatLKR(record.myShare)} · theirs {formatLKR(record.theirShare)}
-                          </span>
-                        </span>
-                        <span className="amount-md tabular" style={{ flexShrink: 0 }}>
-                          {formatLKR(entry.amount)}
-                        </span>
+                          <span className="row-between" style={{ gap: 'var(--sp-2)' }}>
+                            <span className="hint truncate">
+                              your share {formatLKR(record.myShare)} · theirs {formatLKR(record.theirShare)}
+                            </span>
                         {!locked && canEdit && (
                           <span className="row" style={{ gap: 4, flexShrink: 0 }}>
                             <button
@@ -1150,6 +1165,8 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                             </button>
                           </span>
                         )}
+                          </span>
+                        </span>
                       </div>
                     );
                   })}

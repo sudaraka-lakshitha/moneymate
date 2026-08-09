@@ -3417,6 +3417,18 @@ BEGIN
         ) THEN
             EXECUTE format('ALTER PUBLICATION supabase_realtime ADD TABLE public.%I', t);
         END IF;
+
+        -- REPLICA IDENTITY FULL is what makes these tables work with row-level
+        -- security, and its absence is a specific, quiet failure rather than a
+        -- general one. By default an UPDATE or DELETE only puts the primary key
+        -- on the wire, and realtime has to run the table's RLS policy against
+        -- the row before it may send it to anybody. With only an id there is
+        -- nothing to run the policy against, so the event is dropped.
+        --
+        -- Which is why deleting a bill was the change that never arrived:
+        -- deleting is a soft delete, so it is an UPDATE. INSERTs carry the whole
+        -- row and always came through, so realtime looked half-working.
+        EXECUTE format('ALTER TABLE public.%I REPLICA IDENTITY FULL', t);
     END LOOP;
 END
 $realtime$;
