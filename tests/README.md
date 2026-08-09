@@ -53,6 +53,24 @@ Two invariants matter more than any individual figure:
 These are the kind of fault that produces a plausible-looking wrong number rather
 than an error, so they are asserted explicitly rather than assumed.
 
+## The screens
+
+`uitest.mjs` runs the production bundle in a real browser at phone size with
+Supabase stubbed by a PostgREST-shaped fixture, so every screen renders from
+data the app actually asked for. It checks that each screen is there, that the
+figures are on it, that nothing threw, and that the layout stays inside the
+phone — including the states where a control is disabled rather than absent.
+
+```bash
+npm run build
+npx vite preview --port 4173 --host 127.0.0.1 &
+node tests/uitest.mjs        # needs playwright-core; Chromium at /opt/pw-browsers
+```
+
+Service workers are blocked in the harness: the PWA's worker takes over after
+the first load and its fetches leave the page context, so they would miss the
+stub and hit the network.
+
 ## Regression files
 
 | File | Guards against |

@@ -264,6 +264,8 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
     () => Object.values(balances).every((amount) => Math.abs(amount) < 0.01),
     [balances]
   );
+  /** The server's own two conditions for erasing, so the UI can explain itself. */
+  const canErase = isAdmin && allSettled;
 
   const handleToggleArchive = async () => {
     const archiving = !group?.archived_at;
@@ -864,22 +866,25 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                 <h2 className="section-title" style={{ margin: 0 }}>
                   Deleted ({deletedExpenses.length})
                 </h2>
-                {isAdmin && (
-                  <button
-                    type="button"
-                    className="btn btn-ghost btn-sm"
-                    onClick={handleClearDeleted}
-                    disabled={cleaning || !allSettled}
-                  >
-                    {cleaning ? <Spinner /> : <Eraser size={14} />} Erase all
-                  </button>
-                )}
+                {/* Always here, disabled with a reason rather than hidden. A
+                    control that vanishes when you cannot use it reads as one
+                    the app does not have. */}
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  onClick={handleClearDeleted}
+                  disabled={cleaning || !canErase}
+                >
+                  {cleaning ? <Spinner /> : <Eraser size={14} />} Erase all
+                </button>
               </div>
 
               <span className="hint" style={{ display: 'block', marginBottom: 'var(--sp-2)' }}>
-                {allSettled
-                  ? 'Kept so the correction stays on record. They count towards nobody\'s balance and can be erased for good.'
-                  : 'Kept so the correction stays on record. They can be erased once everyone in this group is settled up.'}
+                {!isAdmin
+                  ? 'Kept so the correction stays on record. A group admin can erase them for good.'
+                  : !allSettled
+                    ? 'Kept so the correction stays on record. They can be erased once everyone in this group is settled up — not just you.'
+                    : 'Kept so the correction stays on record. They count towards nobody\'s balance and can be erased for good.'}
               </span>
 
               <div className="stack-sm">
@@ -905,18 +910,23 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                       <span className="amount-md tabular" style={{ flexShrink: 0 }}>
                         {formatLKR(expense.amount)}
                       </span>
-                      {isAdmin && allSettled && (
-                        <button
-                          type="button"
-                          className="btn-icon"
-                          style={{ width: 30, height: 30, color: 'var(--negative)', flexShrink: 0 }}
-                          onClick={() => handleEraseOne(expense)}
-                          disabled={busyErase === expense.id}
-                          aria-label={`Erase ${expense.title} permanently`}
-                        >
-                          {busyErase === expense.id ? <Spinner /> : <Trash2 size={13} />}
-                        </button>
-                      )}
+                      <button
+                        type="button"
+                        className="btn-icon"
+                        style={{ width: 30, height: 30, color: 'var(--negative)', flexShrink: 0 }}
+                        onClick={() => handleEraseOne(expense)}
+                        disabled={busyErase === expense.id || !canErase}
+                        aria-label={`Erase ${expense.title} permanently`}
+                        title={
+                          !isAdmin
+                            ? 'Only a group admin can erase records'
+                            : !allSettled
+                              ? 'Settle every balance in this group first'
+                              : 'Erase permanently'
+                        }
+                      >
+                        {busyErase === expense.id ? <Spinner /> : <Trash2 size={13} />}
+                      </button>
                     </div>
                   );
                 })}
