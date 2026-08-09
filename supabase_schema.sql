@@ -3693,13 +3693,17 @@ BEGIN
 
     SELECT COALESCE(is_direct, FALSE) INTO v_is_direct FROM groups WHERE id = p_group_id;
 
-    -- Genuinely shared means both sides carry part of it. A loan gives one side
-    -- the whole amount and the other nothing, which is the shape this detects.
-    SELECT NOT EXISTS (
-        SELECT 1 FROM jsonb_array_elements(p_splits) s
-        WHERE COALESCE((s->>'is_included')::BOOLEAN, TRUE)
-          AND COALESCE((s->>'amount')::DECIMAL, 0) = 0
-    ) INTO v_shared;
+    -- Genuinely shared means both sides carry part of it, so count the people
+    -- who do. Lending is one person carrying the whole thing.
+    --
+    -- Counted over every split, not just the included ones: whether the side
+    -- carrying nothing was written as excluded or as included-with-zero is an
+    -- implementation detail of whichever entry point recorded it, and a loan
+    -- must never turn into a question because of it.
+    SELECT (
+        SELECT COUNT(*) FROM jsonb_array_elements(p_splits) s
+        WHERE COALESCE((s->>'amount')::DECIMAL, 0) > 0
+    ) >= 2 INTO v_shared;
 
     INSERT INTO expense_splits (expense_id, user_id, is_included, amount, percentage, shares, include_in_stats)
     SELECT
@@ -3790,8 +3794,10 @@ BEGIN
 END
 $stats_once$;
 
--- Loans already on record stop being questions. Only undecided rows are touched
--- here — a shared bill somebody genuinely answered keeps their answer.
+-- Loans already on record stop being questions. Same test as above — fewer than
+-- two people carrying a share means somebody lent rather than shared — and only
+-- undecided rows are touched, so a shared bill somebody genuinely answered keeps
+-- their answer.
 UPDATE expense_splits s
 SET include_in_stats = (s.user_id = e.paid_by AND s.amount > 0)
 FROM expenses e
@@ -3799,10 +3805,7 @@ JOIN groups g ON g.id = e.group_id
 WHERE e.id = s.expense_id
   AND COALESCE(g.is_direct, FALSE)
   AND s.include_in_stats IS NULL
-  AND EXISTS (
-      SELECT 1 FROM expense_splits z
-      WHERE z.expense_id = e.id AND z.is_included AND z.amount = 0
-  );
+  AND (SELECT COUNT(*) FROM expense_splits z WHERE z.expense_id = e.id AND z.amount > 0) < 2;
 
 -- Erasing one deleted record rather than all of them. Same rules as
 -- purge_deleted_expenses — settled group, admin, and the record's ledger entries
