@@ -75,6 +75,7 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   const [statsLoading, setStatsLoading] = useState(false);
   const [showManage, setShowManage] = useState(false);
   const [cleaning, setCleaning] = useState(false);
+  const [busyErase, setBusyErase] = useState<string | null>(null);
 
   const [showEdit, setShowEdit] = useState(false);
   const [draftName, setDraftName] = useState('');
@@ -291,6 +292,28 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
       toast.error(friendlyDbError(error, 'Could not update the group.'));
     } finally {
       setCleaning(false);
+    }
+  };
+
+  const handleEraseOne = async (expense: Expense) => {
+    const ok = await confirm({
+      title: 'Erase this record for good?',
+      message: `"${expense.title}" was already deleted and counts towards nobody's balance. Erasing it removes it permanently and cannot be undone.`,
+      confirmLabel: 'Erase',
+      danger: true,
+    });
+    if (!ok) return;
+
+    setBusyErase(expense.id);
+    try {
+      const { error } = await supabase.rpc('purge_deleted_expense', { p_expense_id: expense.id });
+      if (error) throw error;
+      toast.success('Erased.');
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not erase that record.'));
+    } finally {
+      setBusyErase(null);
     }
   };
 
@@ -746,7 +769,7 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
             </button>
           </div>
 
-          {expenses.length === 0 ? (
+          {activeExpenses.length === 0 ? (
             <EmptyState
               icon="🧾"
               title="No expenses yet"
@@ -759,13 +782,13 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
             />
           ) : (
             <div className="stack-sm">
-              {expenses.some((e) => e.settled_at && !e.is_deleted) && (
+              {activeExpenses.some((e) => e.settled_at) && (
                 <span className="hint" style={{ marginBottom: 2 }}>
                   Bills marked Settled are locked, so paid-up balances cannot reopen. To correct one, add a
                   new expense.
                 </span>
               )}
-              {expenses.map((expense) => {
+              {activeExpenses.map((expense) => {
                 const meta = categoryMeta(expense.category);
                 // Frozen once a payment covered it — the server refuses the edit
                 // either way, this just stops offering a button that cannot work.
@@ -830,6 +853,75 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                 );
               })}
             </div>
+          )}
+
+          {/* Deleted records get their own section rather than sitting greyed
+              out among the live ones. They were unreachable there: nothing to
+              tap, and the count above says zero expenses while four rows show. */}
+          {deletedExpenses.length > 0 && (
+            <>
+              <div className="row-between" style={{ marginTop: 'var(--sp-5)', marginBottom: 'var(--sp-3)' }}>
+                <h2 className="section-title" style={{ margin: 0 }}>
+                  Deleted ({deletedExpenses.length})
+                </h2>
+                {isAdmin && (
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    onClick={handleClearDeleted}
+                    disabled={cleaning || !allSettled}
+                  >
+                    {cleaning ? <Spinner /> : <Eraser size={14} />} Erase all
+                  </button>
+                )}
+              </div>
+
+              <span className="hint" style={{ display: 'block', marginBottom: 'var(--sp-2)' }}>
+                {allSettled
+                  ? 'Kept so the correction stays on record. They count towards nobody\'s balance and can be erased for good.'
+                  : 'Kept so the correction stays on record. They can be erased once everyone in this group is settled up.'}
+              </span>
+
+              <div className="stack-sm">
+                {deletedExpenses.map((expense) => {
+                  const meta = categoryMeta(expense.category);
+                  return (
+                    <div key={expense.id} className="card row" style={{ opacity: 0.6, gap: 'var(--sp-3)' }}>
+                      <span className="icon-tile" style={{ width: 36, height: 36, fontSize: 17 }}>
+                        {meta.emoji}
+                      </span>
+                      <span className="grow" style={{ minWidth: 0 }}>
+                        <span
+                          className="truncate"
+                          style={{ display: 'block', fontWeight: 600, fontSize: '0.9rem' }}
+                        >
+                          {expense.title}
+                        </span>
+                        <span className="hint" style={{ display: 'block' }}>
+                          {expense.paid_by_user?.display_name ?? 'Someone'} paid ·{' '}
+                          {friendlyDate(expense.created_at.slice(0, 10))}
+                        </span>
+                      </span>
+                      <span className="amount-md tabular" style={{ flexShrink: 0 }}>
+                        {formatLKR(expense.amount)}
+                      </span>
+                      {isAdmin && allSettled && (
+                        <button
+                          type="button"
+                          className="btn-icon"
+                          style={{ width: 30, height: 30, color: 'var(--negative)', flexShrink: 0 }}
+                          onClick={() => handleEraseOne(expense)}
+                          disabled={busyErase === expense.id}
+                          aria-label={`Erase ${expense.title} permanently`}
+                        >
+                          {busyErase === expense.id ? <Spinner /> : <Trash2 size={13} />}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </>
           )}
         </>
       )}

@@ -151,5 +151,52 @@ BEGIN
   RAISE NOTICE 'R16 only an admin can clear records | pass=%', blocked;
   IF NOT blocked THEN RAISE EXCEPTION 'R16 FAILED: a plain member cleared group records'; END IF;
 
+  -- ---- Erasing one deleted record rather than the lot ----
+  PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
+  e2 := save_expense(g,'Second mistake',300,ANN,'FOOD','EQUAL','',
+    jsonb_build_array(
+      jsonb_build_object('user_id',ANN,'amount',150,'is_included',true),
+      jsonb_build_object('user_id',BEN,'amount',150,'is_included',true)),'[]'::jsonb);
+  PERFORM delete_expense(e2, 'typo again');
+
+  -- R17: a plain member cannot erase it
+  PERFORM set_config('request.jwt.claim.sub', BEN::TEXT, true);
+  blocked := FALSE;
+  BEGIN
+    PERFORM purge_deleted_expense(e2);
+  EXCEPTION WHEN OTHERS THEN blocked := TRUE;
+  END;
+  RAISE NOTICE 'R17 only an admin can erase one record | pass=%', blocked;
+  IF NOT blocked THEN RAISE EXCEPTION 'R17 FAILED: a plain member erased a record'; END IF;
+
+  -- R18: a live record cannot be erased this way — delete it first
+  PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
+  blocked := FALSE;
+  BEGIN
+    PERFORM purge_deleted_expense(e1);
+  EXCEPTION WHEN OTHERS THEN blocked := TRUE;
+  END;
+  RAISE NOTICE 'R18 a live record cannot be erased | pass=%', blocked;
+  IF NOT blocked THEN RAISE EXCEPTION 'R18 FAILED: erased a record that was still live'; END IF;
+
+  -- R19: the admin erases just that one
+  PERFORM purge_deleted_expense(e2);
+  SELECT COUNT(*) INTO n FROM expenses WHERE id = e2;
+  RAISE NOTICE 'R19 the chosen record is erased | pass=%', n=0;
+  IF n<>0 THEN RAISE EXCEPTION 'R19 FAILED'; END IF;
+
+  SELECT COUNT(*) INTO n FROM expenses WHERE id = e1;
+  RAISE NOTICE 'R20 and the live one is left alone | pass=%', n=1;
+  IF n<>1 THEN RAISE EXCEPTION 'R20 FAILED: erasing one record took another with it'; END IF;
+
+  SELECT COALESCE(SUM(amount),0) INTO net FROM ledger_entries WHERE group_id=g;
+  RAISE NOTICE 'R21 ledger still nets to zero | pass=% (%)', net=0, net;
+  IF net<>0 THEN RAISE EXCEPTION 'R21 FAILED: erasing one record moved money (net=%)', net; END IF;
+
+  IF member_balance(g,ANN)<>0 OR member_balance(g,BEN)<>0 THEN
+    RAISE EXCEPTION 'R22 FAILED: balances shifted (Ann=% Ben=%)', member_balance(g,ANN), member_balance(g,BEN);
+  END IF;
+  RAISE NOTICE 'R22 balances untouched | pass=t';
+
   RAISE NOTICE 'ALL REMOVAL / CLEANUP TESTS PASSED';
 END $t$;

@@ -3764,3 +3764,51 @@ WHERE e.id = s.expense_id
       SELECT 1 FROM expense_splits z
       WHERE z.expense_id = e.id AND z.is_included AND z.amount = 0
   );
+
+-- Erasing one deleted record rather than all of them. Same rules as
+-- purge_deleted_expenses — settled group, admin, and the record's ledger entries
+-- must cancel out per person — because the guarantee has to hold either way.
+CREATE OR REPLACE FUNCTION public.purge_deleted_expense(p_expense_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_group     UUID;
+    v_deleted   BOOLEAN;
+    v_dangling  INT;
+BEGIN
+    SELECT group_id, is_deleted INTO v_group, v_deleted
+    FROM expenses WHERE id = p_expense_id;
+
+    IF v_group IS NULL THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+    IF NOT v_deleted THEN
+        RAISE EXCEPTION 'Delete this expense first — only deleted records can be erased';
+    END IF;
+    IF NOT public.is_group_admin(v_group) THEN
+        RAISE EXCEPTION 'Only a group admin can erase records';
+    END IF;
+    IF NOT public.group_is_settled(v_group) THEN
+        RAISE EXCEPTION 'Settle every balance in this group before erasing records';
+    END IF;
+
+    SELECT COUNT(*) INTO v_dangling
+    FROM (
+        SELECT user_id
+        FROM ledger_entries
+        WHERE reference_id = p_expense_id
+        GROUP BY user_id
+        HAVING ROUND(SUM(amount), 2) <> 0
+    ) unbalanced;
+
+    IF v_dangling > 0 THEN
+        RAISE EXCEPTION 'That record still affects % member(s) and cannot be erased', v_dangling;
+    END IF;
+
+    DELETE FROM ledger_entries WHERE reference_id = p_expense_id;
+    DELETE FROM expenses WHERE id = p_expense_id;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.purge_deleted_expense(UUID) TO authenticated;
