@@ -3739,17 +3739,44 @@ $$;
 
 GRANT EXECUTE ON FUNCTION public.write_expense_rows(UUID, UUID, TEXT, DECIMAL, UUID, JSONB, JSONB) TO authenticated;
 
+-- A record of one-off data migrations, so they stay one-off.
+--
+-- This file is the deploy step and gets re-run after every change. Anything in
+-- it that only makes sense once has to say so, or it runs again next Tuesday
+-- over data that has moved on since. RLS with no policy: nothing outside the
+-- SQL editor has any business reading it.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    key        TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE schema_migrations ENABLE ROW LEVEL SECURITY;
+
 -- Existing data brought in line with the rule above. Group shares become TRUE
 -- outright rather than only where undecided: the old behaviour asked people
 -- questions they should never have been asked, and a "no" given to get rid of a
 -- prompt is not a preference worth preserving.
-UPDATE expense_splits s
-SET include_in_stats = TRUE
-FROM expenses e
-JOIN groups g ON g.id = e.group_id
-WHERE e.id = s.expense_id
-  AND NOT COALESCE(g.is_direct, FALSE)
-  AND s.include_in_stats IS DISTINCT FROM TRUE;
+--
+-- Exactly once, though. Under the new rule a FALSE on a group share can only be
+-- somebody deliberately keeping a bill out of their own charts, and repeating
+-- this would overwrite that every time the file is re-run.
+DO $stats_once$
+BEGIN
+    IF EXISTS (SELECT 1 FROM schema_migrations WHERE key = 'group_stats_auto_include') THEN
+        RETURN;
+    END IF;
+
+    UPDATE expense_splits s
+    SET include_in_stats = TRUE
+    FROM expenses e
+    JOIN groups g ON g.id = e.group_id
+    WHERE e.id = s.expense_id
+      AND NOT COALESCE(g.is_direct, FALSE)
+      AND s.include_in_stats IS DISTINCT FROM TRUE;
+
+    INSERT INTO schema_migrations (key) VALUES ('group_stats_auto_include');
+END
+$stats_once$;
 
 -- Loans already on record stop being questions. Only undecided rows are touched
 -- here — a shared bill somebody genuinely answered keeps their answer.

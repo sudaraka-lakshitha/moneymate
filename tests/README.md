@@ -44,8 +44,12 @@ Two invariants matter more than any individual figure:
 - **Repeated edits do not move money.** `test14.sql` edits one expense fifteen
   times and deletes it. This exists because reversing an expense by re-negating
   its rows was correct exactly once and silently wrong from the second edit on.
+- **Nothing moves money, under any sequence.** `test24.sql` throws random
+  operations at a four-person group and re-checks both invariants after every
+  one, so a fault that needs an unlikely order to show up still names the step
+  that caused it. Change the seed to get a different run.
 
-Both are the kind of fault that produces a plausible-looking wrong number rather
+These are the kind of fault that produces a plausible-looking wrong number rather
 than an error, so they are asserted explicitly rather than assumed.
 
 ## Regression files
@@ -57,3 +61,6 @@ than an error, so they are asserted explicitly rather than assumed.
 | `test19.sql` | A member leaving or deleting their account while the group keeps going: the ledger still nets to zero, and the contribution chart still accounts for every rupee they spent |
 | `test20.sql` | Whose statistics decision is whose — your own entries are answered as you make them, and somebody else editing a bill never resets your answer |
 | `test21.sql` | Removing a friend for good (the pair record must not outlive the friendship and drag them back onto the list), and clearing already-deleted records without moving a rupee |
+| `test22_setup.sql` + `test22_check.sql` | Run the setup, re-run `../supabase_schema.sql` over it, then run the check: a deliberate stats opt-out must survive the deploy step |
+| `test23.sql` | Who can see and do what on the newer functions — an outsider gets no contribution figures, no record counts and no splits; a plain member can read the other side's share, which is what the Friends screen lists |
+| `test24.sql` | Fuzz: 250 random add / edit / delete / settle operations by four people, with both invariants re-checked after every single one |
