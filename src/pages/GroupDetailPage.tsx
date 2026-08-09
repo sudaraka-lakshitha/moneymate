@@ -15,7 +15,7 @@ import { AddExpenseModal } from './AddExpenseModal';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
 import { DonutChart } from '../components/Charts';
 import {
-  ArrowLeft, ArrowRight, AtSign, Archive, ArchiveRestore, Check, Copy, Eraser, Lock, Mail, Pencil, PieChart, Plus,
+  ArrowLeft, ArrowRight, AtSign, Archive, ArchiveRestore, Check, ChevronRight, Copy, Eraser, Lock, Mail, Pencil, PieChart, Plus,
   LogOut, RefreshCw, Settings2, Share2, Trash2, UserCheck, X,
 } from 'lucide-react';
 
@@ -836,6 +836,30 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
 
       {tab === 'balances' && (
         <>
+          {/* The chart was only reachable from an unlabelled icon in the header,
+              which is not somewhere anyone looks for it. This is the screen you
+              are on when you want to know who has been paying. */}
+          <button
+            type="button"
+            className="card card-interactive row"
+            style={{ width: '100%', textAlign: 'left', marginBottom: 'var(--sp-4)' }}
+            onClick={openStats}
+          >
+            <span
+              className="icon-tile"
+              style={{ width: 38, height: 38, background: 'var(--primary-container)', color: 'var(--primary)' }}
+            >
+              <PieChart size={18} />
+            </span>
+            <span className="grow" style={{ minWidth: 0 }}>
+              <span style={{ display: 'block', fontWeight: 700, fontSize: '0.9rem' }}>Who paid what</span>
+              <span className="hint">
+                Each person&rsquo;s share of everything this group has spent, as a chart.
+              </span>
+            </span>
+            <ChevronRight size={16} color="var(--on-surface-faint)" />
+          </button>
+
           <h2 className="section-title" style={{ marginTop: 0 }}>Who owes whom</h2>
           {simplified.length === 0 ? (
             <EmptyState icon="✅" title="Everyone is square" text="No outstanding balances in this group." />
