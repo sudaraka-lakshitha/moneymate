@@ -32,6 +32,7 @@ passes.
 | `e2e_groups.sql` | Create a trip, join by code with approval, invite by email, keep outsiders out, split evenly and unevenly, exclude a member, edit twice, part-settle, archive, purge, delete |
 | `e2e_friends.sql` | Friend request and acceptance, lend, borrow, split directly, edit twice including flipping the payer, delete, part-pay, lender records the repayment — no group involved anywhere |
 | `e2e_own.sql` | Personal entries, edit and soft delete, input validation, budgets and their upsert, recurring posting exactly once, analytics inputs, and one user being unable to see or touch another's data |
+| `e2e_pair.sql` | The whole story between two people in the order it happens — strangers, friend request, lend, borrow, share a bill, pay a bill that was entirely theirs, have one of yours paid, part-settle, a real group on top, unfriend, leave, re-add. Every stage checks all three of money, statistics and visibility, because they can disagree and only the first is obvious |
 
 ## What the assertions are really guarding
 

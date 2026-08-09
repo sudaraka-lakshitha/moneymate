@@ -4135,3 +4135,47 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN) TO authenticated;
+
+-- ========================================
+-- YOUR OWN SPENDING STAYS YOURS
+-- ========================================
+-- Reading expenses was gated purely on being in the group now. Settle up and
+-- leave a trip and your own share of every bill on it stopped being readable —
+-- so your Stats quietly lost the money you actually spent, months of it, with
+-- nothing to indicate anything had happened. Being removed by an admin did the
+-- same thing.
+--
+-- Membership is the right test for the group's business: its other members, its
+-- balances, its bills as a whole. It is the wrong test for the one row that
+-- records what you personally paid, which is yours whatever happened afterwards.
+--
+-- SECURITY DEFINER on the helper is what keeps this from recursing: the expenses
+-- policy has to consult expense_splits, whose own policy consults expenses.
+CREATE OR REPLACE FUNCTION public.has_own_split(p_expense_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+    -- Included only. A bill you were listed on but explicitly left out of
+    -- records nothing you spent, so it is not yours to keep reading once you
+    -- are no longer in the group.
+    SELECT EXISTS (
+        SELECT 1 FROM expense_splits
+        WHERE expense_id = p_expense_id AND user_id = auth.uid() AND is_included
+    );
+$$;
+
+GRANT EXECUTE ON FUNCTION public.has_own_split(UUID) TO authenticated;
+
+DROP POLICY IF EXISTS "Group members can read expenses" ON expenses;
+CREATE POLICY "Group members can read expenses" ON expenses FOR SELECT
+    USING (public.is_group_member(group_id) OR public.has_own_split(id));
+
+DROP POLICY IF EXISTS "Members can read splits" ON expense_splits;
+CREATE POLICY "Members can read splits" ON expense_splits FOR SELECT
+    USING (
+        (user_id = auth.uid() AND is_included)
+        OR EXISTS (
+            SELECT 1 FROM expenses e
+            WHERE e.id = expense_id AND public.is_group_member(e.group_id)
+        )
+    );
