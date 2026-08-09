@@ -111,10 +111,6 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // On by default: a bill you are entering yourself and are part of is your own
-  // spending. The confirmation flow exists for what other people add, not for
-  // making you tick a box to see your own expenses in your own charts.
-  const [statsChoice, setStatsChoice] = useState(true);
 
   // Rebuild the form from what was actually saved: who was in, and the exact
   // per-person figures for whichever split method was used. Without this an edit
@@ -145,7 +141,6 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
         amts[row.user_id] = String(Number(row.amount));
         pcts[row.user_id] = String(Number(row.percentage ?? 0));
         shr[row.user_id] = String(Number(row.shares ?? 1));
-        if (row.user_id === user.id) setStatsChoice(row.include_in_stats === true);
       }
 
       // A member added to the group after this bill has no split row at all.
@@ -328,7 +323,6 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
         shares: splitMethod === 'SHARES' ? parseInt(shares[m.user_id] ?? '1', 10) || 0 : 1,
         // Answered here only for myself. Everyone else's split is left undecided
         // so their own charts are never changed by a bill I typed.
-        stats: m.user_id === user.id ? statsChoice : undefined,
       };
     });
 
@@ -724,25 +718,6 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
           value={notes}
           onChange={(e) => setNotes(e.target.value)}
         />
-
-        {includedMembers.some((m) => m.user_id === user.id) && (
-          <label className="card row" style={{ cursor: 'pointer', gap: 'var(--sp-3)' }}>
-            <input
-              type="checkbox"
-              className="checkbox"
-              checked={statsChoice}
-              onChange={(e) => setStatsChoice(e.target.checked)}
-            />
-            <span className="grow" style={{ minWidth: 0 }}>
-              <span style={{ display: 'block', fontWeight: 600, fontSize: '0.88rem' }}>
-                Count my share in my stats
-              </span>
-              <span className="hint">
-                Only affects your own charts. Everyone else decides for themselves.
-              </span>
-            </span>
-          </label>
-        )}
 
         {error && <Alert variant="error">{error}</Alert>}
 

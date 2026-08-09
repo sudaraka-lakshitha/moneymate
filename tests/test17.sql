@@ -41,10 +41,11 @@ BEGIN
   RAISE NOTICE 'L1 creator''s own choice recorded | pass=%', v IS TRUE;
   IF v IS NOT TRUE THEN RAISE EXCEPTION 'L1 failed'; END IF;
 
-  -- L2: the others are left undecided, NOT silently counted
+  -- L2: in a real group everyone is counted, and nobody is asked. You were in
+  -- the group and the split is yours — the answer was always going to be yes.
   SELECT include_in_stats INTO v FROM expense_splits WHERE expense_id=e1 AND user_id=BEN;
-  RAISE NOTICE 'L2 other participants left undecided | pass=%', v IS NULL;
-  IF v IS NOT NULL THEN RAISE EXCEPTION 'L2 failed: someone else decided for Ben'; END IF;
+  RAISE NOTICE 'L2 group shares count without asking | pass=%', v IS TRUE;
+  IF v IS NOT TRUE THEN RAISE EXCEPTION 'L2 failed: group share left as % for Ben', v; END IF;
 
   -- L3: but the expense itself exists for them regardless
   PERFORM set_config('request.jwt.claim.sub', BEN::TEXT, true);
@@ -88,7 +89,10 @@ BEGIN
   RAISE NOTICE 'L8 cannot opt into an expense you are not in | pass=%', f;
   IF NOT f THEN RAISE EXCEPTION 'L8 failed'; END IF;
 
-  -- L9: bulk-answer everything outstanding
+  -- L9: bulk-answer everything outstanding. The only thing that still asks is a
+  -- shared bill recorded straight between two people, so that is what queues up.
+  PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
+  PERFORM add_direct_expense(CAR, 500, 'Split taxi', TRUE, 250);
   PERFORM set_config('request.jwt.claim.sub', CAR::TEXT, true);
   SELECT COUNT(*) INTO n FROM expense_splits WHERE user_id=CAR AND include_in_stats IS NULL;
   IF n<1 THEN RAISE EXCEPTION 'L9 setup: expected pending rows'; END IF;

@@ -1,19 +1,36 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { useLiveRefresh } from '../lib/realtime';
-import { Expense, FriendRequest, Group, GroupSettlement, User } from '../types';
+import { Expense, FriendRequest, Group, GroupMember, GroupSettlement, User } from '../types';
 import { formatLKR, formatLKRSigned, parseAmount, roundMoney } from '../lib/currency';
 import { computeFriendBalances, FriendBalanceDetail, GroupLedger, netByUser } from '../lib/balances';
 import { friendlyDbError } from '../lib/authErrors';
+import { categoryMeta } from '../lib/categories';
 import { friendlyDate } from '../lib/dates';
 import { Alert, Avatar, EmptyState, Sheet, SkeletonRows, Spinner } from '../components/ui';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
+import { AddExpenseModal } from './AddExpenseModal';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/Confirm';
 import { Check, Clock, Eraser, HandCoins, Pencil, Trash2, UserMinus, UserPlus, Search, X, Pin } from 'lucide-react';
 
 interface FriendsPageProps {
   user: User;
+}
+
+/**
+ * One transaction the two of you are both on. A friend's balance is the sum of
+ * these, and a total on its own is not something anybody can check or correct —
+ * so the sheet lists them.
+ */
+interface PairRecord {
+  expense: Expense;
+  groupId: string;
+  groupName?: string;
+  isDirect: boolean;
+  /** What this expense charged you, and what it charged them. */
+  myShare: number;
+  theirShare: number;
 }
 
 /** A row shown in the list — either shared-balance data, a direct connection, or both. */
@@ -66,6 +83,12 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const [busyEntry, setBusyEntry] = useState<string | null>(null);
   const [removingFriend, setRemovingFriend] = useState(false);
   const [clearingDeleted, setClearingDeleted] = useState(false);
+  /** groupId -> its members, so a group bill can be edited from here. */
+  const [membersByGroup, setMembersByGroup] = useState<Record<string, GroupMember[]>>({});
+  /** Every expense the two of you are both on, direct or in a shared group. */
+  const [pairRecords, setPairRecords] = useState<PairRecord[]>([]);
+  const [pairLoading, setPairLoading] = useState(false);
+  const [editingGroupExpense, setEditingGroupExpense] = useState<Expense | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -147,6 +170,12 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
         setDirectEntries([]);
         setDirectShares({});
       }
+      const byGroup: Record<string, GroupMember[]> = {};
+      for (const row of (memberRes.data ?? []) as any[]) {
+        (byGroup[row.group_id] ||= []).push({ ...row, user: row.users } as GroupMember);
+      }
+      setMembersByGroup(byGroup);
+
       setGroupNames(Object.fromEntries(groups.map((g) => [g.id, g.name])));
       const directIdSet = new Set(groups.filter((g) => g.is_direct).map((g) => g.id));
       setDirectGroupIds(directIdSet);
@@ -206,6 +235,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
           total_i_owe_them: 0,
           shared_group_count: 0,
           perGroup: [],
+          groupIds: [],
           isConnected: true,
           isPinned: pinnedIds.has(resolved.id),
         });
@@ -254,13 +284,70 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     f.friend.display_name.toLowerCase().includes(search.trim().toLowerCase())
   );
 
-  /** The loans and shared bills recorded directly with the open friend. */
-  const selectedEntries = useMemo(() => {
-    if (!selected) return [];
-    const groupId = directGroupByFriend[selected.friend.id];
-    if (!groupId) return [];
-    return directEntries.filter((x) => x.group_id === groupId);
-  }, [selected, directEntries, directGroupByFriend]);
+  /**
+   * Everything the two of you are both on — the direct records plus every bill
+   * in a shared group that charged you both. Fetched when the sheet opens
+   * rather than up front, because it is per friend and the list screen never
+   * needs it.
+   */
+  const loadPairRecords = useCallback(
+    async (friendId: string, groupIds: string[]) => {
+      if (groupIds.length === 0) {
+        setPairRecords([]);
+        return;
+      }
+      setPairLoading(true);
+      try {
+        const { data, error: pairError } = await supabase
+          .from('expenses')
+          .select('*, paid_by_user:users!expenses_paid_by_fkey(*), expense_splits(user_id, amount, is_included)')
+          .in('group_id', groupIds)
+          .eq('is_deleted', false)
+          .order('created_at', { ascending: false })
+          .limit(200);
+        if (pairError) throw pairError;
+
+        const rows: PairRecord[] = [];
+        for (const row of (data ?? []) as any[]) {
+          const splits = (row.expense_splits ?? []) as { user_id: string; amount: number; is_included: boolean }[];
+          const mine = splits.find((sp) => sp.user_id === user.id && sp.is_included);
+          const theirs = splits.find((sp) => sp.user_id === friendId && sp.is_included);
+
+          // Both of you have to be on it, as a payer or as a share. A bill your
+          // flatmate split with somebody else is not a transaction between you.
+          const iAmOn = Boolean(mine) || row.paid_by === user.id;
+          const theyAreOn = Boolean(theirs) || row.paid_by === friendId;
+          if (!iAmOn || !theyAreOn) continue;
+
+          rows.push({
+            expense: row as Expense,
+            groupId: row.group_id,
+            groupName: groupNames[row.group_id],
+            isDirect: directGroupIds.has(row.group_id),
+            myShare: Number(mine?.amount ?? 0),
+            theirShare: Number(theirs?.amount ?? 0),
+          });
+        }
+        setPairRecords(rows);
+      } catch (err) {
+        toast.error(friendlyDbError(err, 'Could not load the records between you.'));
+        setPairRecords([]);
+      } finally {
+        setPairLoading(false);
+      }
+    },
+    [user.id, groupNames, directGroupIds, toast]
+  );
+
+  useEffect(() => {
+    if (!selected) {
+      setPairRecords([]);
+      return;
+    }
+    const direct = directGroupByFriend[selected.friend.id];
+    const ids = Array.from(new Set([...(direct ? [direct] : []), ...selected.groupIds]));
+    void loadPairRecords(selected.friend.id, ids);
+  }, [selected?.friend.id, loadPairRecords, directGroupByFriend]);
 
   /**
    * Settlements post against one group, so the headline button acts on the
@@ -427,6 +514,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       if (rpcError) throw rpcError;
       toast.success('Record deleted.');
       await load();
+      if (selected) await loadPairRecords(selected.friend.id, selected.groupIds);
     } catch (err) {
       toast.error(friendlyDbError(err, 'Could not delete that record.'));
     } finally {
@@ -490,6 +578,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       setLendTo(null);
       setEditingEntry(null);
       await load();
+      if (selected) await loadPairRecords(selected.friend.id, selected.groupIds);
     } catch (err) {
       setLendError(friendlyDbError(err, 'Could not record that.'));
     } finally {
@@ -925,12 +1014,8 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
             {selected.perGroup.length === 0 ? (
               <EmptyState
                 icon="✅"
-                title="Nothing outstanding"
-                text={
-                  selected.shared_group_count === 0
-                    ? 'Nothing between you yet — record a loan above, or split a bill in a group.'
-                    : 'No open balances with this friend.'
-                }
+                title="All square"
+                text="Nothing is owed either way. Whatever you have recorded together is still listed below."
               />
             ) : (
               <>
@@ -986,45 +1071,69 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
               </>
             )}
 
-            {selectedEntries.length > 0 && (
+            <span className="label label-block">
+              Records between you{pairRecords.length > 0 ? ` (${pairRecords.length})` : ''}
+            </span>
+            {pairLoading ? (
+              <SkeletonRows count={3} height={58} />
+            ) : pairRecords.length === 0 ? (
+              <EmptyState
+                icon="🧾"
+                title="Nothing recorded yet"
+                text="Loans, shared bills and anything you have split in a group together will be listed here."
+              />
+            ) : (
               <>
-                <span className="label label-block">
-                  Direct records ({selectedEntries.length})
-                </span>
                 <div className="stack-sm">
-                  {selectedEntries.map((entry) => {
+                  {pairRecords.map((record) => {
+                    const entry = record.expense;
                     const iPaidIt = entry.paid_by === user.id;
                     const locked = Boolean(entry.settled_at);
+                    const meta = categoryMeta(entry.category);
+                    // Same rule the server enforces: the person who added it, or
+                    // an admin of the group it lives in. Showing the buttons to
+                    // anyone else only produces a refusal.
+                    const myRole = (membersByGroup[record.groupId] ?? []).find(
+                      (m) => m.user_id === user.id
+                    )?.role;
+                    const canEdit = entry.created_by === user.id || myRole === 'ADMIN';
                     return (
                       <div key={entry.id} className="card row">
                         <span className="icon-tile" style={{ width: 34, height: 34, fontSize: 15 }}>
-                          🤝
+                          {record.isDirect ? '🤝' : meta.emoji}
                         </span>
                         <span className="grow" style={{ minWidth: 0 }}>
                           <span className="row" style={{ gap: 5 }}>
-                            <span
-                              className="truncate"
-                              style={{ fontSize: '0.88rem', fontWeight: 600 }}
-                            >
+                            <span className="truncate" style={{ fontSize: '0.88rem', fontWeight: 600 }}>
                               {entry.title}
                             </span>
                             {locked && <span className="badge">Settled</span>}
                           </span>
-                          <span className="hint">
+                          <span className="hint" style={{ display: 'block' }}>
                             {friendlyDate(entry.created_at.slice(0, 10))} ·{' '}
                             {iPaidIt ? 'you paid' : `${selected.friend.display_name} paid`}
+                            {!record.isDirect && record.groupName ? ` · ${record.groupName}` : ''}
+                          </span>
+                          {/* The totals people actually argue about: not what the
+                              bill came to, but what each of you carried of it. */}
+                          <span className="hint" style={{ display: 'block' }}>
+                            your share {formatLKR(record.myShare)} · theirs {formatLKR(record.theirShare)}
                           </span>
                         </span>
                         <span className="amount-md tabular" style={{ flexShrink: 0 }}>
                           {formatLKR(entry.amount)}
                         </span>
-                        {!locked && (
+                        {!locked && canEdit && (
                           <span className="row" style={{ gap: 4, flexShrink: 0 }}>
                             <button
                               type="button"
                               className="btn-icon"
                               style={{ width: 30, height: 30 }}
-                              onClick={() => openEditEntry(entry, selected.friend)}
+                              onClick={() =>
+                                record.isDirect
+                                  ? openEditEntry(entry, selected.friend)
+                                  : setEditingGroupExpense(entry)
+                              }
                               aria-label={`Edit ${entry.title}`}
                             >
                               <Pencil size={13} />
@@ -1046,7 +1155,8 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                   })}
                 </div>
                 <span className="hint">
-                  Settled records are locked, so a paid-up balance cannot reopen.
+                  Settled records are locked, so a paid-up balance cannot reopen. Add a new record to
+                  correct one after settling.
                 </span>
               </>
             )}
@@ -1117,6 +1227,24 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
             )}
           </div>
         </Sheet>
+      )}
+
+      {/* A bill from a shared group opens the group's own editor: it has the
+          whole membership and every split method, which a two-person form does
+          not. Deleting is handled here; editing needs the full picture. */}
+      {editingGroupExpense && membersByGroup[editingGroupExpense.group_id ?? ''] && (
+        <AddExpenseModal
+          groupId={editingGroupExpense.group_id as string}
+          user={user}
+          members={membersByGroup[editingGroupExpense.group_id as string]}
+          expense={editingGroupExpense}
+          onClose={() => setEditingGroupExpense(null)}
+          onSaved={async () => {
+            setEditingGroupExpense(null);
+            await load();
+            if (selected) await loadPairRecords(selected.friend.id, selected.groupIds);
+          }}
+        />
       )}
 
       {settleTarget && (

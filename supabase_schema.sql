@@ -2812,6 +2812,9 @@ BEGIN
     -- by one person would quietly reset everybody else's answer to "undecided" —
     -- their share would drop out of their charts and reappear in their
     -- confirmation queue because somebody else fixed a typo.
+    -- Group shares default to counted, but somebody who went and switched their
+    -- own off meant it — that has to survive an edit by anyone else, or a typo
+    -- fix would quietly put their share back in their charts.
     SELECT COALESCE(jsonb_object_agg(user_id::TEXT, include_in_stats), '{}'::jsonb)
     INTO v_choices
     FROM expense_splits
@@ -3626,3 +3629,138 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION public.friend_record_count(UUID) TO authenticated;
+
+-- ========================================
+-- STATISTICS: ASK ONLY WHERE IT IS A QUESTION
+-- ========================================
+-- Group spending now counts for everyone automatically. Being asked to approve
+-- each bill your own flatmates add is noise: you were in the group, the split is
+-- yours, and the answer was always going to be yes.
+--
+-- What is left worth asking about is a shared bill recorded straight between two
+-- people, where the other person never opened a form and never agreed to
+-- anything. They still get the choice.
+--
+-- Loans are decided silently and counted for nobody. Money moving between two
+-- people is not consumption: whoever borrowed it will log what they actually
+-- spent it on, and counting both would double it.
+CREATE OR REPLACE FUNCTION public.write_expense_rows(
+    p_expense_id UUID,
+    p_group_id   UUID,
+    p_title      TEXT,
+    p_amount     DECIMAL,
+    p_paid_by    UUID,
+    p_splits     JSONB,
+    p_items      JSONB
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_item        JSONB;
+    v_split_total DECIMAL(14,2) := 0;
+    v_negatives   INT := 0;
+    v_is_direct   BOOLEAN := FALSE;
+    v_shared      BOOLEAN := TRUE;
+BEGIN
+    SELECT COUNT(*) INTO v_negatives
+    FROM jsonb_array_elements(p_splits) s
+    WHERE COALESCE((s->>'amount')::DECIMAL, 0) < 0;
+
+    IF v_negatives > 0 THEN
+        RAISE EXCEPTION 'A split cannot be a negative amount';
+    END IF;
+
+    SELECT COALESCE(SUM((s->>'amount')::DECIMAL), 0) INTO v_split_total
+    FROM jsonb_array_elements(p_splits) s
+    WHERE (s->>'is_included')::BOOLEAN;
+
+    IF ROUND(v_split_total, 2) <> ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Split total (%) does not equal the expense amount (%)', v_split_total, p_amount;
+    END IF;
+
+    SELECT COALESCE(is_direct, FALSE) INTO v_is_direct FROM groups WHERE id = p_group_id;
+
+    -- Genuinely shared means both sides carry part of it. A loan gives one side
+    -- the whole amount and the other nothing, which is the shape this detects.
+    SELECT NOT EXISTS (
+        SELECT 1 FROM jsonb_array_elements(p_splits) s
+        WHERE COALESCE((s->>'is_included')::BOOLEAN, TRUE)
+          AND COALESCE((s->>'amount')::DECIMAL, 0) = 0
+    ) INTO v_shared;
+
+    INSERT INTO expense_splits (expense_id, user_id, is_included, amount, percentage, shares, include_in_stats)
+    SELECT
+        p_expense_id,
+        (s->>'user_id')::UUID,
+        COALESCE((s->>'is_included')::BOOLEAN, TRUE),
+        COALESCE((s->>'amount')::DECIMAL, 0),
+        COALESCE((s->>'percentage')::DECIMAL, 0),
+        COALESCE((s->>'shares')::INT, 1),
+        CASE
+            -- A real group: counted for everybody, nobody asked.
+            WHEN NOT v_is_direct THEN TRUE
+            -- A shared bill between two people: the person typing it answers in
+            -- the form, the other is asked.
+            WHEN v_shared THEN
+                CASE WHEN (s->>'user_id')::UUID = auth.uid()
+                     THEN COALESCE((s->>'stats')::BOOLEAN, TRUE)
+                     ELSE NULL END
+            -- Otherwise one person carried the lot. It counts for them only if
+            -- they also paid: carrying the whole amount without paying is having
+            -- borrowed it, and a loan is not spending.
+            ELSE ((s->>'user_id')::UUID = p_paid_by AND COALESCE((s->>'amount')::DECIMAL, 0) > 0)
+        END
+    FROM jsonb_array_elements(p_splits) s;
+
+    IF jsonb_array_length(COALESCE(p_items, '[]'::jsonb)) > 0 THEN
+        FOR v_item IN SELECT * FROM jsonb_array_elements(p_items) LOOP
+            INSERT INTO expense_items (expense_id, name, amount, shared_by)
+            VALUES (
+                p_expense_id,
+                v_item->>'name',
+                COALESCE((v_item->>'amount')::DECIMAL, 0),
+                ARRAY(SELECT jsonb_array_elements_text(COALESCE(v_item->'shared_by', '[]'::jsonb)))::UUID[]
+            );
+        END LOOP;
+    END IF;
+
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    VALUES (p_group_id, p_paid_by, 'EXPENSE', p_amount, p_expense_id, 'Paid for ' || p_title);
+
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    SELECT p_group_id, (s->>'user_id')::UUID, 'SPLIT',
+           -COALESCE((s->>'amount')::DECIMAL, 0), p_expense_id, 'Share of ' || p_title
+    FROM jsonb_array_elements(p_splits) s
+    WHERE COALESCE((s->>'is_included')::BOOLEAN, TRUE)
+      AND COALESCE((s->>'amount')::DECIMAL, 0) > 0;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.write_expense_rows(UUID, UUID, TEXT, DECIMAL, UUID, JSONB, JSONB) TO authenticated;
+
+-- Existing data brought in line with the rule above. Group shares become TRUE
+-- outright rather than only where undecided: the old behaviour asked people
+-- questions they should never have been asked, and a "no" given to get rid of a
+-- prompt is not a preference worth preserving.
+UPDATE expense_splits s
+SET include_in_stats = TRUE
+FROM expenses e
+JOIN groups g ON g.id = e.group_id
+WHERE e.id = s.expense_id
+  AND NOT COALESCE(g.is_direct, FALSE)
+  AND s.include_in_stats IS DISTINCT FROM TRUE;
+
+-- Loans already on record stop being questions. Only undecided rows are touched
+-- here — a shared bill somebody genuinely answered keeps their answer.
+UPDATE expense_splits s
+SET include_in_stats = (s.user_id = e.paid_by AND s.amount > 0)
+FROM expenses e
+JOIN groups g ON g.id = e.group_id
+WHERE e.id = s.expense_id
+  AND COALESCE(g.is_direct, FALSE)
+  AND s.include_in_stats IS NULL
+  AND EXISTS (
+      SELECT 1 FROM expense_splits z
+      WHERE z.expense_id = e.id AND z.is_included AND z.amount = 0
+  );

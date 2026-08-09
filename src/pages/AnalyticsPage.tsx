@@ -55,10 +55,10 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
           .eq('user_id', user.id)
           .eq('is_deleted', false)
           .gte('date', since),
-        // Only the shared bills you have explicitly opted in to. Group spending
-        // is not yours to be charted by default — somebody else adding a bill
-        // must not change your figures — so include_in_stats has to be TRUE,
-        // never merely unset.
+        // Shared spending counted as yours. Group shares are marked counted as
+        // they are written, so this is normally everything you were in; a record
+        // a friend made with you privately only lands here once you say so.
+        // TRUE, never merely unset — undecided is not consent.
         supabase
           .from('expense_splits')
           .select('amount, include_in_stats, expenses!inner(category, created_at, is_deleted)')
@@ -286,12 +286,13 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
           <span className="row" style={{ gap: 8, marginBottom: 6 }}>
             <HelpCircle size={16} color="var(--warning)" />
             <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>
-              {pending.length} shared {pending.length === 1 ? 'expense' : 'expenses'} to rule on
+              {pending.length} shared {pending.length === 1 ? 'record' : 'records'} with a friend
             </span>
           </span>
           <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
-            Someone added these with your name on them. They already count toward what you owe — this is
-            only about whether your share shows up in the charts below.
+            A friend recorded these straight with you, outside any group. Group spending counts
+            automatically; this asks only because you were never at the form. They already count toward
+            what you owe — this is only about the charts below.
           </p>
 
           <div className="stack-sm">

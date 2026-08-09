@@ -34,12 +34,19 @@ BEGIN
   RAISE NOTICE 'P1 author''s own split is decided | pass=%', v IS TRUE;
   IF v IS NOT TRUE THEN RAISE EXCEPTION 'P1 FAILED: author left undecided on their own bill'; END IF;
 
-  -- P2: everyone else is asked
+  -- P2: a real group counts for everyone without a prompt. Being asked to
+  -- approve each bill your own group adds is noise, not consent.
   SELECT include_in_stats INTO v FROM expense_splits WHERE expense_id=E1 AND user_id=BEN;
-  RAISE NOTICE 'P2 other member is left to decide | pass=%', v IS NULL;
-  IF v IS NOT NULL THEN RAISE EXCEPTION 'P2 FAILED: someone else answered for Ben'; END IF;
+  RAISE NOTICE 'P2 group shares count automatically | pass=%', v IS TRUE;
+  IF v IS NOT TRUE THEN RAISE EXCEPTION 'P2 FAILED: group share left as % for Ben', v; END IF;
 
-  -- Ben says yes
+  SELECT COUNT(*) INTO n FROM expense_splits s JOIN expenses e ON e.id=s.expense_id
+   JOIN groups gr ON gr.id=e.group_id
+   WHERE NOT gr.is_direct AND s.include_in_stats IS NULL;
+  RAISE NOTICE 'P2b nothing from a group is ever queued | pass=%', n=0;
+  IF n<>0 THEN RAISE EXCEPTION 'P2b FAILED: % group shares waiting to be approved', n; END IF;
+
+  -- Ben can still opt himself out by hand if he wants to
   PERFORM set_config('request.jwt.claim.sub', BEN::TEXT, true);
   PERFORM set_split_stats_choice(E1, TRUE);
 
@@ -112,6 +119,16 @@ BEGIN
    WHERE s.user_id=BEN AND e.created_by=ANN AND s.include_in_stats IS NOT NULL;
   RAISE NOTICE 'P10 backfill answers nothing on Ben''s behalf | pass=%', n=0;
   IF n<>0 THEN RAISE EXCEPTION 'P10 FAILED: backfill decided % splits for Ben', n; END IF;
+
+  -- A loan is not spending, so nobody is asked and nobody is charged for it:
+  -- whoever borrowed it will log what they actually spent it on.
+  D := lend_to_friend(BEN, 2000, 'Emergency', TRUE);
+  SELECT include_in_stats INTO v FROM expense_splits WHERE expense_id=D AND user_id=BEN;
+  RAISE NOTICE 'P13 a loan is not queued for the borrower | pass=%', v IS FALSE;
+  IF v IS NOT FALSE THEN RAISE EXCEPTION 'P13 FAILED: borrower left at % on a loan', v; END IF;
+  SELECT include_in_stats INTO v FROM expense_splits WHERE expense_id=D AND user_id=ANN;
+  RAISE NOTICE 'P14 and not counted for the lender either | pass=%', v IS FALSE;
+  IF v IS NOT FALSE THEN RAISE EXCEPTION 'P14 FAILED: lender at % on a loan', v; END IF;
 
   -- P11: you cannot open a pair record with somebody you have no connection to.
   -- Otherwise anyone holding an account id could post "you owe me" against a

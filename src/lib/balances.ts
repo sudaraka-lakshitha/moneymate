@@ -26,6 +26,12 @@ export interface FriendGroupBalance {
 
 export interface FriendBalanceDetail extends FriendBalance {
   perGroup: FriendGroupBalance[];
+  /**
+   * Every group you are both in, direct pair records included and settled ones
+   * kept. perGroup drops anything that nets to zero, which is right for a
+   * balance breakdown and wrong for finding the history behind it.
+   */
+  groupIds: string[];
 }
 
 /**
@@ -46,6 +52,7 @@ export const computeFriendBalances = (groups: GroupLedger[], meId: string): Frie
       owedToMe: number;
       owedByMe: number;
       groups: Set<string>;
+      allGroups: Set<string>;
       perGroup: Map<string, FriendGroupBalance>;
     }
   >();
@@ -53,7 +60,15 @@ export const computeFriendBalances = (groups: GroupLedger[], meId: string): Frie
   const ensure = (user: User) => {
     let entry = accumulator.get(user.id);
     if (!entry) {
-      entry = { friend: user, net: 0, owedToMe: 0, owedByMe: 0, groups: new Set(), perGroup: new Map() };
+      entry = {
+        friend: user,
+        net: 0,
+        owedToMe: 0,
+        owedByMe: 0,
+        groups: new Set(),
+        allGroups: new Set(),
+        perGroup: new Map(),
+      };
       accumulator.set(user.id, entry);
     }
     return entry;
@@ -85,6 +100,7 @@ export const computeFriendBalances = (groups: GroupLedger[], meId: string): Frie
       // balance, but must not count toward "N shared groups" — lending someone
       // money does not put you in a group together, and saying otherwise
       // contradicts the whole point of the direct flow.
+      entry.allGroups.add(group.groupId);
       if (!group.isDirect) entry.groups.add(group.groupId);
     }
 
@@ -111,6 +127,7 @@ export const computeFriendBalances = (groups: GroupLedger[], meId: string): Frie
       total_i_owe_them: roundMoney(entry.owedByMe),
       shared_group_count: entry.groups.size,
       perGroup: Array.from(entry.perGroup.values()).filter((g) => Math.abs(g.net) > 0.005),
+      groupIds: Array.from(entry.allGroups),
     }))
     // Live balances first, largest magnitude at the top; settled friends after.
     .sort((a, b) => Math.abs(b.net_balance) - Math.abs(a.net_balance));
