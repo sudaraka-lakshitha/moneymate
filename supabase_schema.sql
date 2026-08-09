@@ -3445,3 +3445,184 @@ ALTER TABLE group_settlements    ADD  CONSTRAINT group_settlements_from_user_fke
 ALTER TABLE group_settlements    DROP CONSTRAINT IF EXISTS group_settlements_to_user_fkey;
 ALTER TABLE group_settlements    ADD  CONSTRAINT group_settlements_to_user_fkey
      FOREIGN KEY (to_user) REFERENCES users(id) ON DELETE SET NULL;
+
+-- ========================================
+-- CLEARING OUT DELETED RECORDS
+-- ========================================
+-- Deleting an expense in the app is a soft delete: the row stays so the audit
+-- trail and the reversal that balances the ledger stay readable. Once a group
+-- is square, none of that is load-bearing any more, and the rows are pure
+-- storage. This erases them for good.
+--
+-- Narrower than purge_group_history on purpose. That clears everything and is
+-- the "start this group fresh" button; this one only removes what was already
+-- deleted, so live history survives.
+CREATE OR REPLACE FUNCTION public.purge_deleted_expenses(p_group_id UUID)
+RETURNS INT
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_ids     UUID[];
+    v_count   INT := 0;
+    v_dangling INT;
+BEGIN
+    IF NOT public.is_group_admin(p_group_id) THEN
+        RAISE EXCEPTION 'Only a group admin can clear deleted records';
+    END IF;
+    IF NOT public.group_is_settled(p_group_id) THEN
+        RAISE EXCEPTION 'Settle every balance in this group before clearing deleted records';
+    END IF;
+
+    SELECT ARRAY_AGG(id) INTO v_ids
+    FROM expenses
+    WHERE group_id = p_group_id AND is_deleted;
+
+    IF v_ids IS NULL THEN
+        RETURN 0;
+    END IF;
+    v_count := array_length(v_ids, 1);
+
+    -- Deleting an expense writes a reversal, so each person's entries for it
+    -- already cancel out and dropping them cannot move anybody's balance.
+    -- Verified per person rather than in total: a total of zero could still hide
+    -- two people whose amounts merely offset each other, and erasing those would
+    -- move money between them.
+    SELECT COUNT(*) INTO v_dangling
+    FROM (
+        SELECT user_id
+        FROM ledger_entries
+        WHERE reference_id = ANY(v_ids)
+        GROUP BY user_id
+        HAVING ROUND(SUM(amount), 2) <> 0
+    ) unbalanced;
+
+    IF v_dangling > 0 THEN
+        RAISE EXCEPTION 'Those records still affect % member(s) and cannot be cleared', v_dangling;
+    END IF;
+
+    DELETE FROM ledger_entries WHERE reference_id = ANY(v_ids);
+    -- Splits, items and the edit history cascade with the expense row.
+    DELETE FROM expenses WHERE id = ANY(v_ids);
+
+    RETURN v_count;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.purge_deleted_expenses(UUID) TO authenticated;
+
+-- How much clearing up there is to do, so a button can say so before it is
+-- pressed rather than after.
+CREATE OR REPLACE FUNCTION public.deleted_expense_count(p_group_id UUID)
+RETURNS INT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+    SELECT COUNT(*)::INT
+    FROM expenses
+    WHERE group_id = p_group_id
+      AND is_deleted
+      AND public.is_group_member(p_group_id);
+$$;
+
+GRANT EXECUTE ON FUNCTION public.deleted_expense_count(UUID) TO authenticated;
+
+-- ========================================
+-- REMOVING A FRIEND, PROPERLY
+-- ========================================
+-- Unfriending used to leave the pair's direct group standing, and the Friends
+-- screen builds its list from everyone you share a group with — so the person
+-- you just removed stayed on the list for good, with no way to get rid of them.
+--
+-- The pair group is now torn down as part of removing the friend, but only when
+-- there is nothing left in it worth keeping: it must be settled, and it must
+-- hold no records either side might still want. Anything else and the group
+-- stays, because that history belongs to both of you and unfriending is a
+-- one-sided act. p_purge_history is the explicit "erase it anyway" answer, which
+-- the app only sends after saying plainly what will be lost.
+--
+-- The single-argument version has to go rather than being replaced: leaving it
+-- alongside this one makes remove_friend(uuid) ambiguous, and PostgREST answers
+-- an ambiguous call with an error instead of picking one.
+DROP FUNCTION IF EXISTS public.remove_friend(UUID);
+
+CREATE OR REPLACE FUNCTION public.remove_friend(
+    p_friend_id     UUID,
+    p_purge_history BOOLEAN DEFAULT FALSE
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me      UUID := auth.uid();
+    v_group   UUID;
+    v_balance DECIMAL := 0;
+    v_records INT := 0;
+BEGIN
+    IF v_me IS NULL THEN
+        RAISE EXCEPTION 'Not authenticated';
+    END IF;
+
+    SELECT g.id INTO v_group
+    FROM groups g
+    WHERE g.is_direct
+      AND EXISTS (SELECT 1 FROM group_members m WHERE m.group_id = g.id AND m.user_id = v_me)
+      AND EXISTS (SELECT 1 FROM group_members m WHERE m.group_id = g.id AND m.user_id = p_friend_id)
+      AND (SELECT COUNT(*) FROM group_members m WHERE m.group_id = g.id) = 2
+    LIMIT 1;
+
+    IF v_group IS NOT NULL THEN
+        v_balance := public.member_balance(v_group, v_me);
+        IF ABS(v_balance) >= 0.01 THEN
+            RAISE EXCEPTION 'Settle up before removing this friend (currently %)', v_balance;
+        END IF;
+
+        SELECT COUNT(*) INTO v_records
+        FROM expenses WHERE group_id = v_group AND NOT is_deleted;
+
+        IF v_records = 0 OR p_purge_history THEN
+            -- Everything below the group cascades on the group row.
+            DELETE FROM groups WHERE id = v_group;
+        END IF;
+    END IF;
+
+    DELETE FROM friend_requests
+    WHERE (requester_id = v_me AND addressee_id = p_friend_id)
+       OR (requester_id = p_friend_id AND addressee_id = v_me);
+
+    DELETE FROM friend_pins
+    WHERE (user_id = v_me AND friend_id = p_friend_id)
+       OR (user_id = p_friend_id AND friend_id = v_me);
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.remove_friend(UUID, BOOLEAN) TO authenticated;
+
+-- What removing this friend would cost, asked before it happens so the
+-- confirmation can name a number instead of a vague warning.
+CREATE OR REPLACE FUNCTION public.friend_record_count(p_friend_id UUID)
+RETURNS INT
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me    UUID := auth.uid();
+    v_group UUID;
+    v_count INT := 0;
+BEGIN
+    SELECT g.id INTO v_group
+    FROM groups g
+    WHERE g.is_direct
+      AND EXISTS (SELECT 1 FROM group_members m WHERE m.group_id = g.id AND m.user_id = v_me)
+      AND EXISTS (SELECT 1 FROM group_members m WHERE m.group_id = g.id AND m.user_id = p_friend_id)
+      AND (SELECT COUNT(*) FROM group_members m WHERE m.group_id = g.id) = 2
+    LIMIT 1;
+
+    IF v_group IS NULL THEN
+        RETURN 0;
+    END IF;
+
+    SELECT COUNT(*) INTO v_count
+    FROM expenses WHERE group_id = v_group AND NOT is_deleted;
+    RETURN v_count;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.friend_record_count(UUID) TO authenticated;

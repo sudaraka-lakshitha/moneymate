@@ -188,6 +188,9 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   const simplified = useMemo(() => simplifyDebts(balances, userMap), [balances, userMap]);
   const myDebts = simplified.filter((d) => d.from.id === user.id);
   const activeExpenses = expenses.filter((e) => !e.is_deleted);
+  // Deleted records are kept so the reversal that balances the ledger stays
+  // readable. Once the group is square that is no longer holding anything up.
+  const deletedExpenses = expenses.filter((e) => e.is_deleted);
 
   const handleApprove = async (request: JoinRequest) => {
     setBusyRequest(request.id);
@@ -286,6 +289,31 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
       await load();
     } catch (error) {
       toast.error(friendlyDbError(error, 'Could not update the group.'));
+    } finally {
+      setCleaning(false);
+    }
+  };
+
+  const handleClearDeleted = async () => {
+    const count = deletedExpenses.length;
+    const ok = await confirm({
+      title: `Clear ${count} deleted ${count === 1 ? 'record' : 'records'}?`,
+      message:
+        'These were already deleted and count towards nobody\'s balance. Erasing them frees the space for good. Live expenses are left alone.',
+      confirmLabel: 'Erase',
+      danger: true,
+    });
+    if (!ok) return;
+
+    setCleaning(true);
+    try {
+      const { data, error } = await supabase.rpc('purge_deleted_expenses', { p_group_id: groupId });
+      if (error) throw error;
+      const cleared = Number(data ?? 0);
+      toast.success(`Cleared ${cleared} deleted ${cleared === 1 ? 'record' : 'records'}.`);
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not clear those records.'));
     } finally {
       setCleaning(false);
     }
@@ -1111,6 +1139,29 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                 >
                   {cleaning && <Spinner />}
                   {group.archived_at ? 'Restore group' : 'Archive group'}
+                </button>
+              </div>
+
+              {/* ---- Clear only what was already deleted ---- */}
+              <div className="card">
+                <span className="row" style={{ gap: 8, marginBottom: 6 }}>
+                  <Eraser size={16} color="var(--primary)" />
+                  <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Clear deleted records</span>
+                </span>
+                <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+                  Expenses somebody deleted are kept until the group is settled, so the correction stays on
+                  record. Erasing them afterwards frees the space and leaves every live expense untouched.
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-block"
+                  onClick={handleClearDeleted}
+                  disabled={cleaning || !allSettled || deletedExpenses.length === 0}
+                >
+                  {cleaning && <Spinner />}
+                  {deletedExpenses.length === 0
+                    ? 'Nothing deleted to clear'
+                    : `Clear ${deletedExpenses.length} deleted record${deletedExpenses.length === 1 ? '' : 's'}`}
                 </button>
               </div>
 

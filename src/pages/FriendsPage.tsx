@@ -10,7 +10,7 @@ import { Alert, Avatar, EmptyState, Sheet, SkeletonRows, Spinner } from '../comp
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/Confirm';
-import { Check, Clock, HandCoins, Pencil, Trash2, UserMinus, UserPlus, Search, X, Pin } from 'lucide-react';
+import { Check, Clock, Eraser, HandCoins, Pencil, Trash2, UserMinus, UserPlus, Search, X, Pin } from 'lucide-react';
 
 interface FriendsPageProps {
   user: User;
@@ -65,6 +65,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const [directShares, setDirectShares] = useState<Record<string, Record<string, number>>>({});
   const [busyEntry, setBusyEntry] = useState<string | null>(null);
   const [removingFriend, setRemovingFriend] = useState(false);
+  const [clearingDeleted, setClearingDeleted] = useState(false);
 
   const load = useCallback(async () => {
     setError(null);
@@ -210,12 +211,20 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
         });
       }
 
+      // Somebody you removed should actually go. A row earns its place by being
+      // a connection, by sharing a real group, or by having money outstanding —
+      // a settled pair record from a friendship that is over is none of those,
+      // and leaving it in is why removed friends appeared to come back.
+      const visible = merged.filter(
+        (f) => f.isConnected || f.shared_group_count > 0 || Math.abs(f.net_balance) >= 0.01
+      );
+
       // Pinned first, then by how much money is at stake, then settled friends.
-      merged.sort((a, b) => {
+      visible.sort((a, b) => {
         if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
         return Math.abs(b.net_balance) - Math.abs(a.net_balance);
       });
-      setFriends(merged);
+      setFriends(visible);
       setIncoming(requests.filter((r) => r.status === 'PENDING' && r.addressee_id === user.id));
       setOutgoing(requests.filter((r) => r.status === 'PENDING' && r.requester_id === user.id));
     } catch (err) {
@@ -490,29 +499,105 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
 
   const handleRemoveFriend = async (friend: DisplayFriend) => {
     const owing = Math.abs(friend.net_balance) >= 0.01;
+
+    // How much shared history removal would leave behind, asked before the
+    // confirmation so it can name a number rather than warn vaguely.
+    let records = 0;
+    if (!owing) {
+      const { data } = await supabase.rpc('friend_record_count', { p_friend_id: friend.friend.id });
+      records = Number(data ?? 0);
+    }
+
     const ok = await confirm({
       title: `Remove ${friend.friend.display_name}?`,
       message: owing
         ? `There is still ${formatLKR(Math.abs(friend.net_balance))} between you. Settle up first.`
-        : 'You will no longer be connected. Past records stay on both sides, and you can add them again later.',
+        : records > 0
+          ? `They will leave your friends list. The ${records} ${records === 1 ? 'record' : 'records'} between you stay saved on both sides — you will be asked next whether to erase those too.`
+          : 'They will leave your friends list. You can add them again later.',
       confirmLabel: owing ? 'OK' : 'Remove',
       danger: !owing,
     });
     if (!ok || owing) return;
 
+    // Erasing is a separate answer because it is the destructive half: it takes
+    // the records off the other person's screen as well, and they never agreed
+    // to that. Saying no still removes the friend.
+    let purge = false;
+    if (records > 0) {
+      purge = await confirm({
+        title: 'Erase the records too?',
+        message: `This permanently deletes the ${records} ${records === 1 ? 'record' : 'records'} between you, for both of you. It cannot be undone. Choose Keep to remove the friend but leave the history in place.`,
+        confirmLabel: 'Erase',
+        cancelLabel: 'Keep',
+        danger: true,
+      });
+    }
+
     setRemovingFriend(true);
     try {
       const { error: rpcError } = await supabase.rpc('remove_friend', {
         p_friend_id: friend.friend.id,
+        p_purge_history: purge,
       });
       if (rpcError) throw rpcError;
-      toast.info(`${friend.friend.display_name} removed.`);
+      toast.info(
+        purge
+          ? `${friend.friend.display_name} removed and the shared records erased.`
+          : `${friend.friend.display_name} removed.`
+      );
       setSelected(null);
       await load();
     } catch (err) {
       toast.error(friendlyDbError(err, 'Could not remove that friend.'));
     } finally {
       setRemovingFriend(false);
+    }
+  };
+
+  /**
+   * Permanently erases records between the two of you that were already
+   * deleted. A deleted record is kept so the reversal that balances the ledger
+   * stays readable; once you are square that is no longer holding anything up,
+   * and the rows are pure storage.
+   */
+  const handleClearDeleted = async (friend: DisplayFriend) => {
+    const groupId = directGroupByFriend[friend.friend.id];
+    if (!groupId) return;
+
+    setClearingDeleted(true);
+    try {
+      const { data, error: countError } = await supabase.rpc('deleted_expense_count', {
+        p_group_id: groupId,
+      });
+      if (countError) throw countError;
+
+      const count = Number(data ?? 0);
+      if (count === 0) {
+        toast.info('Nothing to clear — no deleted records between you.');
+        return;
+      }
+
+      const ok = await confirm({
+        title: `Clear ${count} deleted ${count === 1 ? 'record' : 'records'}?`,
+        message:
+          'These were already deleted and are not part of any balance. Erasing them frees the space for good and cannot be undone.',
+        confirmLabel: 'Erase',
+        danger: true,
+      });
+      if (!ok) return;
+
+      const { data: cleared, error: purgeError } = await supabase.rpc('purge_deleted_expenses', {
+        p_group_id: groupId,
+      });
+      if (purgeError) throw purgeError;
+      toast.success(`Cleared ${Number(cleared ?? 0)} deleted ${Number(cleared) === 1 ? 'record' : 'records'}.`);
+      await load();
+    } catch (err) {
+      // The commonest refusal is an unsettled balance, and the server says so.
+      toast.error(friendlyDbError(err, 'Could not clear those records.'));
+    } finally {
+      setClearingDeleted(false);
     }
   };
 
@@ -964,6 +1049,17 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                   Settled records are locked, so a paid-up balance cannot reopen.
                 </span>
               </>
+            )}
+
+            {directGroupByFriend[selected.friend.id] && (
+              <button
+                type="button"
+                className="btn btn-ghost btn-block btn-sm"
+                onClick={() => handleClearDeleted(selected)}
+                disabled={clearingDeleted}
+              >
+                {clearingDeleted ? <Spinner /> : <Eraser size={15} />} Clear deleted records
+              </button>
             )}
 
             {selected.isConnected && (

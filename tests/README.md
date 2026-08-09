@@ -56,3 +56,4 @@ than an error, so they are asserted explicitly rather than assumed.
 | `test18.sql` | Inviting a friend straight into a group, deleting an account |
 | `test19.sql` | A member leaving or deleting their account while the group keeps going: the ledger still nets to zero, and the contribution chart still accounts for every rupee they spent |
 | `test20.sql` | Whose statistics decision is whose — your own entries are answered as you make them, and somebody else editing a bill never resets your answer |
+| `test21.sql` | Removing a friend for good (the pair record must not outlive the friendship and drag them back onto the list), and clearing already-deleted records without moving a rupee |

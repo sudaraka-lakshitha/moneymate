@@ -5,14 +5,14 @@ import { Budget, DailyExpense, ExpenseCategory, User } from '../types';
 import { formatLKR, parseAmount, roundMoney } from '../lib/currency';
 import { CATEGORIES, categoryMeta } from '../lib/categories';
 import { useTheme } from '../lib/theme';
-import { friendlyDate, monthKey, monthLabel, startOfMonthISO, todayISO } from '../lib/dates';
+import { friendlyDate, monthKey, monthLabel, startOfMonthISO, toISODate, todayISO } from '../lib/dates';
 import { friendlyDbError } from '../lib/authErrors';
 import { Alert, EmptyState, ProgressBar, Sheet, SkeletonRows, Spinner } from '../components/ui';
 import { ReceiptPicker } from '../components/ReceiptPicker';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/Confirm';
 import { queueWrite, readCache, useOnline, writeCache } from '../lib/offline';
-import { Pencil, Plus, Repeat, Trash2, Wallet } from 'lucide-react';
+import { Archive, Pencil, Plus, Repeat, RotateCcw, Trash2, Wallet } from 'lucide-react';
 
 const FREQUENCIES = [
   { id: 'DAILY', label: 'Daily' },
@@ -46,6 +46,12 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
 
   const [showAdd, setShowAdd] = useState(false);
   const [editing, setEditing] = useState<DailyExpense | null>(null);
+  const [showManage, setShowManage] = useState(false);
+  const [binned, setBinned] = useState<DailyExpense[]>([]);
+  const [binLoading, setBinLoading] = useState(false);
+  const [binBusy, setBinBusy] = useState<string | null>(null);
+  const [cleanupMonths, setCleanupMonths] = useState('12');
+  const [cleaning, setCleaning] = useState(false);
   const [showBudgets, setShowBudgets] = useState(false);
 
   const [title, setTitle] = useState('');
@@ -296,6 +302,145 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
     }
   };
 
+  /**
+   * Records you deleted. They are kept rather than erased so a mistaken tap is
+   * recoverable, which only helps if there is somewhere to recover them from.
+   */
+  const openManage = async () => {
+    setShowManage(true);
+    setBinLoading(true);
+    try {
+      const { data, error: binError } = await supabase
+        .from('daily_expenses')
+        .select('*')
+        .eq('user_id', user.id)
+        .eq('is_deleted', true)
+        .order('date', { ascending: false })
+        .limit(200);
+      if (binError) throw binError;
+      setBinned((data ?? []) as DailyExpense[]);
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not load your deleted records.'));
+      setBinned([]);
+    } finally {
+      setBinLoading(false);
+    }
+  };
+
+  const handleRestore = async (expense: DailyExpense) => {
+    setBinBusy(expense.id);
+    try {
+      const { error: restoreError } = await supabase
+        .from('daily_expenses')
+        .update({ is_deleted: false, deleted_at: null })
+        .eq('id', expense.id);
+      if (restoreError) throw restoreError;
+      setBinned((current) => current.filter((e) => e.id !== expense.id));
+      toast.success(`Restored "${expense.title}".`);
+      await load();
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not restore that entry.'));
+    } finally {
+      setBinBusy(null);
+    }
+  };
+
+  const handleErase = async (expense: DailyExpense) => {
+    const ok = await confirm({
+      title: 'Erase permanently?',
+      message: `"${expense.title}" will be gone for good. This cannot be undone.`,
+      confirmLabel: 'Erase',
+      danger: true,
+    });
+    if (!ok) return;
+
+    setBinBusy(expense.id);
+    try {
+      const { error: eraseError } = await supabase.from('daily_expenses').delete().eq('id', expense.id);
+      if (eraseError) throw eraseError;
+      setBinned((current) => current.filter((e) => e.id !== expense.id));
+      toast.success('Erased.');
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not erase that entry.'));
+    } finally {
+      setBinBusy(null);
+    }
+  };
+
+  const handleEmptyBin = async () => {
+    const count = binned.length;
+    const ok = await confirm({
+      title: `Erase ${count} deleted ${count === 1 ? 'entry' : 'entries'}?`,
+      message: 'Everything in here is erased for good. This cannot be undone.',
+      confirmLabel: 'Erase all',
+      danger: true,
+    });
+    if (!ok) return;
+
+    setCleaning(true);
+    try {
+      const { error: eraseError } = await supabase
+        .from('daily_expenses')
+        .delete()
+        .eq('user_id', user.id)
+        .eq('is_deleted', true);
+      if (eraseError) throw eraseError;
+      setBinned([]);
+      toast.success(`Erased ${count} ${count === 1 ? 'entry' : 'entries'}.`);
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not empty the bin.'));
+    } finally {
+      setCleaning(false);
+    }
+  };
+
+  /** Erases old entries outright — the storage-freeing half of managing records. */
+  const handleClearOld = async () => {
+    const months = Math.max(1, Number(cleanupMonths) || 12);
+    const cutoff = new Date();
+    cutoff.setMonth(cutoff.getMonth() - months);
+    const cutoffISO = toISODate(cutoff);
+
+    setCleaning(true);
+    try {
+      const { count, error: countError } = await supabase
+        .from('daily_expenses')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', user.id)
+        .lt('date', cutoffISO);
+      if (countError) throw countError;
+
+      const total = count ?? 0;
+      if (total === 0) {
+        toast.info(`Nothing older than ${months} ${months === 1 ? 'month' : 'months'}.`);
+        return;
+      }
+
+      const ok = await confirm({
+        title: `Erase ${total} old ${total === 1 ? 'entry' : 'entries'}?`,
+        message: `Everything you logged before ${friendlyDate(cutoffISO)} is erased for good, deleted or not. Your charts and totals for those months will go with them. This cannot be undone.`,
+        confirmLabel: 'Erase',
+        danger: true,
+      });
+      if (!ok) return;
+
+      const { error: deleteError } = await supabase
+        .from('daily_expenses')
+        .delete()
+        .eq('user_id', user.id)
+        .lt('date', cutoffISO);
+      if (deleteError) throw deleteError;
+
+      toast.success(`Erased ${total} old ${total === 1 ? 'entry' : 'entries'}.`);
+      setShowManage(false);
+      await load();
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not clear old records.'));
+    } finally {
+      setCleaning(false);
+    }
+  };
+
   const openBudgets = () => {
     setBudgetDrafts(
       Object.fromEntries(
@@ -364,9 +509,19 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
           <h1 className="page-title">Tracker</h1>
           <p className="page-subtitle">{monthLabel(currentMonth)}</p>
         </div>
-        <button type="button" className="btn btn-primary btn-sm" onClick={openAdd}>
-          <Plus size={15} /> Log
-        </button>
+        <span className="row" style={{ gap: 'var(--sp-2)' }}>
+          <button
+            type="button"
+            className="btn-icon"
+            onClick={openManage}
+            aria-label="Manage your records"
+          >
+            <Archive size={17} />
+          </button>
+          <button type="button" className="btn btn-primary btn-sm" onClick={openAdd}>
+            <Plus size={15} /> Log
+          </button>
+        </span>
       </header>
 
       {error && (
@@ -681,6 +836,111 @@ export const TrackerPage: React.FC<TrackerPageProps> = ({ user }) => {
               {savingBudgets ? 'Saving…' : 'Save budgets'}
             </button>
           </form>
+        </Sheet>
+      )}
+      {showManage && (
+        <Sheet title="Manage your records" onClose={() => setShowManage(false)}>
+          <div className="stack">
+            <span className="label label-block">Deleted entries</span>
+            {binLoading ? (
+              <SkeletonRows count={3} height={52} />
+            ) : binned.length === 0 ? (
+              <EmptyState
+                icon="🗑️"
+                title="Nothing deleted"
+                text="Entries you delete land here first, so a mistaken tap can be undone."
+              />
+            ) : (
+              <>
+                <div className="card card-flush">
+                  {binned.map((expense) => {
+                    const meta = categoryMeta(expense.category);
+                    return (
+                      <div key={expense.id} className="list-row">
+                        <span className="icon-tile" style={{ width: 34, height: 34, fontSize: 16 }}>
+                          {meta.emoji}
+                        </span>
+                        <span className="grow" style={{ minWidth: 0 }}>
+                          <span
+                            className="truncate"
+                            style={{ display: 'block', fontWeight: 600, fontSize: '0.88rem' }}
+                          >
+                            {expense.title}
+                          </span>
+                          <span className="hint" style={{ display: 'block' }}>
+                            {formatLKR(Number(expense.amount))} · {friendlyDate(expense.date)}
+                          </span>
+                        </span>
+                        <span className="row" style={{ gap: 4, flexShrink: 0 }}>
+                          <button
+                            type="button"
+                            className="btn-icon"
+                            style={{ width: 30, height: 30 }}
+                            onClick={() => handleRestore(expense)}
+                            disabled={binBusy === expense.id}
+                            aria-label={`Restore ${expense.title}`}
+                          >
+                            {binBusy === expense.id ? <Spinner /> : <RotateCcw size={13} />}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-icon"
+                            style={{ width: 30, height: 30, color: 'var(--negative)' }}
+                            onClick={() => handleErase(expense)}
+                            disabled={binBusy === expense.id}
+                            aria-label={`Erase ${expense.title} permanently`}
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-block btn-sm"
+                  onClick={handleEmptyBin}
+                  disabled={cleaning}
+                >
+                  {cleaning && <Spinner />} Erase all {binned.length}
+                </button>
+              </>
+            )}
+
+            <span className="label label-block" style={{ marginTop: 'var(--sp-4)' }}>
+              Free up space
+            </span>
+            <div className="card">
+              <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+                Permanently erase entries older than a given age. Useful once a year has been and gone and
+                you no longer need the detail. <strong>This cannot be undone</strong>, and those months drop
+                out of your charts with it.
+              </p>
+              <div className="row" style={{ gap: 'var(--sp-2)' }}>
+                <select
+                  className="input input-sm"
+                  value={cleanupMonths}
+                  onChange={(e) => setCleanupMonths(e.target.value)}
+                  aria-label="How old"
+                  style={{ width: 150 }}
+                >
+                  <option value="6">Older than 6 months</option>
+                  <option value="12">Older than 1 year</option>
+                  <option value="24">Older than 2 years</option>
+                  <option value="36">Older than 3 years</option>
+                </select>
+                <button
+                  type="button"
+                  className="btn btn-danger btn-sm grow"
+                  onClick={handleClearOld}
+                  disabled={cleaning}
+                >
+                  {cleaning && <Spinner />} Erase
+                </button>
+              </div>
+            </div>
+          </div>
         </Sheet>
       )}
     </div>
