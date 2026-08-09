@@ -67,6 +67,8 @@ export interface Expense {
    * settled group would silently show a debt again.
    */
   settled_at?: string | null;
+  /** A record between two people that is lending rather than a shared bill. */
+  is_loan?: boolean;
 }
 
 export interface ExpenseSplit {

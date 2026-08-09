@@ -77,24 +77,43 @@ BEGIN
   RAISE NOTICE 'Q5 a loan is nobody''s spending | pass=% (% counted)', n=0, n;
   IF n<>0 THEN RAISE EXCEPTION 'Q5 FAILED: % loan share(s) counted as spending', n; END IF;
 
-  -- Q6: the shape where the empty side was written as excluded rather than as
-  -- zero. Whichever way it was recorded, it is still lending.
-  e := gen_random_uuid();
-  EXECUTE 'RESET ROLE';
-  INSERT INTO expenses (id, group_id, title, amount, paid_by, created_by, category, split_method)
-  VALUES (e, pair, 'Odd-shaped loan', 700, ANN, ANN, 'OTHER', 'UNEQUAL');
-  EXECUTE 'SET ROLE authenticated';
-  PERFORM write_expense_rows(e, pair, 'Odd-shaped loan', 700, ANN,
-    jsonb_build_array(
-      jsonb_build_object('user_id',ANN,'amount',0,'is_included',false),
-      jsonb_build_object('user_id',BEN,'amount',700,'is_included',true)),
-    '[]'::jsonb);
-
-  RAISE NOTICE 'Q6 an excluded empty side is still lending | pass=% (% queued)',
-    pg_temp.queued(BEN)=0, pg_temp.queued(BEN);
-  IF pg_temp.queued(BEN)<>0 THEN
-    RAISE EXCEPTION 'Q6 FAILED: written the other way round, the loan became a question';
+  -- Q6: paying a bill that was entirely somebody else's is not lending, even
+  -- though the numbers are identical. The money was consumed, it was theirs,
+  -- and it will never be recorded anywhere else — so they are asked.
+  e := add_direct_expense(BEN, 700, 'Your phone bill', TRUE, 700, FALSE);
+  RAISE NOTICE 'Q6 paying their bill outright asks them | pass=% (% queued)',
+    pg_temp.queued(BEN)=1, pg_temp.queued(BEN);
+  IF pg_temp.queued(BEN)<>1 THEN
+    RAISE EXCEPTION 'Q6 FAILED: their own bill was treated as a loan and never counted';
   END IF;
+
+  -- Q6b: and it is not the payer's spending — they carry none of it.
+  SELECT include_in_stats INTO n FROM (
+    SELECT CASE WHEN include_in_stats THEN 1 ELSE 0 END AS include_in_stats
+    FROM expense_splits WHERE expense_id=e AND user_id=ANN) z;
+  RAISE NOTICE 'Q6b and is not the payer''s own spending | pass=%', n=0;
+  IF n<>0 THEN RAISE EXCEPTION 'Q6b FAILED: the payer was charged for a bill that was not theirs'; END IF;
+
+  -- Answer it so the later counts stay readable.
+  PERFORM set_config('request.jwt.claim.sub', BEN::TEXT, true);
+  PERFORM set_split_stats_choice(e, TRUE);
+  PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
+
+  -- Q6c: the mirror image. Ben pays a bill that is entirely Ann's, and Ann
+  -- records it. It is her consumption, so it counts for her without a prompt —
+  -- she is the one filling in the form.
+  e := add_direct_expense(BEN, 400, 'My phone bill', FALSE, 0, FALSE);
+  SELECT CASE WHEN include_in_stats THEN 1 WHEN include_in_stats IS NULL THEN -1 ELSE 0 END
+    INTO n FROM expense_splits WHERE expense_id=e AND user_id=ANN;
+  RAISE NOTICE 'Q6c a bill of mine that a friend paid counts as mine | pass=%', n=1;
+  IF n<>1 THEN
+    RAISE EXCEPTION 'Q6c FAILED: my own bill read as % (1 counted, 0 excluded, -1 unanswered)', n;
+  END IF;
+
+  SELECT CASE WHEN include_in_stats THEN 1 WHEN include_in_stats IS NULL THEN -1 ELSE 0 END
+    INTO n FROM expense_splits WHERE expense_id=e AND user_id=BEN;
+  RAISE NOTICE 'Q6d and the friend who fronted it is not charged for it | pass=%', n=0;
+  IF n<>0 THEN RAISE EXCEPTION 'Q6d FAILED: the payer got asked about a bill that was not theirs'; END IF;
 
   -- Q7: the change must not have swallowed genuinely shared bills, which are
   -- the one thing that should still ask.

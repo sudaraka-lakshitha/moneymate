@@ -486,9 +486,11 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     setIPaid(iPaidIt);
     setTheirShare(String(theirs));
 
-    // Reopen in the shape it was recorded in, so saving without touching
-    // anything cannot quietly change what the record means.
-    if (iPaidIt && Math.abs(theirs - total) < 0.01) setLendMode('LENT');
+    // Reopen as it was recorded, so saving without touching anything cannot
+    // quietly change what the record means. The stored flag decides, not the
+    // numbers: "I lent you 5,000" and "I paid your 5,000 bill" look the same.
+    if (entry.is_loan === false) setLendMode('SHARED');
+    else if (iPaidIt && Math.abs(theirs - total) < 0.01) setLendMode('LENT');
     else if (!iPaidIt && Math.abs(theirs) < 0.01) setLendMode('BORROWED');
     else setLendMode('SHARED');
 
@@ -537,6 +539,10 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     //   borrowed -> they paid, none of it is theirs
     //   shared   -> whoever paid, split (evenly unless overridden)
     const paidByMe = lendMode === 'SHARED' ? iPaid : lendMode === 'LENT';
+    // Lending and paying somebody's bill produce identical numbers and mean
+    // opposite things, so the choice made here travels with the record instead
+    // of being guessed back out of the split later.
+    const isLoan = lendMode !== 'SHARED';
     let share: number;
     if (lendMode === 'LENT') share = amount;
     else if (lendMode === 'BORROWED') share = 0;
@@ -556,6 +562,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
             p_note: lendNote.trim(),
             p_i_paid: paidByMe,
             p_their_share: share,
+            p_is_loan: isLoan,
           })
         : await supabase.rpc('add_direct_expense', {
             p_friend_id: lendTo.id,
@@ -563,6 +570,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
             p_note: lendNote.trim(),
             p_i_paid: paidByMe,
             p_their_share: share,
+            p_is_loan: isLoan,
           });
       if (rpcError) throw rpcError;
 

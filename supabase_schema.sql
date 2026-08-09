@@ -3854,3 +3854,284 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION public.purge_deleted_expense(UUID) TO authenticated;
+
+-- ========================================
+-- LENDING VS PAYING FOR SOMEBODY
+-- ========================================
+-- These two look identical in the data and mean opposite things:
+--
+--   "I lent you 5,000"            — nothing has been consumed yet. Whoever
+--                                   borrowed it will log what they spend it on,
+--                                   so counting it now would count it twice.
+--   "I paid your 5,000 phone bill" — the consumption already happened, and it
+--                                   was theirs. It will never be logged
+--                                   anywhere else, so it belongs in their
+--                                   figures.
+--
+-- Both give one person the whole share and the other nothing, so no amount of
+-- looking at the numbers can tell them apart. The app knows, because the person
+-- entering it chose Lent, Borrowed or Shared — so the answer is recorded rather
+-- than guessed.
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS is_loan BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Existing records have no recorded intent, so shape is the best guess
+-- available: one person carrying everything reads as lending. Once, so that
+-- correcting one of these afterwards is not undone by the next deploy.
+DO $loans_once$
+BEGIN
+    IF EXISTS (SELECT 1 FROM schema_migrations WHERE key = 'direct_is_loan_from_shape') THEN
+        RETURN;
+    END IF;
+
+    UPDATE expenses e
+    SET is_loan = TRUE
+    FROM groups g
+    WHERE g.id = e.group_id
+      AND COALESCE(g.is_direct, FALSE)
+      AND (SELECT COUNT(*) FROM expense_splits z WHERE z.expense_id = e.id AND z.amount > 0) < 2;
+
+    INSERT INTO schema_migrations (key) VALUES ('direct_is_loan_from_shape');
+END
+$loans_once$;
+
+-- write_expense_rows, deciding from the recorded intent rather than the shape.
+CREATE OR REPLACE FUNCTION public.write_expense_rows(
+    p_expense_id UUID,
+    p_group_id   UUID,
+    p_title      TEXT,
+    p_amount     DECIMAL,
+    p_paid_by    UUID,
+    p_splits     JSONB,
+    p_items      JSONB
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_item        JSONB;
+    v_split_total DECIMAL(14,2) := 0;
+    v_negatives   INT := 0;
+    v_is_direct   BOOLEAN := FALSE;
+    v_is_loan     BOOLEAN := FALSE;
+BEGIN
+    SELECT COUNT(*) INTO v_negatives
+    FROM jsonb_array_elements(p_splits) s
+    WHERE COALESCE((s->>'amount')::DECIMAL, 0) < 0;
+
+    IF v_negatives > 0 THEN
+        RAISE EXCEPTION 'A split cannot be a negative amount';
+    END IF;
+
+    SELECT COALESCE(SUM((s->>'amount')::DECIMAL), 0) INTO v_split_total
+    FROM jsonb_array_elements(p_splits) s
+    WHERE (s->>'is_included')::BOOLEAN;
+
+    IF ROUND(v_split_total, 2) <> ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Split total (%) does not equal the expense amount (%)', v_split_total, p_amount;
+    END IF;
+
+    SELECT COALESCE(is_direct, FALSE) INTO v_is_direct FROM groups WHERE id = p_group_id;
+    SELECT COALESCE(is_loan, FALSE)   INTO v_is_loan   FROM expenses WHERE id = p_expense_id;
+
+    INSERT INTO expense_splits (expense_id, user_id, is_included, amount, percentage, shares, include_in_stats)
+    SELECT
+        p_expense_id,
+        (s->>'user_id')::UUID,
+        COALESCE((s->>'is_included')::BOOLEAN, TRUE),
+        COALESCE((s->>'amount')::DECIMAL, 0),
+        COALESCE((s->>'percentage')::DECIMAL, 0),
+        COALESCE((s->>'shares')::INT, 1),
+        CASE
+            -- A real group: counted for everybody, nobody asked.
+            WHEN NOT v_is_direct THEN TRUE
+            -- Lending: a transfer, not spending. Nobody counts it, nobody is
+            -- asked about it.
+            WHEN v_is_loan THEN FALSE
+            -- Carrying none of a bill leaves nothing to count either way.
+            WHEN COALESCE((s->>'amount')::DECIMAL, 0) = 0 THEN FALSE
+            -- A bill between two people. Whoever is typing it answers in the
+            -- form; the other person is asked, because they were never here.
+            WHEN (s->>'user_id')::UUID = auth.uid()
+                THEN COALESCE((s->>'stats')::BOOLEAN, TRUE)
+            ELSE NULL
+        END
+    FROM jsonb_array_elements(p_splits) s;
+
+    IF jsonb_array_length(COALESCE(p_items, '[]'::jsonb)) > 0 THEN
+        FOR v_item IN SELECT * FROM jsonb_array_elements(p_items) LOOP
+            INSERT INTO expense_items (expense_id, name, amount, shared_by)
+            VALUES (
+                p_expense_id,
+                v_item->>'name',
+                COALESCE((v_item->>'amount')::DECIMAL, 0),
+                ARRAY(SELECT jsonb_array_elements_text(COALESCE(v_item->'shared_by', '[]'::jsonb)))::UUID[]
+            );
+        END LOOP;
+    END IF;
+
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    VALUES (p_group_id, p_paid_by, 'EXPENSE', p_amount, p_expense_id, 'Paid for ' || p_title);
+
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    SELECT p_group_id, (s->>'user_id')::UUID, 'SPLIT',
+           -COALESCE((s->>'amount')::DECIMAL, 0), p_expense_id, 'Share of ' || p_title
+    FROM jsonb_array_elements(p_splits) s
+    WHERE COALESCE((s->>'is_included')::BOOLEAN, TRUE)
+      AND COALESCE((s->>'amount')::DECIMAL, 0) > 0;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.write_expense_rows(UUID, UUID, TEXT, DECIMAL, UUID, JSONB, JSONB) TO authenticated;
+
+-- The two entry points, now carrying the intent. The old signatures are dropped
+-- rather than left alongside: an extra defaulted argument makes the call
+-- ambiguous, and PostgREST answers an ambiguous call with an error.
+DROP FUNCTION IF EXISTS public.add_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL);
+
+CREATE OR REPLACE FUNCTION public.add_direct_expense(
+    p_friend_id   UUID,
+    p_amount      DECIMAL,
+    p_note        TEXT    DEFAULT '',
+    p_i_paid      BOOLEAN DEFAULT TRUE,
+    p_their_share DECIMAL DEFAULT NULL,
+    p_is_loan     BOOLEAN DEFAULT FALSE
+)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me     UUID := auth.uid();
+    v_group  UUID;
+    v_payer  UUID;
+    v_theirs DECIMAL;
+    v_mine   DECIMAL;
+    v_title  TEXT;
+    v_id     UUID;
+BEGIN
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+
+    v_theirs := ROUND(COALESCE(p_their_share, p_amount / 2), 2);
+
+    IF v_theirs < 0 OR v_theirs > ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Their share must be between zero and the full amount';
+    END IF;
+
+    v_mine  := ROUND(p_amount, 2) - v_theirs;
+    v_group := public.direct_group_with(p_friend_id);
+    v_payer := CASE WHEN p_i_paid THEN v_me ELSE p_friend_id END;
+    v_title := COALESCE(NULLIF(TRIM(p_note), ''), CASE WHEN p_is_loan THEN 'Loan' ELSE 'Shared expense' END);
+
+    INSERT INTO expenses (group_id, title, amount, paid_by, created_by,
+                          category, split_method, notes, is_loan)
+    VALUES (v_group, v_title, p_amount, v_payer, v_me, 'OTHER',
+            CASE WHEN v_theirs * 2 = ROUND(p_amount, 2) THEN 'EQUAL' ELSE 'UNEQUAL' END,
+            COALESCE(p_note, ''), COALESCE(p_is_loan, FALSE))
+    RETURNING id INTO v_id;
+
+    PERFORM public.write_expense_rows(
+        v_id, v_group, v_title, p_amount, v_payer,
+        jsonb_build_array(
+            jsonb_build_object('user_id', p_friend_id, 'amount', v_theirs, 'is_included', TRUE),
+            jsonb_build_object('user_id', v_me, 'amount', v_mine, 'is_included', TRUE, 'stats', TRUE)
+        ),
+        '[]'::jsonb
+    );
+
+    RETURN v_id;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.add_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN) TO authenticated;
+
+CREATE OR REPLACE FUNCTION public.lend_to_friend(
+    p_friend_id UUID,
+    p_amount    DECIMAL,
+    p_note      TEXT DEFAULT '',
+    p_i_lent    BOOLEAN DEFAULT TRUE
+)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+    RETURN public.add_direct_expense(
+        p_friend_id,
+        p_amount,
+        COALESCE(NULLIF(TRIM(p_note), ''), 'Loan'),
+        p_i_lent,                                        -- lender is the payer
+        CASE WHEN p_i_lent THEN p_amount ELSE 0 END,     -- borrower carries all of it
+        TRUE                                             -- and it is a loan
+    );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.lend_to_friend(UUID, DECIMAL, TEXT, BOOLEAN) TO authenticated;
+
+DROP FUNCTION IF EXISTS public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL);
+
+CREATE OR REPLACE FUNCTION public.update_direct_expense(
+    p_expense_id  UUID,
+    p_amount      DECIMAL,
+    p_note        TEXT    DEFAULT '',
+    p_i_paid      BOOLEAN DEFAULT TRUE,
+    p_their_share DECIMAL DEFAULT NULL,
+    p_is_loan     BOOLEAN DEFAULT FALSE
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me     UUID := auth.uid();
+    v_group  UUID;
+    v_friend UUID;
+    v_theirs DECIMAL;
+    v_mine   DECIMAL;
+    v_payer  UUID;
+    v_title  TEXT;
+BEGIN
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+
+    SELECT group_id INTO v_group FROM expenses WHERE id = p_expense_id;
+    IF v_group IS NULL THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM groups WHERE id = v_group AND is_direct) THEN
+        RAISE EXCEPTION 'That entry is not a direct record — edit it in its group';
+    END IF;
+    IF NOT public.is_group_member(v_group) THEN
+        RAISE EXCEPTION 'You are not part of this record';
+    END IF;
+
+    SELECT user_id INTO v_friend
+    FROM group_members WHERE group_id = v_group AND user_id <> v_me
+    LIMIT 1;
+
+    v_theirs := ROUND(COALESCE(p_their_share, p_amount / 2), 2);
+    IF v_theirs < 0 OR v_theirs > ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Their share must be between zero and the full amount';
+    END IF;
+    v_mine  := ROUND(p_amount, 2) - v_theirs;
+    v_payer := CASE WHEN p_i_paid THEN v_me ELSE v_friend END;
+    v_title := COALESCE(NULLIF(TRIM(p_note), ''),
+                        CASE WHEN p_is_loan THEN 'Loan' ELSE 'Shared expense' END);
+
+    -- Set before rewriting the splits: write_expense_rows reads it off the row.
+    UPDATE expenses SET is_loan = COALESCE(p_is_loan, FALSE) WHERE id = p_expense_id;
+
+    PERFORM public.update_expense(
+        p_expense_id, v_title, p_amount, v_payer, 'OTHER',
+        CASE WHEN v_theirs * 2 = ROUND(p_amount, 2) THEN 'EQUAL' ELSE 'UNEQUAL' END,
+        COALESCE(p_note, ''),
+        jsonb_build_array(
+            jsonb_build_object('user_id', v_friend, 'amount', v_theirs, 'is_included', TRUE),
+            jsonb_build_object('user_id', v_me, 'amount', v_mine, 'is_included', TRUE, 'stats', TRUE)
+        ),
+        '[]'::jsonb
+    );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN) TO authenticated;
