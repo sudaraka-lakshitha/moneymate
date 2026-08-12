@@ -419,8 +419,27 @@ const run = async () => {
   await visible('Friend sheet', 'add expense or loan', 'text=Add expense or loan');
   await visible('Friend sheet', 'clear deleted records', 'text=Clear deleted records');
   await visible('Friend sheet', 'remove friend', 'text=Remove friend');
+  // One settle control, not one per group: the same action used to appear twice.
+  const settleButtons = await page
+    .locator('button:has-text("Settle"), button:has-text("Record payment"), button:has-text("received")')
+    .count();
+  check('Friend sheet', 'exactly one settle control', settleButtons === 1, `${settleButtons} found`);
   await noOverflow('Friend sheet');
   await shot('07-friend-sheet');
+  await page.click('text=Add expense or loan');
+  await page.waitForTimeout(700);
+  await visible('Add record', 'sheet open', 'text=/You and Ben/');
+  await page.click('div[aria-label="What happened"] button:has-text("Shared")');
+  await page.waitForTimeout(400);
+  await visible('Add record', 'a shared bill can be categorised', 'text=Category');
+  const foodChip = await page.locator('button:has-text("Food")').count();
+  check('Add record', 'the category chips are there', foodChip >= 1, `${foodChip} found`);
+  await page.click('div[aria-label="What happened"] button:has-text("I lent")');
+  await page.waitForTimeout(400);
+  const catOnLoan = await page.locator('text=Category').count();
+  check('Add record', 'lending has no category', catOnLoan === 0, `${catOnLoan} found`);
+  await noOverflow('Add record');
+  await shot('07c-add-record');
   await page.keyboard.press('Escape');
   await page.waitForTimeout(400);
 

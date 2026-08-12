@@ -4117,3 +4117,169 @@ CREATE POLICY "Members can read splits" ON expense_splits FOR SELECT
             WHERE e.id = expense_id AND public.is_group_member(e.group_id)
         )
     );
+
+-- ========================================
+-- CATEGORIES ON RECORDS BETWEEN TWO PEOPLE
+-- ========================================
+-- Direct records were written with a hard-coded 'OTHER', so every bill split
+-- with one friend landed in the same bucket and the category breakdown said
+-- nothing for anyone who mostly splits with the same person.
+--
+-- A loan keeps OTHER: money moving between two people is not a category of
+-- spending, and the app does not offer the choice for one.
+DROP FUNCTION IF EXISTS public.add_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN);
+
+CREATE OR REPLACE FUNCTION public.add_direct_expense(
+    p_friend_id   UUID,
+    p_amount      DECIMAL,
+    p_note        TEXT    DEFAULT '',
+    p_i_paid      BOOLEAN DEFAULT TRUE,
+    p_their_share DECIMAL DEFAULT NULL,
+    p_is_loan     BOOLEAN DEFAULT FALSE,
+    p_category    TEXT    DEFAULT 'OTHER'
+)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me     UUID := auth.uid();
+    v_group  UUID;
+    v_payer  UUID;
+    v_theirs DECIMAL;
+    v_mine   DECIMAL;
+    v_title  TEXT;
+    v_cat    TEXT;
+    v_id     UUID;
+BEGIN
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+
+    v_theirs := ROUND(COALESCE(p_their_share, p_amount / 2), 2);
+
+    IF v_theirs < 0 OR v_theirs > ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Their share must be between zero and the full amount';
+    END IF;
+
+    v_mine  := ROUND(p_amount, 2) - v_theirs;
+    v_group := public.direct_group_with(p_friend_id);
+    v_payer := CASE WHEN p_i_paid THEN v_me ELSE p_friend_id END;
+    v_title := COALESCE(NULLIF(TRIM(p_note), ''), CASE WHEN p_is_loan THEN 'Loan' ELSE 'Shared expense' END);
+    v_cat   := CASE WHEN COALESCE(p_is_loan, FALSE) THEN 'OTHER' ELSE COALESCE(p_category, 'OTHER') END;
+
+    INSERT INTO expenses (group_id, title, amount, paid_by, created_by,
+                          category, split_method, notes, is_loan)
+    VALUES (v_group, v_title, p_amount, v_payer, v_me, v_cat,
+            CASE WHEN v_theirs * 2 = ROUND(p_amount, 2) THEN 'EQUAL' ELSE 'UNEQUAL' END,
+            COALESCE(p_note, ''), COALESCE(p_is_loan, FALSE))
+    RETURNING id INTO v_id;
+
+    PERFORM public.write_expense_rows(
+        v_id, v_group, v_title, p_amount, v_payer,
+        jsonb_build_array(
+            jsonb_build_object('user_id', p_friend_id, 'amount', v_theirs, 'is_included', TRUE),
+            jsonb_build_object('user_id', v_me, 'amount', v_mine, 'is_included', TRUE, 'stats', TRUE)
+        ),
+        '[]'::jsonb
+    );
+
+    RETURN v_id;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.add_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN, TEXT) TO authenticated;
+
+CREATE OR REPLACE FUNCTION public.lend_to_friend(
+    p_friend_id UUID,
+    p_amount    DECIMAL,
+    p_note      TEXT DEFAULT '',
+    p_i_lent    BOOLEAN DEFAULT TRUE
+)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+    RETURN public.add_direct_expense(
+        p_friend_id,
+        p_amount,
+        COALESCE(NULLIF(TRIM(p_note), ''), 'Loan'),
+        p_i_lent,
+        CASE WHEN p_i_lent THEN p_amount ELSE 0 END,
+        TRUE,
+        'OTHER'
+    );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.lend_to_friend(UUID, DECIMAL, TEXT, BOOLEAN) TO authenticated;
+
+DROP FUNCTION IF EXISTS public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN);
+
+CREATE OR REPLACE FUNCTION public.update_direct_expense(
+    p_expense_id  UUID,
+    p_amount      DECIMAL,
+    p_note        TEXT    DEFAULT '',
+    p_i_paid      BOOLEAN DEFAULT TRUE,
+    p_their_share DECIMAL DEFAULT NULL,
+    p_is_loan     BOOLEAN DEFAULT FALSE,
+    p_category    TEXT    DEFAULT 'OTHER'
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me     UUID := auth.uid();
+    v_group  UUID;
+    v_friend UUID;
+    v_theirs DECIMAL;
+    v_mine   DECIMAL;
+    v_payer  UUID;
+    v_title  TEXT;
+    v_cat    TEXT;
+BEGIN
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+
+    SELECT group_id INTO v_group FROM expenses WHERE id = p_expense_id;
+    IF v_group IS NULL THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM groups WHERE id = v_group AND is_direct) THEN
+        RAISE EXCEPTION 'That entry is not a direct record — edit it in its group';
+    END IF;
+    IF NOT public.is_group_member(v_group) THEN
+        RAISE EXCEPTION 'You are not part of this record';
+    END IF;
+
+    SELECT user_id INTO v_friend
+    FROM group_members WHERE group_id = v_group AND user_id <> v_me
+    LIMIT 1;
+
+    v_theirs := ROUND(COALESCE(p_their_share, p_amount / 2), 2);
+    IF v_theirs < 0 OR v_theirs > ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Their share must be between zero and the full amount';
+    END IF;
+    v_mine  := ROUND(p_amount, 2) - v_theirs;
+    v_payer := CASE WHEN p_i_paid THEN v_me ELSE v_friend END;
+    v_title := COALESCE(NULLIF(TRIM(p_note), ''),
+                        CASE WHEN p_is_loan THEN 'Loan' ELSE 'Shared expense' END);
+    v_cat   := CASE WHEN COALESCE(p_is_loan, FALSE) THEN 'OTHER' ELSE COALESCE(p_category, 'OTHER') END;
+
+    -- Set before rewriting the splits: write_expense_rows reads it off the row.
+    UPDATE expenses SET is_loan = COALESCE(p_is_loan, FALSE) WHERE id = p_expense_id;
+
+    PERFORM public.update_expense(
+        p_expense_id, v_title, p_amount, v_payer, v_cat,
+        CASE WHEN v_theirs * 2 = ROUND(p_amount, 2) THEN 'EQUAL' ELSE 'UNEQUAL' END,
+        COALESCE(p_note, ''),
+        jsonb_build_array(
+            jsonb_build_object('user_id', v_friend, 'amount', v_theirs, 'is_included', TRUE),
+            jsonb_build_object('user_id', v_me, 'amount', v_mine, 'is_included', TRUE, 'stats', TRUE)
+        ),
+        '[]'::jsonb
+    );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN, TEXT) TO authenticated;

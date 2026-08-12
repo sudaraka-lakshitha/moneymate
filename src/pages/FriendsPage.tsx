@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { useLiveRefresh } from '../lib/realtime';
-import { Expense, FriendRequest, Group, GroupMember, GroupSettlement, User } from '../types';
+import { Expense, ExpenseCategory, FriendRequest, Group, GroupMember, GroupSettlement, User } from '../types';
 import { formatLKR, formatLKRSigned, parseAmount, roundMoney } from '../lib/currency';
 import { computeFriendBalances, FriendBalanceDetail, GroupLedger, netByUser } from '../lib/balances';
 import { friendlyDbError } from '../lib/authErrors';
-import { categoryMeta } from '../lib/categories';
+import { CATEGORIES, categoryMeta } from '../lib/categories';
 import { friendlyDate } from '../lib/dates';
 import { Alert, Avatar, EmptyState, Sheet, SkeletonRows, Spinner } from '../components/ui';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
@@ -60,6 +60,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<DisplayFriend | null>(null);
   const [settleTarget, setSettleTarget] = useState<SettleTarget | null>(null);
+  const [settleChoices, setSettleChoices] = useState<SettleTarget[]>([]);
 
   const [showAdd, setShowAdd] = useState(false);
   const [addEmail, setAddEmail] = useState('');
@@ -71,6 +72,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const [lendTo, setLendTo] = useState<User | null>(null);
   const [lendAmount, setLendAmount] = useState('');
   const [lendNote, setLendNote] = useState('');
+  const [lendCategory, setLendCategory] = useState<ExpenseCategory>('OTHER');
   const [lendMode, setLendMode] = useState<'LENT' | 'BORROWED' | 'SHARED'>('LENT');
   const [iPaid, setIPaid] = useState(true);
   const [theirShare, setTheirShare] = useState('');
@@ -241,12 +243,12 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
         });
       }
 
-      // Somebody you removed should actually go. A row earns its place by being
-      // a connection, by sharing a real group, or by having money outstanding —
-      // a settled pair record from a friendship that is over is none of those,
-      // and leaving it in is why removed friends appeared to come back.
+      // A row earns its place by being a connection or by having money
+      // outstanding. Sharing a group makes somebody a group-mate, not a friend —
+      // they are already listed inside that group, and keeping them here is why
+      // people who are no longer friends never left the list.
       const visible = merged.filter(
-        (f) => f.isConnected || f.shared_group_count > 0 || Math.abs(f.net_balance) >= 0.01
+        (f) => f.isConnected || Math.abs(f.net_balance) >= 0.01
       );
 
       // Pinned first, then by how much money is at stake, then settled friends.
@@ -349,10 +351,27 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     void loadPairRecords(selected.friend.id, ids);
   }, [selected?.friend.id, loadPairRecords, directGroupByFriend]);
 
+  /** Every outstanding part of this friend's balance, largest first. */
+  const settleOptions = useMemo<SettleTarget[]>(() => {
+    if (!selected) return [];
+    return selected.perGroup
+      .filter((entry) => Math.abs(entry.net) >= 0.01)
+      .sort((a, b) => Math.abs(b.net) - Math.abs(a.net))
+      .map((entry) => ({
+        groupId: entry.groupId,
+        // The pair group's internal name would read "Between you and X" on X's
+        // own settle sheet.
+        groupName: directGroupIds.has(entry.groupId) ? undefined : entry.groupName,
+        payee: selected.friend,
+        suggestedAmount: Math.abs(entry.net),
+        // Positive means they owe me, so the payment comes from them.
+        direction: entry.net > 0 ? ('THEY_PAY' as const) : ('I_PAY' as const),
+      }));
+  }, [selected, directGroupIds]);
+
   /**
-   * Settlements post against one group, so the headline button acts on the
-   * largest outstanding balance rather than pretending to clear several at
-   * once. The per-group rows below remain available for the rest.
+   * Settlements post against one group, so the single button opens on the
+   * largest outstanding balance; the sheet lets you switch to another.
    */
   const settleablePart = useMemo(() => {
     if (!selected) return null;
@@ -470,6 +489,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     setLendMode('LENT');
     setIPaid(true);
     setTheirShare('');
+    setLendCategory('OTHER');
     setLendError(null);
     setSelected(null);
   };
@@ -485,6 +505,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     setLendNote(entry.title === 'Loan' || entry.title === 'Shared expense' ? '' : entry.title);
     setIPaid(iPaidIt);
     setTheirShare(String(theirs));
+    setLendCategory((entry.category ?? 'OTHER') as ExpenseCategory);
 
     // Reopen as it was recorded, so saving without touching anything cannot
     // quietly change what the record means. The stored flag decides, not the
@@ -563,6 +584,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
             p_i_paid: paidByMe,
             p_their_share: share,
             p_is_loan: isLoan,
+            p_category: isLoan ? 'OTHER' : lendCategory,
           })
         : await supabase.rpc('add_direct_expense', {
             p_friend_id: lendTo.id,
@@ -571,6 +593,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
             p_i_paid: paidByMe,
             p_their_share: share,
             p_is_loan: isLoan,
+            p_category: isLoan ? 'OTHER' : lendCategory,
           });
       if (rpcError) throw rpcError;
 
@@ -990,15 +1013,8 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                 type="button"
                 className="btn btn-primary btn-block btn-lg"
                 onClick={() => {
-                  setSettleTarget({
-                    groupId: settleablePart.groupId,
-                    groupName: directGroupIds.has(settleablePart.groupId)
-                      ? undefined
-                      : settleablePart.groupName,
-                    payee: selected.friend,
-                    suggestedAmount: Math.abs(settleablePart.net),
-                    direction: settleablePart.net > 0 ? 'THEY_PAY' : 'I_PAY',
-                  });
+                  setSettleTarget(settleOptions[0] ?? null);
+                  setSettleChoices(settleOptions);
                   setSelected(null);
                 }}
               >
@@ -1051,30 +1067,6 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                         >
                           {formatLKR(Math.abs(entry.net))}
                         </span>
-                        {Math.abs(entry.net) >= 0.01 && (
-                          <button
-                            type="button"
-                            className="btn btn-primary btn-sm"
-                            onClick={() => {
-                              setSettleTarget({
-                                groupId: entry.groupId,
-                                // The pair group's internal name would read
-                                // "Between you and X" on X's own settle sheet.
-                                groupName: directGroupIds.has(entry.groupId)
-                                  ? undefined
-                                  : entry.groupName,
-                                payee: selected.friend,
-                                suggestedAmount: Math.abs(entry.net),
-                                // Positive means they owe me, so the payment
-                                // comes from them — previously unrecordable.
-                                direction: entry.net > 0 ? 'THEY_PAY' : 'I_PAY',
-                              });
-                              setSelected(null);
-                            }}
-                          >
-                            {entry.net > 0 ? 'Record payment' : 'Settle'}
-                          </button>
-                        )}
                       </span>
                     </div>
                   ))}
@@ -1275,6 +1267,8 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       {settleTarget && (
         <SettleUpSheet
           target={settleTarget}
+          options={settleChoices}
+          onPick={setSettleTarget}
           onClose={() => setSettleTarget(null)}
           onSettled={() => {
             setSettleTarget(null);
@@ -1347,6 +1341,26 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
               onChange={(e) => setLendNote(e.target.value)}
               maxLength={140}
             />
+
+            {/* Only a shared bill has a category. Lending is money moving
+                between two people, not a kind of spending. */}
+            {lendMode === 'SHARED' && (
+              <div className="field">
+                <span className="label label-block">Category</span>
+                <div className="rail">
+                  {CATEGORIES.map((cat) => (
+                    <button
+                      key={cat.id}
+                      type="button"
+                      className={`chip ${lendCategory === cat.id ? 'is-selected' : ''}`}
+                      onClick={() => setLendCategory(cat.id)}
+                    >
+                      {cat.emoji} {cat.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {lendMode === 'SHARED' && (
               <>
