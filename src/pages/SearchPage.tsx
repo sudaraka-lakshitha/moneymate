@@ -15,7 +15,6 @@ interface SearchPageProps {
 
 interface Hit {
   id: string;
-  kind: 'group' | 'personal';
   title: string;
   amount: number;
   category: ExpenseCategory;
@@ -36,7 +35,6 @@ export const SearchPage: React.FC<SearchPageProps> = ({ user, onNavigate }) => {
 
   const [showFilters, setShowFilters] = useState(false);
   const [categories, setCategories] = useState<Set<string>>(new Set());
-  const [source, setSource] = useState<'all' | 'group' | 'personal'>('all');
   const [minAmount, setMinAmount] = useState('');
   const [maxAmount, setMaxAmount] = useState('');
   const [fromDate, setFromDate] = useState('');
@@ -44,35 +42,24 @@ export const SearchPage: React.FC<SearchPageProps> = ({ user, onNavigate }) => {
   const [sort, setSort] = useState<SortKey>('recent');
 
   /**
-   * Everything is loaded once and filtered in memory. A personal expense app
-   * has hundreds of rows, not millions, so this keeps typing instant and works
-   * from the offline cache without a round trip per keystroke.
+   * Everything is loaded once and filtered in memory. There are hundreds of
+   * rows here, not millions, so this keeps typing instant and works from the
+   * offline cache without a round trip per keystroke.
    */
   const load = useCallback(async () => {
     setError(null);
     try {
-      const [groupRes, personalRes] = await Promise.all([
-        supabase
-          .from('expenses')
-          .select('id, title, amount, category, created_at, notes, group_id, groups(name, is_direct), paid_by_user:users!expenses_paid_by_fkey(display_name)')
-          .eq('is_deleted', false)
-          .order('created_at', { ascending: false })
-          .limit(500),
-        supabase
-          .from('daily_expenses')
-          .select('id, title, amount, category, date, note')
-          .eq('user_id', user.id)
-          .eq('is_deleted', false)
-          .order('date', { ascending: false })
-          .limit(500),
-      ]);
+      const groupRes = await supabase
+        .from('expenses')
+        .select('id, title, amount, category, created_at, notes, group_id, groups(name, is_direct), paid_by_user:users!expenses_paid_by_fkey(display_name)')
+        .eq('is_deleted', false)
+        .order('created_at', { ascending: false })
+        .limit(500);
 
       if (groupRes.error) throw groupRes.error;
-      if (personalRes.error) throw personalRes.error;
 
       const groupHits: Hit[] = (groupRes.data ?? []).map((row: any) => ({
         id: row.id,
-        kind: 'group',
         title: row.title,
         amount: Number(row.amount),
         category: (row.category || 'OTHER') as ExpenseCategory,
@@ -85,17 +72,7 @@ export const SearchPage: React.FC<SearchPageProps> = ({ user, onNavigate }) => {
         note: row.notes,
       }));
 
-      const personalHits: Hit[] = (personalRes.data ?? []).map((row: any) => ({
-        id: row.id,
-        kind: 'personal',
-        title: row.title,
-        amount: Number(row.amount),
-        category: (row.category || 'OTHER') as ExpenseCategory,
-        date: row.date,
-        note: row.note,
-      }));
-
-      setHits([...groupHits, ...personalHits]);
+      setHits(groupHits);
     } catch (err) {
       setError(friendlyDbError(err, 'Could not load your expenses.'));
     } finally {
@@ -113,7 +90,6 @@ export const SearchPage: React.FC<SearchPageProps> = ({ user, onNavigate }) => {
     const max = maxAmount ? parseAmount(maxAmount) : null;
 
     const filtered = hits.filter((hit) => {
-      if (source !== 'all' && hit.kind !== source) return false;
       if (categories.size > 0 && !categories.has(hit.category)) return false;
       if (min !== null && hit.amount < min) return false;
       if (max !== null && hit.amount > max) return false;
@@ -133,7 +109,7 @@ export const SearchPage: React.FC<SearchPageProps> = ({ user, onNavigate }) => {
     return filtered.sort((a, b) =>
       sort === 'amount' ? b.amount - a.amount : b.date.localeCompare(a.date)
     );
-  }, [hits, query, source, categories, minAmount, maxAmount, fromDate, toDate, sort]);
+  }, [hits, query, categories, minAmount, maxAmount, fromDate, toDate, sort]);
 
   const total = useMemo(
     () => roundMoney(results.reduce((sum, hit) => sum + hit.amount, 0)),
@@ -142,13 +118,11 @@ export const SearchPage: React.FC<SearchPageProps> = ({ user, onNavigate }) => {
 
   const activeFilterCount =
     (categories.size > 0 ? 1 : 0) +
-    (source !== 'all' ? 1 : 0) +
     (minAmount || maxAmount ? 1 : 0) +
     (fromDate || toDate ? 1 : 0);
 
   const clearFilters = () => {
     setCategories(new Set());
-    setSource('all');
     setMinAmount('');
     setMaxAmount('');
     setFromDate('');
@@ -168,7 +142,7 @@ export const SearchPage: React.FC<SearchPageProps> = ({ user, onNavigate }) => {
       <header className="page-header">
         <div>
           <h1 className="page-title">Search</h1>
-          <p className="page-subtitle">Every bill and tracker entry</p>
+          <p className="page-subtitle">Every shared bill</p>
         </div>
       </header>
 
@@ -217,23 +191,6 @@ export const SearchPage: React.FC<SearchPageProps> = ({ user, onNavigate }) => {
 
       {showFilters && (
         <div className="card stack" style={{ marginBottom: 'var(--sp-4)' }}>
-          <div className="field">
-            <span className="label label-block">Source</span>
-            <div className="chip-grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
-              {(['all', 'group', 'personal'] as const).map((option) => (
-                <button
-                  key={option}
-                  type="button"
-                  className={`chip ${source === option ? 'is-selected' : ''}`}
-                  style={{ display: 'flex', justifyContent: 'center', textTransform: 'capitalize' }}
-                  onClick={() => setSource(option)}
-                >
-                  {option === 'all' ? 'Both' : option}
-                </button>
-              ))}
-            </div>
-          </div>
-
           <div className="field">
             <span className="label label-block">Categories</span>
             <div className="row" style={{ flexWrap: 'wrap', gap: 6 }}>
@@ -317,7 +274,7 @@ export const SearchPage: React.FC<SearchPageProps> = ({ user, onNavigate }) => {
           text={
             query || activeFilterCount > 0
               ? 'Try a different word, or loosen the filters.'
-              : 'Find any bill or tracker entry by name, note, group, person, category, amount or date.'
+              : 'Find any bill by name, note, group, person, category, amount or date.'
           }
         />
       ) : (
@@ -326,11 +283,10 @@ export const SearchPage: React.FC<SearchPageProps> = ({ user, onNavigate }) => {
             const meta = categoryMeta(hit.category);
             return (
               <button
-                key={`${hit.kind}-${hit.id}`}
+                key={hit.id}
                 type="button"
                 className="list-row list-row-interactive"
                 onClick={() => hit.groupId && onNavigate(`group-detail/${hit.groupId}`)}
-                disabled={hit.kind === 'personal'}
               >
                 <span className="icon-tile" style={{ width: 36, height: 36, fontSize: 17 }}>
                   {meta.emoji}
@@ -340,9 +296,7 @@ export const SearchPage: React.FC<SearchPageProps> = ({ user, onNavigate }) => {
                     {hit.title}
                   </span>
                   <span className="hint truncate" style={{ display: 'block' }}>
-                    {hit.kind === 'group'
-                      ? `${hit.groupName ?? 'Group'} · ${hit.payerName ?? 'someone'} paid`
-                      : 'Personal'}
+                    {`${hit.groupName ?? 'Between you two'} · ${hit.payerName ?? 'someone'} paid`}
                     {' · '}
                     {friendlyDate(hit.date)}
                   </span>

@@ -6,7 +6,7 @@ DECLARE
   t TEXT;
   wanted TEXT[] := ARRAY['expenses','expense_splits','ledger_entries','group_settlements',
                          'group_members','groups','group_invitations','group_join_requests',
-                         'friend_requests','daily_expenses'];
+                         'friend_requests'];
   missing TEXT := '';
   thin    TEXT := '';
   ident   CHAR;

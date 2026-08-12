@@ -127,21 +127,6 @@ export const Sheet: React.FC<SheetProps> = ({ title, onClose, children, footer }
 
 /* --------------------------------------------------------------- Progress */
 
-export const ProgressBar: React.FC<{ percent: number; color?: string }> = ({ percent, color }) => (
-  <div
-    className="progress"
-    role="progressbar"
-    aria-valuenow={Math.round(percent)}
-    aria-valuemin={0}
-    aria-valuemax={100}
-  >
-    <div
-      className="progress-bar"
-      style={{ width: `${Math.max(0, Math.min(percent, 100))}%`, background: color || 'var(--primary)' }}
-    />
-  </div>
-);
-
 /* ------------------------------------------------------------ Google mark */
 
 /** Official four-colour Google "G". An emoji here reads as a broken image. */

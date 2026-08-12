@@ -1,15 +1,14 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { useLiveRefresh } from '../lib/realtime';
-import { DailyExpense, Expense, Group, User } from '../types';
+import { Expense, Group, User } from '../types';
 import { formatLKR, formatLKRSigned, roundMoney } from '../lib/currency';
 import { computeFriendBalances, GroupLedger, netByUser } from '../lib/balances';
 import { categoryMeta } from '../lib/categories';
-import { friendlyDate, lastNDays, startOfMonthISO, toISODate } from '../lib/dates';
+import { friendlyDate } from '../lib/dates';
 import { friendlyDbError } from '../lib/authErrors';
 import { Alert, Avatar, EmptyState, Skeleton, SkeletonRows } from '../components/ui';
-import { Sparkline } from '../components/Charts';
-import { ChevronRight, Plus, Search, Users2, Wallet } from 'lucide-react';
+import { Plus, Search, Users2, Wallet } from 'lucide-react';
 
 interface HomePageProps {
   user: User;
@@ -20,7 +19,6 @@ export const HomePage: React.FC<HomePageProps> = ({ user, onNavigate }) => {
   const [groups, setGroups] = useState<Group[]>([]);
   const [groupBalances, setGroupBalances] = useState<Record<string, number>>({});
   const [recent, setRecent] = useState<Expense[]>([]);
-  const [dailyExpenses, setDailyExpenses] = useState<DailyExpense[]>([]);
   const [owedToMe, setOwedToMe] = useState(0);
   const [owedByMe, setOwedByMe] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -92,14 +90,6 @@ export const HomePage: React.FC<HomePageProps> = ({ user, onNavigate }) => {
         setOwedByMe(roundMoney(byMe));
       }
 
-      const { data: daily } = await supabase
-        .from('daily_expenses')
-        .select('*')
-        .eq('user_id', user.id)
-        .eq('is_deleted', false)
-        .gte('date', toISODate(new Date(Date.now() - 13 * 24 * 3600 * 1000)))
-        .order('date', { ascending: true });
-      setDailyExpenses((daily ?? []) as DailyExpense[]);
     } catch (err) {
       setError(friendlyDbError(err, 'Could not load your dashboard.'));
     } finally {
@@ -111,26 +101,11 @@ export const HomePage: React.FC<HomePageProps> = ({ user, onNavigate }) => {
     void load();
   }, [load]);
 
-  useLiveRefresh('home', ['expenses','ledger_entries','group_members','daily_expenses'], load);
+  useLiveRefresh('home', ['expenses','ledger_entries','group_members'], load);
 
   const netBalance = roundMoney(owedToMe - owedByMe);
   const isPositive = netBalance >= 0;
   const settled = Math.abs(netBalance) < 0.01;
-
-  const sparkValues = useMemo(() => {
-    const byDate: Record<string, number> = {};
-    for (const expense of dailyExpenses) {
-      byDate[expense.date] = (byDate[expense.date] ?? 0) + Number(expense.amount);
-    }
-    return lastNDays(14).map((date) => byDate[date] ?? 0);
-  }, [dailyExpenses]);
-
-  const monthSpend = useMemo(() => {
-    const start = startOfMonthISO();
-    return roundMoney(
-      dailyExpenses.filter((e) => e.date >= start).reduce((sum, e) => sum + Number(e.amount), 0)
-    );
-  }, [dailyExpenses]);
 
   const quickActions = [
     { icon: Plus, label: 'Add bill', route: 'groups' },
@@ -232,22 +207,6 @@ export const HomePage: React.FC<HomePageProps> = ({ user, onNavigate }) => {
           </button>
         ))}
       </div>
-
-      {monthSpend > 0 && (
-        <button
-          type="button"
-          className="card card-interactive row"
-          style={{ marginBottom: 'var(--sp-6)' }}
-          onClick={() => onNavigate('analytics')}
-        >
-          <span className="grow">
-            <span className="label">Your own spending this month</span>
-            <div className="amount-md tabular">{formatLKR(monthSpend)}</div>
-          </span>
-          <Sparkline values={sparkValues} />
-          <ChevronRight size={16} color="var(--on-surface-faint)" />
-        </button>
-      )}
 
       <div className="row-between" style={{ marginBottom: 'var(--sp-3)' }}>
         <h2 className="section-title" style={{ margin: 0 }}>

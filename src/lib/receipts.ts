@@ -4,19 +4,15 @@ import { toISODate } from './dates';
 const BUCKET = 'receipts';
 
 /**
- * Storage paths are groups/<group_id>/… or personal/<user_id>/…, which is what
- * the storage RLS policies read to decide who may see a receipt.
+ * Storage paths are groups/<group_id>/…, which is what the storage RLS policies
+ * read to decide who may see a receipt.
  */
-export type ReceiptScope =
-  | { kind: 'group'; groupId: string }
-  | { kind: 'personal'; userId: string };
+export type ReceiptScope = { kind: 'group'; groupId: string };
 
 const pathFor = (scope: ReceiptScope, fileName: string): string => {
   const stamp = Date.now();
   const safe = fileName.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-40);
-  return scope.kind === 'group'
-    ? `groups/${scope.groupId}/${stamp}-${safe}`
-    : `personal/${scope.userId}/${stamp}-${safe}`;
+  return `groups/${scope.groupId}/${stamp}-${safe}`;
 };
 
 /** Uploads a receipt image and returns its storage path (not a public URL). */

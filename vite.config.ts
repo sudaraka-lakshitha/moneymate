@@ -15,7 +15,7 @@ export default defineConfig({
         name: 'MoneyMate — Split Smarter, Settle Faster',
         short_name: 'MoneyMate',
         description:
-          'Split group expenses, settle debts and track daily spending in Sri Lankan rupees.',
+          'Split group expenses, settle debts with friends and see where shared money goes, in Sri Lankan rupees.',
         theme_color: '#0B0B16',
         background_color: '#0B0B16',
         display: 'standalone',

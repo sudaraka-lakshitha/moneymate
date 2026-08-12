@@ -163,32 +163,6 @@ CREATE TABLE IF NOT EXISTS expense_edits (
     change_summary TEXT NOT NULL
 );
 
--- ---- DAILY EXPENSES (personal tracker) ----
-CREATE TABLE IF NOT EXISTS daily_expenses (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    amount DECIMAL(14, 2) NOT NULL CHECK (amount > 0),
-    category TEXT DEFAULT 'OTHER',
-    date DATE NOT NULL,
-    note TEXT DEFAULT '',
-    receipt_url TEXT,
-    is_deleted BOOLEAN DEFAULT FALSE,
-    deleted_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ---- BUDGETS ----
-CREATE TABLE IF NOT EXISTS budgets (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    category TEXT NOT NULL,
-    monthly_limit DECIMAL(14, 2) NOT NULL CHECK (monthly_limit > 0),
-    month TEXT NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE (user_id, category, month)
-);
-
 -- ========================================
 -- INDEXES (performance)
 -- ========================================
@@ -204,8 +178,6 @@ CREATE INDEX IF NOT EXISTS idx_settlements_group ON group_settlements(group_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_group ON ledger_entries(group_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger_entries(user_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_ref ON ledger_entries(reference_id);
-CREATE INDEX IF NOT EXISTS idx_daily_user_date ON daily_expenses(user_id, date);
-CREATE INDEX IF NOT EXISTS idx_budgets_user ON budgets(user_id, month);
 -- ========================================
 -- SECURITY DEFINER HELPERS
 -- ========================================
@@ -296,8 +268,6 @@ ALTER TABLE balance_snapshots    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE settlement_cycles    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE group_settlements    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE expense_edits        ENABLE ROW LEVEL SECURITY;
-ALTER TABLE daily_expenses       ENABLE ROW LEVEL SECURITY;
-ALTER TABLE budgets              ENABLE ROW LEVEL SECURITY;
 
 -- ---- users ----
 DROP POLICY IF EXISTS "Users can read own profile" ON users;
@@ -484,22 +454,6 @@ CREATE POLICY "Members can insert edits" ON expense_edits FOR INSERT
         SELECT 1 FROM expenses e
         WHERE e.id = expense_id AND public.is_group_member(e.group_id)
     ));
-
--- ---- daily_expenses ----
-DROP POLICY IF EXISTS "Users manage own daily expenses" ON daily_expenses;
-DROP POLICY IF EXISTS "Users can manage their own daily expenses" ON daily_expenses;
-
-CREATE POLICY "Users manage own daily expenses" ON daily_expenses FOR ALL
-    USING (user_id = auth.uid())
-    WITH CHECK (user_id = auth.uid());
-
--- ---- budgets ----
-DROP POLICY IF EXISTS "Users manage own budgets" ON budgets;
-DROP POLICY IF EXISTS "Users can manage their own budgets" ON budgets;
-
-CREATE POLICY "Users manage own budgets" ON budgets FOR ALL
-    USING (user_id = auth.uid())
-    WITH CHECK (user_id = auth.uid());
 
 -- ========================================
 -- RPCs
@@ -1130,27 +1084,22 @@ BEGIN
         v_guard := 0;
 
         WHILE v_template.next_run <= CURRENT_DATE AND v_guard < 60 LOOP
-            IF v_template.group_id IS NULL THEN
-                INSERT INTO daily_expenses (user_id, title, amount, category, date, note)
-                VALUES (v_template.user_id, v_template.title, v_template.amount,
-                        v_template.category, v_template.next_run, v_template.notes);
-            ELSE
-                -- Skip silently if the user has since left the group, rather
-                -- than blocking every other template behind an exception.
-                IF public.is_group_member_of(v_template.group_id, v_template.user_id) THEN
-                    INSERT INTO expenses (group_id, title, amount, paid_by, created_by,
-                                          category, split_method, notes, is_recurring, recurrence_rule)
-                    VALUES (v_template.group_id, v_template.title, v_template.amount,
-                            COALESCE(v_template.paid_by, v_template.user_id), v_template.user_id,
-                            v_template.category, v_template.split_method, v_template.notes,
-                            TRUE, v_template.frequency)
-                    RETURNING id INTO v_expense;
+            -- Skip silently if the user has since left the group, rather than
+            -- blocking every other template behind an exception.
+            IF v_template.group_id IS NOT NULL
+               AND public.is_group_member_of(v_template.group_id, v_template.user_id) THEN
+                INSERT INTO expenses (group_id, title, amount, paid_by, created_by,
+                                      category, split_method, notes, is_recurring, recurrence_rule)
+                VALUES (v_template.group_id, v_template.title, v_template.amount,
+                        COALESCE(v_template.paid_by, v_template.user_id), v_template.user_id,
+                        v_template.category, v_template.split_method, v_template.notes,
+                        TRUE, v_template.frequency)
+                RETURNING id INTO v_expense;
 
-                    PERFORM public.write_expense_rows(
-                        v_expense, v_template.group_id, v_template.title, v_template.amount,
-                        COALESCE(v_template.paid_by, v_template.user_id), v_template.splits, '[]'::jsonb
-                    );
-                END IF;
+                PERFORM public.write_expense_rows(
+                    v_expense, v_template.group_id, v_template.title, v_template.amount,
+                    COALESCE(v_template.paid_by, v_template.user_id), v_template.splits, '[]'::jsonb
+                );
             END IF;
 
             v_created := v_created + 1;
@@ -2385,15 +2334,6 @@ ALTER TABLE expenses DROP CONSTRAINT IF EXISTS expenses_title_sane;
 ALTER TABLE expenses ADD CONSTRAINT expenses_title_sane
     CHECK (LENGTH(TRIM(title)) BETWEEN 1 AND 200) NOT VALID;
 
-ALTER TABLE daily_expenses DROP CONSTRAINT IF EXISTS daily_expenses_category_known;
-ALTER TABLE daily_expenses ADD CONSTRAINT daily_expenses_category_known
-    CHECK (category IN ('FOOD','TRANSPORT','ACCOMMODATION','ENTERTAINMENT',
-                        'SHOPPING','HEALTH','UTILITIES','OTHER')) NOT VALID;
-
-ALTER TABLE daily_expenses DROP CONSTRAINT IF EXISTS daily_expenses_title_sane;
-ALTER TABLE daily_expenses ADD CONSTRAINT daily_expenses_title_sane
-    CHECK (LENGTH(TRIM(title)) BETWEEN 1 AND 200) NOT VALID;
-
 -- NOT VALID above: the constraints bind every future write immediately, but do
 -- not re-check rows already stored. Applying this to a live database therefore
 -- cannot fail partway on historical data — which for a schema meant to be
@@ -3373,8 +3313,6 @@ BEGIN
     DELETE FROM group_invitations WHERE invited_user_id = v_me OR invited_by = v_me;
     DELETE FROM group_join_requests WHERE user_id = v_me;
     DELETE FROM recurring_expenses WHERE user_id = v_me;
-    DELETE FROM budgets            WHERE user_id = v_me;
-    DELETE FROM daily_expenses     WHERE user_id = v_me;
 
     DELETE FROM users WHERE id = v_me;
 
@@ -3409,7 +3347,7 @@ BEGIN
     FOREACH t IN ARRAY ARRAY[
         'expenses', 'expense_splits', 'ledger_entries', 'group_settlements',
         'group_members', 'groups', 'group_invitations', 'group_join_requests',
-        'friend_requests', 'daily_expenses'
+        'friend_requests'
     ] LOOP
         IF NOT EXISTS (
             SELECT 1 FROM pg_publication_tables

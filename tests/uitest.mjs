@@ -124,16 +124,6 @@ const friendRequests = [
     status: 'PENDING', created_at: today, responded_at: null, requester: caraU, addressee: meU },
 ];
 
-const daily = [
-  { id: 'd1', user_id: ME, title: 'Coffee', amount: 350, category: 'FOOD', date: day(0),
-    note: '', is_deleted: false, created_at: today, receipt_url: null },
-  { id: 'd2', user_id: ME, title: 'Bus fare', amount: 120, category: 'TRANSPORT', date: day(1),
-    note: '', is_deleted: false, created_at: today, receipt_url: null },
-  { id: 'd3', user_id: ME, title: 'Groceries', amount: 2800, category: 'SHOPPING', date: day(3),
-    note: '', is_deleted: false, created_at: today, receipt_url: null },
-  { id: 'd4', user_id: ME, title: 'Deleted snack', amount: 200, category: 'FOOD', date: day(5),
-    note: '', is_deleted: true, created_at: today, receipt_url: null },
-];
 
 const splitsFlat = expenses.flatMap((e) =>
   (e.expense_splits ?? []).map((s) => ({
@@ -154,8 +144,6 @@ const TABLES = {
   group_settlements: settlements,
   friend_requests: friendRequests,
   friend_pins: [{ user_id: ME, friend_id: BEN }],
-  daily_expenses: daily,
-  budgets: [{ id: 'b1', user_id: ME, category: 'FOOD', monthly_limit: 15000, month: day(0).slice(0, 7) }],
   group_join_requests: [],
   group_invitations: [],
   recurring_expenses: [],
@@ -433,25 +421,6 @@ const run = async () => {
   await visible('Friend sheet', 'remove friend', 'text=Remove friend');
   await noOverflow('Friend sheet');
   await shot('07-friend-sheet');
-  await page.keyboard.press('Escape');
-  await page.waitForTimeout(400);
-
-  // ---------- Tracker ----------
-  await goTab('Tracker');
-  await visible('Tracker', 'month total', 'text=Spent this month');
-  await visible('Tracker', 'entry listed', 'text=Coffee');
-  await visible('Tracker', 'budgets section', 'text=Monthly budgets');
-  await noOverflow('Tracker');
-  await shot('08-tracker');
-
-  await page.click('button[aria-label="Manage your records"]');
-  await page.waitForTimeout(900);
-  await visible('Records manager', 'sheet open', 'text=Manage your records');
-  await visible('Records manager', 'deleted entries section', 'text=Deleted entries');
-  await visible('Records manager', 'free up space section', 'text=Free up space');
-  await visible('Records manager', 'age selector', 'select');
-  await noOverflow('Records manager');
-  await shot('09-records-manager');
   await page.keyboard.press('Escape');
   await page.waitForTimeout(400);
 

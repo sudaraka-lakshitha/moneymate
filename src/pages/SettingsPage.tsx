@@ -177,7 +177,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
     const first = await confirm({
       title: 'Delete your account?',
       message:
-        'Your profile, personal expenses, budgets and friendships are erased permanently. Groups you share stay for the other members, and past shared bills remain on their records. This cannot be undone.',
+        'Your profile, your shared records and your friendships are erased permanently. Groups you share stay for the other members, and past shared bills remain on their records. This cannot be undone.',
       confirmLabel: 'Continue',
       danger: true,
     });
@@ -497,7 +497,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
           <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Delete account</span>
         </span>
         <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
-          Erases your profile, personal expenses, budgets and friendships for good. Settle every balance
+          Erases your profile, your shared records and your friendships for good. Settle every balance
           first — an unsettled account cannot be deleted, because it would leave somebody else's books
           short.
         </p>

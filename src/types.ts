@@ -109,28 +109,6 @@ export type ExpenseCategory =
   | 'UTILITIES'
   | 'OTHER';
 
-export interface DailyExpense {
-  id: string;
-  user_id: string;
-  title: string;
-  amount: number;
-  category: ExpenseCategory;
-  date: string;
-  note?: string;
-  receipt_url?: string | null;
-  is_deleted: boolean;
-  created_at: string;
-}
-
-export interface Budget {
-  id: string;
-  user_id: string;
-  category: ExpenseCategory;
-  monthly_limit: number;
-  /** yyyy-MM */
-  month: string;
-}
-
 export interface GroupSettlement {
   id: string;
   group_id: string;
