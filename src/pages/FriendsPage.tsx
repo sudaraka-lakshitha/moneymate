@@ -76,12 +76,17 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const [lendMode, setLendMode] = useState<'LENT' | 'BORROWED' | 'SHARED'>('LENT');
   const [iPaid, setIPaid] = useState(true);
   const [theirShare, setTheirShare] = useState('');
+  /** Both of you put money in. What you paid; theirs is whatever is left. */
+  const [bothPaid, setBothPaid] = useState(false);
+  const [myPayment, setMyPayment] = useState('');
   const [lending, setLending] = useState(false);
   const [lendError, setLendError] = useState<string | null>(null);
   const [editingEntry, setEditingEntry] = useState<Expense | null>(null);
   const [directEntries, setDirectEntries] = useState<Expense[]>([]);
   /** expenseId -> friendId -> their stored share, so editing never guesses. */
   const [directShares, setDirectShares] = useState<Record<string, Record<string, number>>>({});
+  /** expenseId -> what I put in, so a record we both paid for reopens as it is. */
+  const [directPaid, setDirectPaid] = useState<Record<string, Record<string, number>>>({});
   const [busyEntry, setBusyEntry] = useState<string | null>(null);
   const [removingFriend, setRemovingFriend] = useState(false);
   const [clearingDeleted, setClearingDeleted] = useState(false);
@@ -156,21 +161,35 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
         // The stored split, not a guess. Opening an edit without it would fall
         // back to an even split and silently halve a loan on save.
         if (entries.length > 0) {
-          const { data: splitData } = await supabase
-            .from('expense_splits')
-            .select('expense_id, user_id, amount')
-            .in('expense_id', entries.map((x) => x.id));
+          const ids = entries.map((x) => x.id);
+          const [{ data: splitData }, { data: payerData }] = await Promise.all([
+            supabase
+              .from('expense_splits')
+              .select('expense_id, user_id, amount')
+              .in('expense_id', ids),
+            // What each of you actually put in, which is a separate question
+            // from what each of you owes.
+            supabase.from('expense_payers').select('expense_id, user_id, amount').in('expense_id', ids),
+          ]);
           const map: Record<string, Record<string, number>> = {};
           for (const row of (splitData ?? []) as any[]) {
             (map[row.expense_id] ||= {})[row.user_id] = Number(row.amount);
           }
           setDirectShares(map);
+
+          const paid: Record<string, Record<string, number>> = {};
+          for (const row of (payerData ?? []) as any[]) {
+            (paid[row.expense_id] ||= {})[row.user_id] = Number(row.amount);
+          }
+          setDirectPaid(paid);
         } else {
           setDirectShares({});
+          setDirectPaid({});
         }
       } else {
         setDirectEntries([]);
         setDirectShares({});
+        setDirectPaid({});
       }
       const byGroup: Record<string, GroupMember[]> = {};
       for (const row of (memberRes.data ?? []) as any[]) {
@@ -489,6 +508,8 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     setLendMode('LENT');
     setIPaid(true);
     setTheirShare('');
+    setBothPaid(false);
+    setMyPayment('');
     setLendCategory('OTHER');
     setLendError(null);
     setSelected(null);
@@ -506,6 +527,14 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     setIPaid(iPaidIt);
     setTheirShare(String(theirs));
     setLendCategory((entry.category ?? 'OTHER') as ExpenseCategory);
+
+    // A record you both put money into reopens showing both amounts, rather
+    // than collapsing onto whoever paid more and losing the other half.
+    const paidRows = directPaid[entry.id] ?? {};
+    const mineIn = paidRows[user.id] ?? 0;
+    const both = Object.values(paidRows).filter((v) => v > 0).length > 1;
+    setBothPaid(both);
+    setMyPayment(both ? String(mineIn) : '');
 
     // Reopen as it was recorded, so saving without touching anything cannot
     // quietly change what the record means. The stored flag decides, not the
@@ -574,6 +603,17 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       return;
     }
 
+    // Null unless you both put money in, which the database reads as "one of
+    // you paid all of it", chosen by p_i_paid — the behaviour that was here
+    // before contributions existed.
+    const mineIn =
+      lendMode === 'SHARED' && bothPaid ? roundMoney(parseAmount(myPayment)) : null;
+
+    if (mineIn !== null && (mineIn < 0 || mineIn > amount)) {
+      setLendError(`What you paid must be between Rs. 0 and ${formatLKR(amount)}.`);
+      return;
+    }
+
     setLending(true);
     try {
       const { error: rpcError } = editingEntry
@@ -585,6 +625,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
             p_their_share: share,
             p_is_loan: isLoan,
             p_category: isLoan ? 'OTHER' : lendCategory,
+            p_my_payment: mineIn,
           })
         : await supabase.rpc('add_direct_expense', {
             p_friend_id: lendTo.id,
@@ -594,17 +635,22 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
             p_their_share: share,
             p_is_loan: isLoan,
             p_category: isLoan ? 'OTHER' : lendCategory,
+            p_my_payment: mineIn,
           });
       if (rpcError) throw rpcError;
 
-      // What changes hands is their share when I paid, my share when they did.
-      const delta = paidByMe ? share : amount - share;
+      // What changes hands is the gap between what you put in and what was
+      // yours to pay. With one payer that reduces to their share, or to yours
+      // when they paid — the two cases this used to handle separately.
+      const myShare = roundMoney(amount - share);
+      const myPaid = mineIn ?? (paidByMe ? amount : 0);
+      const delta = roundMoney(myPaid - myShare);
       toast.success(
-        delta === 0
-          ? 'Recorded.'
-          : paidByMe
+        Math.abs(delta) < 0.01
+          ? 'Recorded — you are square on this one.'
+          : delta > 0
             ? `Recorded — ${lendTo.display_name} owes you ${formatLKR(delta)}.`
-            : `Recorded — you owe ${lendTo.display_name} ${formatLKR(delta)}.`
+            : `Recorded — you owe ${lendTo.display_name} ${formatLKR(-delta)}.`
       );
       setLendTo(null);
       setEditingEntry(null);
@@ -1367,21 +1413,71 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                 <div className="segmented" role="group" aria-label="Who paid">
                   <button
                     type="button"
-                    className={`segmented-option ${iPaid ? 'is-active' : ''}`}
-                    onClick={() => setIPaid(true)}
-                    aria-pressed={iPaid}
+                    className={`segmented-option ${iPaid && !bothPaid ? 'is-active' : ''}`}
+                    onClick={() => {
+                      setIPaid(true);
+                      setBothPaid(false);
+                    }}
+                    aria-pressed={iPaid && !bothPaid}
                   >
                     I paid
                   </button>
                   <button
                     type="button"
-                    className={`segmented-option ${!iPaid ? 'is-active' : ''}`}
-                    onClick={() => setIPaid(false)}
-                    aria-pressed={!iPaid}
+                    className={`segmented-option ${!iPaid && !bothPaid ? 'is-active' : ''}`}
+                    onClick={() => {
+                      setIPaid(false);
+                      setBothPaid(false);
+                    }}
+                    aria-pressed={!iPaid && !bothPaid}
                   >
                     {lendTo.display_name.split(' ')[0]} paid
                   </button>
+                  {/* The case the app could not record: you put in 1,000 and
+                      they put in 500 of a 1,500 bill, and you still split it
+                      down the middle. */}
+                  <button
+                    type="button"
+                    className={`segmented-option ${bothPaid ? 'is-active' : ''}`}
+                    onClick={() => {
+                      setBothPaid(true);
+                      setLendError(null);
+                    }}
+                    aria-pressed={bothPaid}
+                  >
+                    Both did
+                  </button>
                 </div>
+
+                {bothPaid && (
+                  <div className="field">
+                    <label className="label label-block" htmlFor="my-payment">
+                      What you put in
+                    </label>
+                    <div className="input-prefixed">
+                      <span className="input-prefix">Rs.</span>
+                      <input
+                        id="my-payment"
+                        type="text"
+                        inputMode="decimal"
+                        className="input tabular"
+                        placeholder="0.00"
+                        value={myPayment}
+                        onChange={(e) => {
+                          setMyPayment(e.target.value);
+                          setLendError(null);
+                        }}
+                      />
+                    </div>
+                    <span className="hint">
+                      {parseAmount(lendAmount) > 0
+                        ? `${lendTo.display_name.split(' ')[0]} put in the rest: ${formatLKR(
+                            roundMoney(parseAmount(lendAmount) - parseAmount(myPayment))
+                          )}.`
+                        : 'Enter the bill above first.'}
+                    </span>
+                  </div>
+                )}
 
                 <div className="field">
                   <label className="label label-block" htmlFor="their-share">
@@ -1411,6 +1507,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                     theirShareRaw={theirShare}
                     friendName={lendTo.display_name.split(' ')[0]}
                     iPaid={iPaid}
+                    myPaymentRaw={bothPaid ? myPayment : null}
                   />
                 </div>
               </>
@@ -1478,12 +1575,22 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
  * where an uneven split goes wrong, so the remainder is computed and displayed
  * before the record is saved — including when it does not add up.
  */
+/**
+ * What the record will mean once it is saved: what each of you put in, what
+ * each of you owes, and the one line that matters — who ends up owing whom.
+ *
+ * The two are genuinely independent. Paying 1,000 of a 1,500 bill you split
+ * evenly leaves you 250 up; the shares alone cannot say that, and neither can
+ * the payments.
+ */
 const SplitPreview: React.FC<{
   total: number;
   theirShareRaw: string;
   friendName: string;
   iPaid: boolean;
-}> = ({ total, theirShareRaw, friendName, iPaid }) => {
+  /** What I put in, when we both did. Null means one of us paid all of it. */
+  myPaymentRaw?: string | null;
+}> = ({ total, theirShareRaw, friendName, iPaid, myPaymentRaw = null }) => {
   if (total <= 0) {
     return <span className="hint">Leave blank to split it down the middle.</span>;
   }
@@ -1491,15 +1598,42 @@ const SplitPreview: React.FC<{
   const typed = theirShareRaw.trim();
   const theirs = typed ? roundMoney(parseAmount(typed)) : roundMoney(total / 2);
   const mine = roundMoney(total - theirs);
-  const invalid = theirs < 0 || theirs > total;
 
-  // What actually changes hands: their share if I paid, my share if they did.
-  // This is the line that moves when you flip who paid — the shares alone do
-  // not, which made the payer toggle look like it did nothing.
-  const owed = iPaid ? theirs : mine;
+  const split = myPaymentRaw !== null;
+  const myPaid = split ? roundMoney(parseAmount(myPaymentRaw)) : iPaid ? total : 0;
+  const theirPaid = roundMoney(total - myPaid);
+
+  const invalid = theirs < 0 || theirs > total || myPaid < 0 || myPaid > total;
+
+  // Put in minus owed. With one payer this is their share, or yours when they
+  // paid — the two cases this used to handle separately.
+  const owed = roundMoney(myPaid - mine);
 
   return (
     <div className="stack-sm" style={{ marginTop: 'var(--sp-2)' }}>
+      {split && (
+        <>
+          <div className="row-between">
+            <span className="hint">You put in</span>
+            <span
+              className={`tabular ${invalid ? 'text-negative' : ''}`}
+              style={{ fontSize: '0.85rem', fontWeight: 700 }}
+            >
+              {formatLKR(myPaid)}
+            </span>
+          </div>
+          <div className="row-between">
+            <span className="hint">{friendName} put in</span>
+            <span
+              className={`tabular ${invalid ? 'text-negative' : ''}`}
+              style={{ fontSize: '0.85rem', fontWeight: 700 }}
+            >
+              {formatLKR(theirPaid)}
+            </span>
+          </div>
+        </>
+      )}
+
       <div className="row-between">
         <span className="hint">{friendName}&rsquo;s share</span>
         <span
@@ -1526,24 +1660,28 @@ const SplitPreview: React.FC<{
         >
           <span className="hint">Result</span>
           <span
-            className={`tabular ${owed < 0.01 ? 'text-neutral' : iPaid ? 'text-positive' : 'text-negative'}`}
+            className={`tabular ${
+              Math.abs(owed) < 0.01 ? 'text-neutral' : owed > 0 ? 'text-positive' : 'text-negative'
+            }`}
             style={{ fontSize: '0.85rem', fontWeight: 700 }}
           >
-            {owed < 0.01
+            {Math.abs(owed) < 0.01
               ? 'Nothing owed'
-              : iPaid
+              : owed > 0
                 ? `${friendName} owes you ${formatLKR(owed)}`
-                : `You owe ${friendName} ${formatLKR(owed)}`}
+                : `You owe ${friendName} ${formatLKR(-owed)}`}
           </span>
         </div>
       )}
 
       <span className="hint">
         {invalid
-          ? `That is more than the bill — ${friendName}'s share must be between Rs. 0 and ${formatLKR(total)}.`
-          : typed
-            ? `Adds up to ${formatLKR(total)}.`
-            : 'Split down the middle. Type a number to change it.'}
+          ? `That is more than the bill — every amount must be between Rs. 0 and ${formatLKR(total)}.`
+          : split
+            ? `The two payments add up to ${formatLKR(total)}.`
+            : typed
+              ? `Adds up to ${formatLKR(total)}.`
+              : 'Split down the middle. Type a number to change it.'}
       </span>
     </div>
   );

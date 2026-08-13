@@ -4,9 +4,9 @@
 DO $t$
 DECLARE
   t TEXT;
-  wanted TEXT[] := ARRAY['expenses','expense_splits','ledger_entries','group_settlements',
-                         'group_members','groups','group_invitations','group_join_requests',
-                         'friend_requests'];
+  wanted TEXT[] := ARRAY['expenses','expense_splits','expense_payers','ledger_entries',
+                         'group_settlements','group_members','groups','group_invitations',
+                         'group_join_requests','friend_requests'];
   missing TEXT := '';
   thin    TEXT := '';
   ident   CHAR;

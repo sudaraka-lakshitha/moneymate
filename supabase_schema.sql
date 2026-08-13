@@ -1027,6 +1027,9 @@ CREATE TABLE IF NOT EXISTS recurring_expenses (
     paid_by      UUID REFERENCES users(id) ON DELETE SET NULL,
     split_method TEXT DEFAULT 'EQUAL',
     splits       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    -- Who puts money in, beside who owes what. NULL means the one payer named
+    -- in paid_by covers the whole thing.
+    payers       JSONB,
     frequency    TEXT NOT NULL CHECK (frequency IN ('DAILY', 'WEEKLY', 'MONTHLY')),
     next_run     DATE NOT NULL,
     last_run     DATE,
@@ -1098,7 +1101,8 @@ BEGIN
 
                 PERFORM public.write_expense_rows(
                     v_expense, v_template.group_id, v_template.title, v_template.amount,
-                    COALESCE(v_template.paid_by, v_template.user_id), v_template.splits, '[]'::jsonb
+                    COALESCE(v_template.paid_by, v_template.user_id), v_template.splits, '[]'::jsonb,
+                    v_template.payers
                 );
             END IF;
 
@@ -4473,3 +4477,696 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION public.update_expense(UUID, TEXT, DECIMAL, UUID, TEXT, TEXT, TEXT, JSONB, JSONB) TO authenticated;
+
+-- ========================================
+-- SEVERAL PEOPLE PAYING FOR ONE BILL
+-- ========================================
+-- Two friends buy a 1,500 item. One puts in 1,000, the other 500, and they
+-- split it evenly. The app could not record that, because the database
+-- remembered exactly one payer: expenses.paid_by is a single UUID and
+-- write_expense_rows posted one EXPENSE credit for the whole amount.
+--
+-- Naming either person as "the payer" is wrong by 500 in opposite directions,
+-- and wrong in a way nothing would flag — the ledger still nets to zero either
+-- way, so the balance just quietly reads 750 instead of 250.
+--
+-- Shares already live one-row-per-person in expense_splits. Contributions get
+-- the same treatment. Who owes what and who put money in are separate
+-- questions, and they always were; only one of them had somewhere to live.
+CREATE TABLE IF NOT EXISTS expense_payers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    expense_id UUID NOT NULL REFERENCES expenses(id) ON DELETE CASCADE,
+    -- SET NULL, not CASCADE, deliberately. If a deleted account took its
+    -- contribution rows with it, the "who paid what" chart would stop adding up
+    -- to what the group spent — the same fault that once lost a departed
+    -- member's spending. A NULL here collects into the unnamed bucket the chart
+    -- already draws, exactly as expenses.paid_by does.
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    amount DECIMAL(14, 2) NOT NULL CHECK (amount > 0),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_payers_expense ON expense_payers(expense_id);
+CREATE INDEX IF NOT EXISTS idx_payers_user ON expense_payers(user_id);
+
+-- One row per person per bill. Partial, because a NULL user_id is a departed
+-- account rather than a duplicate, and there can be several of those.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payers_unique
+    ON expense_payers(expense_id, user_id) WHERE user_id IS NOT NULL;
+
+ALTER TABLE expense_payers ENABLE ROW LEVEL SECURITY;
+
+-- Mirrors expense_splits: the group's members read and write them, and the
+-- person who added the bill can clear them up if the save fails halfway.
+DROP POLICY IF EXISTS "Members can read payers" ON expense_payers;
+DROP POLICY IF EXISTS "Members can insert payers" ON expense_payers;
+DROP POLICY IF EXISTS "Members can delete payers" ON expense_payers;
+
+CREATE POLICY "Members can read payers" ON expense_payers FOR SELECT
+    USING (
+        user_id = auth.uid()
+        OR EXISTS (
+            SELECT 1 FROM expenses e
+            WHERE e.id = expense_id AND public.is_group_member(e.group_id)
+        )
+    );
+CREATE POLICY "Members can insert payers" ON expense_payers FOR INSERT
+    WITH CHECK (EXISTS (
+        SELECT 1 FROM expenses e
+        WHERE e.id = expense_id AND public.is_group_member(e.group_id)
+    ));
+CREATE POLICY "Members can delete payers" ON expense_payers FOR DELETE
+    USING (EXISTS (
+        SELECT 1 FROM expenses e
+        WHERE e.id = expense_id AND e.created_by = auth.uid()
+    ));
+
+-- Paying for a bill you took no share of — settling a friend's phone bill, or
+-- fronting a group booking you are not on — must not stop being readable when
+-- you leave the group. has_own_split covers the share side; this covers the
+-- money side. SECURITY DEFINER for the same reason: the expenses policy would
+-- otherwise consult a table whose own policy consults expenses.
+CREATE OR REPLACE FUNCTION public.is_payer(p_expense_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM expense_payers
+        WHERE expense_id = p_expense_id AND user_id = auth.uid()
+    );
+$$;
+
+GRANT EXECUTE ON FUNCTION public.is_payer(UUID) TO authenticated;
+
+DROP POLICY IF EXISTS "Group members can read expenses" ON expenses;
+CREATE POLICY "Group members can read expenses" ON expenses FOR SELECT
+    USING (
+        public.is_group_member(group_id)
+        OR public.has_own_split(id)
+        OR public.is_payer(id)
+    );
+
+-- Contributions for every bill that predates the table, taken from the single
+-- payer each of them recorded. Once: correcting one of these afterwards must
+-- not be undone by the next deploy.
+DO $payers_once$
+BEGIN
+    IF EXISTS (SELECT 1 FROM schema_migrations WHERE key = 'expense_payers_from_paid_by') THEN
+        RETURN;
+    END IF;
+
+    INSERT INTO expense_payers (expense_id, user_id, amount)
+    SELECT e.id, e.paid_by, e.amount
+    FROM expenses e
+    WHERE NOT EXISTS (SELECT 1 FROM expense_payers p WHERE p.expense_id = e.id);
+
+    INSERT INTO schema_migrations (key) VALUES ('expense_payers_from_paid_by');
+END
+$payers_once$;
+
+-- write_expense_rows, posting one EXPENSE credit per payer instead of one for
+-- the lot.
+--
+-- The ledger invariant is untouched, and that is the whole point: contributions
+-- sum to the total and shares sum to the total, so every group still nets to
+-- exactly zero per person. member_balance, group_is_settled, expense_is_locked,
+-- the settlement functions and the net-per-user reversal inside update_expense
+-- and delete_expense never learn that anything changed.
+--
+-- p_payers is NULL for a bill one person paid for, which is most of them, and
+-- the single credit is written for p_paid_by exactly as before.
+DROP FUNCTION IF EXISTS public.write_expense_rows(UUID, UUID, TEXT, DECIMAL, UUID, JSONB, JSONB);
+
+CREATE OR REPLACE FUNCTION public.write_expense_rows(
+    p_expense_id UUID,
+    p_group_id   UUID,
+    p_title      TEXT,
+    p_amount     DECIMAL,
+    p_paid_by    UUID,
+    p_splits     JSONB,
+    p_items      JSONB,
+    p_payers     JSONB DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_item        JSONB;
+    v_split_total DECIMAL(14,2) := 0;
+    v_paid_total  DECIMAL(14,2) := 0;
+    v_negatives   INT := 0;
+    v_payers      JSONB;
+    v_stranger    UUID;
+    v_principal   UUID;
+BEGIN
+    SELECT COUNT(*) INTO v_negatives
+    FROM jsonb_array_elements(p_splits) s
+    WHERE COALESCE((s->>'amount')::DECIMAL, 0) < 0;
+
+    IF v_negatives > 0 THEN
+        RAISE EXCEPTION 'A split cannot be a negative amount';
+    END IF;
+
+    SELECT COALESCE(SUM((s->>'amount')::DECIMAL), 0) INTO v_split_total
+    FROM jsonb_array_elements(p_splits) s
+    WHERE (s->>'is_included')::BOOLEAN;
+
+    IF ROUND(v_split_total, 2) <> ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Split total (%) does not equal the expense amount (%)', v_split_total, p_amount;
+    END IF;
+
+    -- One payer for the whole thing unless told otherwise.
+    v_payers := COALESCE(NULLIF(p_payers, 'null'::jsonb), '[]'::jsonb);
+    IF jsonb_array_length(v_payers) = 0 THEN
+        v_payers := jsonb_build_array(
+            jsonb_build_object('user_id', p_paid_by, 'amount', ROUND(p_amount, 2))
+        );
+    END IF;
+
+    -- What people put in has to add up to the bill for the same reason the
+    -- shares do: anything else invents or destroys money.
+    SELECT COALESCE(SUM(ROUND((x->>'amount')::DECIMAL, 2)), 0) INTO v_paid_total
+    FROM jsonb_array_elements(v_payers) x;
+
+    IF ROUND(v_paid_total, 2) <> ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'The amounts paid (%) do not add up to the bill (%)', v_paid_total, p_amount;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM jsonb_array_elements(v_payers) x
+        WHERE COALESCE((x->>'amount')::DECIMAL, 0) <= 0
+    ) THEN
+        RAISE EXCEPTION 'Everyone listed as paying must have paid something';
+    END IF;
+
+    IF (SELECT COUNT(DISTINCT x->>'user_id') FROM jsonb_array_elements(v_payers) x)
+       <> jsonb_array_length(v_payers) THEN
+        RAISE EXCEPTION 'The same person is listed as paying twice';
+    END IF;
+
+    SELECT (x->>'user_id')::UUID INTO v_stranger
+    FROM jsonb_array_elements(v_payers) x
+    WHERE NOT public.is_group_member_of(p_group_id, (x->>'user_id')::UUID)
+    LIMIT 1;
+
+    IF v_stranger IS NOT NULL THEN
+        RAISE EXCEPTION 'Somebody listed as paying is not a member of this group';
+    END IF;
+
+    INSERT INTO expense_splits (expense_id, user_id, is_included, amount, percentage, shares)
+    SELECT
+        p_expense_id,
+        (s->>'user_id')::UUID,
+        COALESCE((s->>'is_included')::BOOLEAN, TRUE),
+        COALESCE((s->>'amount')::DECIMAL, 0),
+        COALESCE((s->>'percentage')::DECIMAL, 0),
+        COALESCE((s->>'shares')::INT, 1)
+    FROM jsonb_array_elements(p_splits) s;
+
+    INSERT INTO expense_payers (expense_id, user_id, amount)
+    SELECT p_expense_id, (x->>'user_id')::UUID, ROUND((x->>'amount')::DECIMAL, 2)
+    FROM jsonb_array_elements(v_payers) x;
+
+    IF jsonb_array_length(COALESCE(p_items, '[]'::jsonb)) > 0 THEN
+        FOR v_item IN SELECT * FROM jsonb_array_elements(p_items) LOOP
+            INSERT INTO expense_items (expense_id, name, amount, shared_by)
+            VALUES (
+                p_expense_id,
+                v_item->>'name',
+                COALESCE((v_item->>'amount')::DECIMAL, 0),
+                ARRAY(SELECT jsonb_array_elements_text(COALESCE(v_item->'shared_by', '[]'::jsonb)))::UUID[]
+            );
+        END LOOP;
+    END IF;
+
+    -- expenses.paid_by stays, holding whoever put in the most. Four screens
+    -- embed users!expenses_paid_by_fkey to show a face beside the bill, and a
+    -- null there would break them at request time rather than at compile time.
+    SELECT user_id INTO v_principal
+    FROM expense_payers WHERE expense_id = p_expense_id
+    ORDER BY amount DESC, user_id LIMIT 1;
+
+    UPDATE expenses SET paid_by = v_principal
+    WHERE id = p_expense_id AND paid_by IS DISTINCT FROM v_principal;
+
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    SELECT p_group_id, (x->>'user_id')::UUID, 'EXPENSE',
+           ROUND((x->>'amount')::DECIMAL, 2), p_expense_id, 'Paid for ' || p_title
+    FROM jsonb_array_elements(v_payers) x;
+
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    SELECT p_group_id, (s->>'user_id')::UUID, 'SPLIT',
+           -COALESCE((s->>'amount')::DECIMAL, 0), p_expense_id, 'Share of ' || p_title
+    FROM jsonb_array_elements(p_splits) s
+    WHERE COALESCE((s->>'is_included')::BOOLEAN, TRUE)
+      AND COALESCE((s->>'amount')::DECIMAL, 0) > 0;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.write_expense_rows(UUID, UUID, TEXT, DECIMAL, UUID, JSONB, JSONB, JSONB) TO authenticated;
+
+-- save_expense and update_expense, carrying the contributions through.
+--
+-- Dropping the old signatures first is not optional: an extra defaulted
+-- argument makes the PostgREST call ambiguous and it errors rather than
+-- choosing, the same trap already handled for add_direct_expense.
+DROP FUNCTION IF EXISTS public.save_expense(UUID, TEXT, DECIMAL, UUID, TEXT, TEXT, TEXT, JSONB, JSONB);
+
+CREATE OR REPLACE FUNCTION public.save_expense(
+    p_group_id     UUID,
+    p_title        TEXT,
+    p_amount       DECIMAL,
+    p_paid_by      UUID,
+    p_category     TEXT,
+    p_split_method TEXT,
+    p_notes        TEXT,
+    p_splits       JSONB,
+    p_items        JSONB DEFAULT '[]'::jsonb,
+    p_payers       JSONB DEFAULT NULL
+)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_expense_id UUID;
+BEGIN
+    IF NOT public.is_group_member(p_group_id) THEN
+        RAISE EXCEPTION 'You are not a member of this group';
+    END IF;
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+    IF NOT public.is_group_member_of(p_group_id, p_paid_by) THEN
+        RAISE EXCEPTION 'The payer is not a member of this group';
+    END IF;
+
+    INSERT INTO expenses (group_id, title, amount, paid_by, created_by, on_behalf_of,
+                          category, split_method, notes)
+    VALUES (
+        p_group_id, p_title, p_amount, p_paid_by, auth.uid(),
+        CASE WHEN p_paid_by <> auth.uid() THEN p_paid_by END,
+        COALESCE(p_category, 'OTHER'), COALESCE(p_split_method, 'EQUAL'), COALESCE(p_notes, '')
+    )
+    RETURNING id INTO v_expense_id;
+
+    PERFORM public.write_expense_rows(
+        v_expense_id, p_group_id, p_title, p_amount, p_paid_by, p_splits, p_items, p_payers);
+
+    RETURN v_expense_id;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.save_expense(UUID, TEXT, DECIMAL, UUID, TEXT, TEXT, TEXT, JSONB, JSONB, JSONB) TO authenticated;
+
+DROP FUNCTION IF EXISTS public.update_expense(UUID, TEXT, DECIMAL, UUID, TEXT, TEXT, TEXT, JSONB, JSONB);
+
+CREATE OR REPLACE FUNCTION public.update_expense(
+    p_expense_id   UUID,
+    p_title        TEXT,
+    p_amount       DECIMAL,
+    p_paid_by      UUID,
+    p_category     TEXT,
+    p_split_method TEXT,
+    p_notes        TEXT,
+    p_splits       JSONB,
+    p_items        JSONB DEFAULT '[]'::jsonb,
+    p_payers       JSONB DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_old      expenses%ROWTYPE;
+    v_old_snap JSONB;
+    v_new_snap JSONB;
+    v_old_pay  JSONB;
+    v_summary  TEXT := '';
+BEGIN
+    SELECT * INTO v_old FROM expenses WHERE id = p_expense_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+    IF v_old.is_deleted THEN
+        RAISE EXCEPTION 'This expense has been deleted';
+    END IF;
+    IF v_old.created_by <> auth.uid() AND NOT public.is_group_admin(v_old.group_id) THEN
+        RAISE EXCEPTION 'Only the person who added this expense, or a group admin, can edit it';
+    END IF;
+    IF public.expense_is_locked(p_expense_id) THEN
+        RAISE EXCEPTION 'This expense has already been settled and cannot be changed. Add a new expense to correct it.';
+    END IF;
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+
+    SELECT COALESCE(jsonb_agg(jsonb_build_object('user_id', user_id, 'amount', amount)), '[]'::jsonb)
+    INTO v_old_pay
+    FROM expense_payers WHERE expense_id = p_expense_id;
+
+    v_old_snap := jsonb_build_object(
+        'title', v_old.title, 'amount', v_old.amount, 'paid_by', v_old.paid_by,
+        'category', v_old.category, 'split_method', v_old.split_method, 'notes', v_old.notes,
+        'payers', v_old_pay,
+        'splits', (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                       'user_id', user_id, 'amount', amount, 'is_included', is_included)), '[]'::jsonb)
+                   FROM expense_splits WHERE expense_id = p_expense_id)
+    );
+
+    IF v_old.title <> p_title THEN
+        v_summary := v_summary || format('title "%s" → "%s"; ', v_old.title, p_title);
+    END IF;
+    IF ROUND(v_old.amount, 2) <> ROUND(p_amount, 2) THEN
+        v_summary := v_summary || format('amount %s → %s; ', v_old.amount, p_amount);
+    END IF;
+    IF v_old.paid_by IS DISTINCT FROM p_paid_by THEN
+        v_summary := v_summary || 'payer changed; ';
+    END IF;
+    IF v_old.split_method <> p_split_method THEN
+        v_summary := v_summary || format('split %s → %s; ', v_old.split_method, p_split_method);
+    END IF;
+    IF v_summary = '' THEN
+        v_summary := 'splits adjusted';
+    END IF;
+
+    -- Zero out whatever this expense currently contributes, however many edits
+    -- it has already been through. Nothing is deleted: the ledger stays
+    -- append-only and auditable.
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    SELECT group_id, user_id, 'EDIT_REVERSAL', -SUM(amount), p_expense_id,
+           'Reversal for edit of ' || v_old.title
+    FROM ledger_entries
+    WHERE reference_id = p_expense_id
+    GROUP BY group_id, user_id
+    HAVING SUM(amount) <> 0;
+
+    DELETE FROM expense_splits WHERE expense_id = p_expense_id;
+    DELETE FROM expense_payers WHERE expense_id = p_expense_id;
+    DELETE FROM expense_items  WHERE expense_id = p_expense_id;
+
+    UPDATE expenses
+    SET title = p_title, amount = p_amount, paid_by = p_paid_by,
+        on_behalf_of = CASE WHEN p_paid_by <> auth.uid() THEN p_paid_by END,
+        category = COALESCE(p_category, 'OTHER'),
+        split_method = COALESCE(p_split_method, 'EQUAL'),
+        notes = COALESCE(p_notes, ''),
+        updated_at = NOW()
+    WHERE id = p_expense_id;
+
+    PERFORM public.write_expense_rows(
+        p_expense_id, v_old.group_id, p_title, p_amount, p_paid_by, p_splits, p_items, p_payers);
+
+    v_new_snap := jsonb_build_object(
+        'title', p_title, 'amount', p_amount, 'paid_by', p_paid_by,
+        'category', p_category, 'split_method', p_split_method, 'notes', p_notes,
+        'payers', (SELECT COALESCE(jsonb_agg(jsonb_build_object('user_id', user_id, 'amount', amount)), '[]'::jsonb)
+                   FROM expense_payers WHERE expense_id = p_expense_id),
+        'splits', p_splits
+    );
+
+    INSERT INTO expense_edits (expense_id, edited_by, old_snapshot, new_snapshot, change_summary)
+    VALUES (p_expense_id, auth.uid(), v_old_snap, v_new_snap, RTRIM(v_summary, '; '));
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.update_expense(UUID, TEXT, DECIMAL, UUID, TEXT, TEXT, TEXT, JSONB, JSONB, JSONB) TO authenticated;
+
+-- The same thing between two people, where it is simplest expressed as one
+-- number: how much of the bill came out of your pocket. Their contribution is
+-- whatever is left, so the two can never disagree.
+--
+-- NULL keeps the old meaning — one of you paid all of it, chosen by p_i_paid —
+-- and a loan ignores it outright, because lending is one person handing over
+-- money and there is nothing to divide.
+DROP FUNCTION IF EXISTS public.add_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN, TEXT);
+
+CREATE OR REPLACE FUNCTION public.add_direct_expense(
+    p_friend_id   UUID,
+    p_amount      DECIMAL,
+    p_note        TEXT    DEFAULT '',
+    p_i_paid      BOOLEAN DEFAULT TRUE,
+    p_their_share DECIMAL DEFAULT NULL,
+    p_is_loan     BOOLEAN DEFAULT FALSE,
+    p_category    TEXT    DEFAULT 'OTHER',
+    p_my_payment  DECIMAL DEFAULT NULL
+)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me       UUID := auth.uid();
+    v_group    UUID;
+    v_payer    UUID;
+    v_theirs   DECIMAL;
+    v_mine     DECIMAL;
+    v_i_put    DECIMAL;
+    v_they_put DECIMAL;
+    v_payers   JSONB;
+    v_title    TEXT;
+    v_cat      TEXT;
+    v_id       UUID;
+BEGIN
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+
+    v_theirs := ROUND(COALESCE(p_their_share, p_amount / 2), 2);
+
+    IF v_theirs < 0 OR v_theirs > ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Their share must be between zero and the full amount';
+    END IF;
+
+    v_mine  := ROUND(p_amount, 2) - v_theirs;
+    v_group := public.direct_group_with(p_friend_id);
+
+    v_i_put := CASE
+        WHEN COALESCE(p_is_loan, FALSE) OR p_my_payment IS NULL
+            THEN CASE WHEN p_i_paid THEN ROUND(p_amount, 2) ELSE 0 END
+        ELSE ROUND(p_my_payment, 2)
+    END;
+
+    IF v_i_put < 0 OR v_i_put > ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'What you paid must be between zero and the full amount';
+    END IF;
+
+    v_they_put := ROUND(p_amount, 2) - v_i_put;
+
+    SELECT COALESCE(jsonb_agg(x), '[]'::jsonb) INTO v_payers FROM (
+        SELECT jsonb_build_object('user_id', v_me, 'amount', v_i_put) AS x WHERE v_i_put > 0
+        UNION ALL
+        SELECT jsonb_build_object('user_id', p_friend_id, 'amount', v_they_put) WHERE v_they_put > 0
+    ) parts;
+
+    -- Whoever put in more carries the record, which is what the lists show.
+    v_payer := CASE WHEN v_i_put >= v_they_put THEN v_me ELSE p_friend_id END;
+    v_title := COALESCE(NULLIF(TRIM(p_note), ''), CASE WHEN p_is_loan THEN 'Loan' ELSE 'Shared expense' END);
+    v_cat   := CASE WHEN COALESCE(p_is_loan, FALSE) THEN 'OTHER' ELSE COALESCE(p_category, 'OTHER') END;
+
+    INSERT INTO expenses (group_id, title, amount, paid_by, created_by,
+                          category, split_method, notes, is_loan)
+    VALUES (v_group, v_title, p_amount, v_payer, v_me, v_cat,
+            CASE WHEN v_theirs * 2 = ROUND(p_amount, 2) THEN 'EQUAL' ELSE 'UNEQUAL' END,
+            COALESCE(p_note, ''), COALESCE(p_is_loan, FALSE))
+    RETURNING id INTO v_id;
+
+    PERFORM public.write_expense_rows(
+        v_id, v_group, v_title, p_amount, v_payer,
+        jsonb_build_array(
+            jsonb_build_object('user_id', p_friend_id, 'amount', v_theirs, 'is_included', TRUE),
+            jsonb_build_object('user_id', v_me, 'amount', v_mine, 'is_included', TRUE)
+        ),
+        '[]'::jsonb,
+        v_payers
+    );
+
+    RETURN v_id;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.add_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN, TEXT, DECIMAL) TO authenticated;
+
+DROP FUNCTION IF EXISTS public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN, TEXT);
+
+CREATE OR REPLACE FUNCTION public.update_direct_expense(
+    p_expense_id  UUID,
+    p_amount      DECIMAL,
+    p_note        TEXT    DEFAULT '',
+    p_i_paid      BOOLEAN DEFAULT TRUE,
+    p_their_share DECIMAL DEFAULT NULL,
+    p_is_loan     BOOLEAN DEFAULT FALSE,
+    p_category    TEXT    DEFAULT 'OTHER',
+    p_my_payment  DECIMAL DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me       UUID := auth.uid();
+    v_group    UUID;
+    v_friend   UUID;
+    v_payer    UUID;
+    v_theirs   DECIMAL;
+    v_mine     DECIMAL;
+    v_i_put    DECIMAL;
+    v_they_put DECIMAL;
+    v_payers   JSONB;
+    v_title    TEXT;
+    v_cat      TEXT;
+BEGIN
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+
+    SELECT group_id INTO v_group FROM expenses WHERE id = p_expense_id;
+    IF v_group IS NULL THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM groups WHERE id = v_group AND is_direct) THEN
+        RAISE EXCEPTION 'That entry is not a direct record — edit it in its group';
+    END IF;
+    IF NOT public.is_group_member(v_group) THEN
+        RAISE EXCEPTION 'You are not part of this record';
+    END IF;
+
+    SELECT user_id INTO v_friend
+    FROM group_members WHERE group_id = v_group AND user_id <> v_me
+    LIMIT 1;
+
+    v_theirs := ROUND(COALESCE(p_their_share, p_amount / 2), 2);
+    IF v_theirs < 0 OR v_theirs > ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Their share must be between zero and the full amount';
+    END IF;
+
+    v_mine := ROUND(p_amount, 2) - v_theirs;
+
+    v_i_put := CASE
+        WHEN COALESCE(p_is_loan, FALSE) OR p_my_payment IS NULL
+            THEN CASE WHEN p_i_paid THEN ROUND(p_amount, 2) ELSE 0 END
+        ELSE ROUND(p_my_payment, 2)
+    END;
+
+    IF v_i_put < 0 OR v_i_put > ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'What you paid must be between zero and the full amount';
+    END IF;
+
+    v_they_put := ROUND(p_amount, 2) - v_i_put;
+
+    SELECT COALESCE(jsonb_agg(x), '[]'::jsonb) INTO v_payers FROM (
+        SELECT jsonb_build_object('user_id', v_me, 'amount', v_i_put) AS x WHERE v_i_put > 0
+        UNION ALL
+        SELECT jsonb_build_object('user_id', v_friend, 'amount', v_they_put) WHERE v_they_put > 0
+    ) parts;
+
+    v_payer := CASE WHEN v_i_put >= v_they_put THEN v_me ELSE v_friend END;
+    v_title := COALESCE(NULLIF(TRIM(p_note), ''),
+                        CASE WHEN p_is_loan THEN 'Loan' ELSE 'Shared expense' END);
+    v_cat   := CASE WHEN COALESCE(p_is_loan, FALSE) THEN 'OTHER' ELSE COALESCE(p_category, 'OTHER') END;
+
+    -- Set before rewriting the splits: write_expense_rows reads it off the row.
+    UPDATE expenses SET is_loan = COALESCE(p_is_loan, FALSE) WHERE id = p_expense_id;
+
+    PERFORM public.update_expense(
+        p_expense_id, v_title, p_amount, v_payer, v_cat,
+        CASE WHEN v_theirs * 2 = ROUND(p_amount, 2) THEN 'EQUAL' ELSE 'UNEQUAL' END,
+        COALESCE(p_note, ''),
+        jsonb_build_array(
+            jsonb_build_object('user_id', v_friend, 'amount', v_theirs, 'is_included', TRUE),
+            jsonb_build_object('user_id', v_me, 'amount', v_mine, 'is_included', TRUE)
+        ),
+        '[]'::jsonb,
+        v_payers
+    );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN, TEXT, DECIMAL) TO authenticated;
+
+-- The "who paid what" chart, reading contributions rather than the single
+-- payer column.
+--
+-- This is the one screen that would otherwise report nonsense confidently: with
+-- two payers, SUM(amount) GROUP BY paid_by hands the whole 1,500 to whoever
+-- happened to put in more and gives the other person nothing, and the slices
+-- still add up to the group total so nothing looks wrong.
+--
+-- The rest is unchanged and deliberate: the people CTE keeps departed members
+-- and deleted accounts in the chart, and IS NOT DISTINCT FROM joins the
+-- unnamed bucket, so the slices keep adding up to what the group really spent.
+CREATE OR REPLACE FUNCTION public.group_contribution_stats(p_group_id UUID)
+RETURNS TABLE (
+    out_user_id     UUID,
+    out_display_name TEXT,
+    out_avatar_url  TEXT,
+    out_paid        DECIMAL,
+    out_share       DECIMAL,
+    out_net         DECIMAL,
+    out_expenses    INT
+)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+    WITH paid AS (
+        SELECT pay.user_id,
+               SUM(pay.amount)              AS total,
+               COUNT(DISTINCT pay.expense_id)::INT AS cnt
+        FROM expense_payers pay
+        JOIN expenses e ON e.id = pay.expense_id
+        WHERE e.group_id = p_group_id AND NOT e.is_deleted
+        GROUP BY pay.user_id
+    ),
+    owed AS (
+        SELECT s.user_id, SUM(s.amount) AS total
+        FROM expense_splits s
+        JOIN expenses e ON e.id = s.expense_id
+        WHERE e.group_id = p_group_id AND NOT e.is_deleted AND s.is_included
+        GROUP BY s.user_id
+    ),
+    people AS (
+        SELECT user_id FROM group_members WHERE group_id = p_group_id
+        UNION
+        SELECT user_id FROM paid
+        UNION
+        SELECT user_id FROM owed
+    )
+    SELECT
+        pe.user_id,
+        CASE
+            WHEN u.id IS NULL          THEN 'Former member'
+            WHEN m.user_id IS NULL     THEN COALESCE(u.display_name, 'Member') || ' (left)'
+            ELSE COALESCE(u.display_name, 'Member')
+        END,
+        u.avatar_url,
+        ROUND(COALESCE(p.total, 0), 2),
+        ROUND(COALESCE(o.total, 0), 2),
+        ROUND(COALESCE(p.total, 0) - COALESCE(o.total, 0), 2),
+        COALESCE(p.cnt, 0)
+    FROM people pe
+    LEFT JOIN users u ON u.id = pe.user_id
+    LEFT JOIN group_members m ON m.group_id = p_group_id AND m.user_id = pe.user_id
+    LEFT JOIN paid  p ON p.user_id IS NOT DISTINCT FROM pe.user_id
+    LEFT JOIN owed  o ON o.user_id IS NOT DISTINCT FROM pe.user_id
+    WHERE public.is_group_member(p_group_id)
+    ORDER BY COALESCE(p.total, 0) DESC;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.group_contribution_stats(UUID) TO authenticated;
+
+-- A recurring group bill can be split between payers too, beside the splits it
+-- already carries.
+ALTER TABLE recurring_expenses ADD COLUMN IF NOT EXISTS payers JSONB;
+
+-- Live updates for the new table, on the same terms as the rest: published, and
+-- replicating the whole row so an update or delete carries enough for RLS to
+-- authorise sending it.
+DO $rt_payers$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_publication_tables
+            WHERE pubname = 'supabase_realtime' AND schemaname = 'public'
+              AND tablename = 'expense_payers'
+        ) THEN
+            ALTER PUBLICATION supabase_realtime ADD TABLE public.expense_payers;
+        END IF;
+        ALTER TABLE public.expense_payers REPLICA IDENTITY FULL;
+    END IF;
+END
+$rt_payers$;

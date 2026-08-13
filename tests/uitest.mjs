@@ -171,6 +171,17 @@ const TABLES = {
   recurring_expenses: [],
   expense_items: [],
   expense_edits: [],
+  // Who put money in, mirroring the EXPENSE side of the ledger above. e1 is the
+  // one two people paid for: 3,000 from me and 1,500 from Ben.
+  expense_payers: [
+    { expense_id: 'e1', user_id: ME, amount: 3000 },
+    { expense_id: 'e1', user_id: BEN, amount: 1500 },
+    { expense_id: 'e2', user_id: BEN, amount: 3300 },
+    { expense_id: 'e3', user_id: CARA, amount: 2400 },
+    { expense_id: 'e5', user_id: ME, amount: 1200 },
+    { expense_id: 'e6', user_id: ME, amount: 5000 },
+    { expense_id: 'e7', user_id: BEN, amount: 3000 },
+  ],
 };
 
 const RPC = {
@@ -407,6 +418,39 @@ const run = async () => {
   await noOverflow('Group detail');
   await shot('03-group-detail');
 
+  // ---------- Several people paying for one group bill ----------
+  await page.click('button.btn-primary:has-text("Add")');
+  await page.waitForTimeout(800);
+  await visible('Add expense', 'sheet open', 'text=Split method');
+  await visible('Add expense', 'who paid section', 'div[aria-label="Who paid"]');
+  await visible('Add expense', 'the way in', 'button:has-text("More than one person paid")');
+
+  await page.fill('input[placeholder="0.00"]', '1500');
+  await page.click('button:has-text("More than one person paid")');
+  await page.waitForTimeout(400);
+
+  // One amount per member, so "we put in 1,000 and 500" is expressible at all.
+  const payerFields = await page.locator('div[aria-label="Who paid"] input[inputmode="decimal"]').count();
+  check('Add expense', 'an amount per member appears', payerFields === 3, `${payerFields} fields`);
+
+  // The remainder is the number people watch while typing, so it has to be
+  // right before it is reassuring.
+  await page.fill('input[aria-label="What I paid"]', '1000');
+  await page.waitForTimeout(300);
+  const short = await page.locator('div[aria-label="Who paid"] >> text=Left to account for').count();
+  check('Add expense', 'says how much is unaccounted for', short === 1);
+
+  await page.fill('input[aria-label="What Ben Perera paid"]', '500');
+  await page.waitForTimeout(300);
+  const adds = await page
+    .locator('div[aria-label="Who paid"] >> text=Adds up to the bill')
+    .count();
+  check('Add expense', 'and confirms when it adds up', adds === 1);
+  await noOverflow('Add expense');
+  await shot('03b-many-payers');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(500);
+
   // ---------- Balances tab + the chart ----------
   await page.click('button:has-text("Balances")');
   await page.waitForTimeout(700);
@@ -458,10 +502,28 @@ const run = async () => {
   await visible('Add record', 'a shared bill can be categorised', 'text=Category');
   const foodChip = await page.locator('button:has-text("Food")').count();
   check('Add record', 'the category chips are there', foodChip >= 1, `${foodChip} found`);
+
+  // The 1,500 item: 1,000 from me, 500 from them, still split evenly. The
+  // record has to end up saying they owe me 250 — naming either of us as the
+  // payer would say 750, in opposite directions.
+  await page.fill('input[placeholder="0.00"]', '1500');
+  await page.click('div[aria-label="Who paid"] button:has-text("Both did")');
+  await page.waitForTimeout(400);
+  await visible('Add record', 'what you put in', 'text=What you put in');
+  await page.fill('#my-payment', '1000');
+  await page.fill('#their-share', '750');
+  await page.waitForTimeout(400);
+  await visible('Add record', 'their contribution is derived', 'text=/put in the rest: Rs. 500/');
+  await visible('Add record', 'the resulting balance is spelled out', 'text=/owes you Rs. 250/');
+  await noOverflow('Add record');
+  await shot('07d-both-paid');
+
   await page.click('div[aria-label="What happened"] button:has-text("I lent")');
   await page.waitForTimeout(400);
   const catOnLoan = await page.locator('text=Category').count();
   check('Add record', 'lending has no category', catOnLoan === 0, `${catOnLoan} found`);
+  const bothOnLoan = await page.locator('button:has-text("Both did")').count();
+  check('Add record', 'lending has no second payer', bothOnLoan === 0, `${bothOnLoan} found`);
   await noOverflow('Add record');
   await shot('07c-add-record');
   await page.keyboard.press('Escape');

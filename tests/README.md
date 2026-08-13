@@ -44,6 +44,10 @@ Two invariants matter more than any individual figure:
 - **Repeated edits do not move money.** `test14.sql` edits one expense fifteen
   times and deletes it. This exists because reversing an expense by re-negating
   its rows was correct exactly once and silently wrong from the second edit on.
+- **Contributions and shares each reconstruct the bill.** Since several people
+  can pay for one expense, "who put money in" and "who owes what" are separate
+  sets of rows. Both must sum to the total — that is what keeps every group
+  netting to zero, and it is why the money core needed no changes to support it.
 - **Nothing moves money, under any sequence.** `test24.sql` throws random
   operations at a four-person group and re-checks both invariants after every
   one, so a fault that needs an unlikely order to show up still names the step
@@ -105,3 +109,4 @@ change; it is the only check that catches this class.
 | `test25.sql` | What realtime needs from the database: the tables published, and `REPLICA IDENTITY FULL` so an update or delete carries enough of the row for RLS to authorise sending it. Needs a `supabase_realtime` publication to exist — create an empty one locally, as Supabase provisions it |
 | `test26.sql` | What counts as your spending now that nothing is ever asked: every share you are on counts the moment it is saved, in a group or between two people; lending counts for nobody in either direction; a bill paid entirely for somebody else counts for them and not the payer; and the opt-in column is gone from the schema |
 | `test27.sql` | The Friends screen — a record between two people keeps the category it was given and refuses an invented one, a loan stays uncategorised, and the list predicate keeps anyone owed money while dropping an ex-friend you only share a settled group with |
+| `test28.sql` | Several people paying for one bill: the 1,500 item with 1,000 and 500 in it produces a 250 balance rather than 750; contributions that do not add up, a stranger paying, and a zero contribution are all refused; the chart attributes to both payers instead of handing the bill to one; edits and deletes move every contribution; and a one-payer bill still behaves exactly as it did |
