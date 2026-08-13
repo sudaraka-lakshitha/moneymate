@@ -4,7 +4,7 @@ import { useLiveRefresh } from '../lib/realtime';
 import { Group, GroupInvitation, InviteLookup, User } from '../types';
 import { formatLKRSigned } from '../lib/currency';
 import { friendlyDbError } from '../lib/authErrors';
-import { Alert, EmptyState, Sheet, SkeletonRows, Spinner } from '../components/ui';
+import { Alert, Avatar, EmptyState, Sheet, SkeletonRows, Spinner } from '../components/ui';
 import { useToast } from '../components/Toast';
 import { Archive, Check, Plus, Search, Users2, X } from 'lucide-react';
 
@@ -33,6 +33,11 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
   const [emoji, setEmoji] = useState('💰');
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  /** Your friends, so a group can start with the people who are in it. */
+  const [friends, setFriends] = useState<User[]>([]);
+  const [friendsError, setFriendsError] = useState<string | null>(null);
+  const [picked, setPicked] = useState<Record<string, boolean>>({});
+  const pickedCount = friends.filter((f) => picked[f.id]).length;
 
   const [inviteCode, setInviteCode] = useState('');
   const [lookup, setLookup] = useState<InviteLookup | null>(null);
@@ -80,6 +85,20 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
         .eq('status', 'PENDING')
         .order('created_at', { ascending: false });
       setInvitations((inviteData ?? []) as unknown as GroupInvitation[]);
+
+      // The people a new group is most likely to be made of.
+      const { data: friendData, error: friendError } = await supabase
+        .from('friend_requests')
+        .select('requester:users!friend_requests_requester_id_fkey(*), addressee:users!friend_requests_addressee_id_fkey(*), requester_id, addressee_id')
+        .or(`requester_id.eq.${user.id},addressee_id.eq.${user.id}`)
+        .eq('status', 'ACCEPTED');
+      if (friendError) console.error('Friends failed to load:', friendError);
+      setFriendsError(friendError ? friendlyDbError(friendError, 'Could not load your friends.') : null);
+      setFriends(
+        (friendData ?? [])
+          .map((row: any) => (row.requester_id === user.id ? row.addressee : row.requester))
+          .filter(Boolean) as User[]
+      );
     } catch (error) {
       toast.error(friendlyDbError(error, 'Could not load your groups.'));
     } finally {
@@ -124,19 +143,27 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
       // Creates the group and seats the creator as ADMIN atomically, server
       // side — see create_group in supabase_schema.sql for why this isn't two
       // plain inserts.
-      const { data: group, error } = await supabase.rpc('create_group', {
+      const withFriends = friends.filter((f) => picked[f.id]).map((f) => f.id);
+
+      const { data: group, error } = await supabase.rpc('create_group_with_friends', {
         p_name: name.trim(),
         p_description: description.trim(),
         p_icon_emoji: emoji,
+        p_friend_ids: withFriends,
       });
 
       if (error) throw error;
 
-      toast.success(`"${group.name}" created.`);
+      toast.success(
+        withFriends.length > 0
+          ? `"${group.name}" created with ${withFriends.length} ${withFriends.length === 1 ? 'friend' : 'friends'} already in it.`
+          : `"${group.name}" created.`
+      );
       setShowCreate(false);
       setName('');
       setDescription('');
       setEmoji('💰');
+      setPicked({});
       await loadGroups();
       onNavigate(`group-detail/${group.id}`);
     } catch (error) {
@@ -404,11 +431,81 @@ export const GroupsPage: React.FC<GroupsPageProps> = ({ user, onNavigate }) => {
               maxLength={140}
             />
 
+            {/* The people the group is actually for. Ticking somebody puts them
+                in from the start — they are already a friend, which is the
+                consent this app runs on everywhere else. Anyone not on the list
+                still joins by invitation or by code. */}
+            <div className="field" aria-label="Add your friends">
+              <span className="label label-block">Add your friends</span>
+              {friendsError ? (
+                <Alert variant="error">{friendsError}</Alert>
+              ) : friends.length === 0 ? (
+                <span className="hint" style={{ display: 'block' }}>
+                  Nobody on your Friends list yet. You can create the group now and share its code, or
+                  add friends first and start a group with them already in it.
+                </span>
+              ) : (
+                <div className="stack-sm">
+                  {friends.map((f) => {
+                    const on = Boolean(picked[f.id]);
+                    return (
+                      <button
+                        key={f.id}
+                        type="button"
+                        className="card row"
+                        style={{
+                          textAlign: 'left',
+                          borderColor: on ? 'var(--primary)' : undefined,
+                        }}
+                        onClick={() => setPicked((prev) => ({ ...prev, [f.id]: !on }))}
+                        aria-pressed={on}
+                      >
+                        <Avatar name={f.display_name} url={f.avatar_url} size={32} />
+                        <span className="grow truncate" style={{ fontSize: '0.88rem', fontWeight: 600 }}>
+                          {f.display_name}
+                        </span>
+                        <span
+                          className="row"
+                          style={{
+                            width: 22,
+                            height: 22,
+                            flexShrink: 0,
+                            justifyContent: 'center',
+                            borderRadius: 7,
+                            border: `1.5px solid ${on ? 'var(--primary)' : 'var(--card-border)'}`,
+                            background: on ? 'var(--primary)' : 'transparent',
+                            color: '#fff',
+                          }}
+                        >
+                          {on && <Check size={13} />}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* A group is for three or more. Two people already have a shared
+                  record of their own under Friends, and a second place for the
+                  same two people's money is a way to lose track of it. */}
+              {pickedCount === 1 && (
+                <span className="hint" style={{ display: 'block', marginTop: 'var(--sp-2)' }}>
+                  Just the two of you? You already have a shared record with{' '}
+                  {friends.find((f) => picked[f.id])?.display_name.split(' ')[0] ?? 'them'} under
+                  Friends — no group needed. Groups are worth it from three people up.
+                </span>
+              )}
+            </div>
+
             {createError && <Alert variant="error">{createError}</Alert>}
 
             <button type="submit" className="btn btn-primary btn-block btn-lg" disabled={creating}>
               {creating && <Spinner />}
-              {creating ? 'Creating…' : 'Create group'}
+              {creating
+                ? 'Creating…'
+                : pickedCount > 0
+                  ? `Create with ${pickedCount} ${pickedCount === 1 ? 'friend' : 'friends'}`
+                  : 'Create group'}
             </button>
           </form>
         </Sheet>
