@@ -19,6 +19,9 @@ const CARA = '33333333-3333-3333-3333-333333333333';
 // A group-mate who is not a friend and is square with me. Sharing a group
 // makes somebody a group-mate, not a friend — she must not be in the list.
 const DANA = '44444444-4444-4444-4444-444444444444';
+// An accepted friend who is in no group of mine — the person the invite
+// sheet exists to offer.
+const EVAN = '55555555-5555-5555-5555-555555555555';
 const G1 = 'aaaaaaaa-0000-0000-0000-000000000001';
 const DIRECT = 'aaaaaaaa-0000-0000-0000-000000000002';
 
@@ -27,6 +30,7 @@ const meU = user(ME, 'Sudaraka Lakshitha', 'me@t.lk');
 const benU = user(BEN, 'Ben Perera', 'ben@t.lk');
 const caraU = user(CARA, 'Cara Silva', 'cara@t.lk');
 const danaU = user(DANA, 'Dana Fernando', 'dana@t.lk');
+const evanU = user(EVAN, 'Evan Silva', 'evan@t.lk');
 
 const today = new Date().toISOString();
 const day = (n) => new Date(Date.now() - n * 864e5).toISOString().slice(0, 10);
@@ -147,10 +151,12 @@ const friendRequests = [
     status: 'ACCEPTED', created_at: today, responded_at: today, requester: meU, addressee: benU },
   { id: 'fr2', requester_id: CARA, addressee_id: ME, addressee_email: 'me@t.lk',
     status: 'PENDING', created_at: today, responded_at: null, requester: caraU, addressee: meU },
+  { id: 'fr3', requester_id: ME, addressee_id: EVAN, addressee_email: 'evan@t.lk',
+    status: 'ACCEPTED', created_at: today, responded_at: today, requester: meU, addressee: evanU },
 ];
 
 
-const byId = { [ME]: meU, [BEN]: benU, [CARA]: caraU, [DANA]: danaU };
+const byId = { [ME]: meU, [BEN]: benU, [CARA]: caraU, [DANA]: danaU, [EVAN]: evanU };
 const splitsFlat = expenses.flatMap((e) =>
   (e.expense_splits ?? []).map((s) => ({
     ...s, expense_id: e.id, percentage: 0, shares: 1, users: byId[s.user_id],
@@ -162,7 +168,7 @@ const splitsFlat = expenses.flatMap((e) =>
 );
 
 const TABLES = {
-  users: [meU, benU, caraU, danaU],
+  users: [meU, benU, caraU, danaU, evanU],
   groups,
   group_members: members,
   expenses,
@@ -491,6 +497,23 @@ const run = async () => {
   await noOverflow('Group detail');
   await shot('03-group-detail');
 
+  // ---------- Inviting somebody straight into the group ----------
+  await page.click('button[aria-label="Invite members"]');
+  await page.waitForTimeout(700);
+  // Adding a friend has to be the first thing offered and must never vanish:
+  // it used to sit third, below two blocks about the invite code, and rendered
+  // nothing at all when the list was empty — which reads as a feature the app
+  // does not have.
+  await visible('Invite', 'adding a friend comes first', 'text=Add a friend');
+  await visible('Invite', 'the friend is listed', 'text=Evan Silva');
+  await visible('Invite', 'with a way to invite them', 'button:has-text("Invite")');
+  await visible('Invite', 'the code is for everyone else', 'text=/anyone not on your Friends list/');
+  await visible('Invite', 'and email still works', 'text=/or by email/');
+  await noOverflow('Invite');
+  await shot('03e-invite');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(500);
+
   // ---------- Several people paying for one group bill ----------
   await page.click('button.btn-primary:has-text("Add")');
   await page.waitForTimeout(800);
@@ -525,6 +548,25 @@ const run = async () => {
     .locator('div[aria-label="Who paid"] >> text=Adds up to the bill')
     .count();
   check('Add expense', 'and confirms when it adds up', adds === 1);
+
+  // Paying and owing are separate questions, so the page has to say what the
+  // two of them come to together — otherwise neither number tells anybody
+  // where they stand.
+  await visible('Add expense', 'the arithmetic is on the page', 'text=What this comes to');
+  await visible('Add expense', 'paying is distinguished from splitting', 'text=/still share it evenly/');
+
+  // The numbers, derived rather than hardcoded so the fixture can grow: a
+  // 1,500 bill split evenly across the group, with 1,000 from me and 500 from
+  // Ben. I am owed the gap; whoever put in nothing owes their whole share.
+  const money = (n) => `Rs. ${n.toLocaleString('en-LK', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const evenShare = 1500 / groupSize;
+  await visible(
+    'Add expense',
+    'what I put in against what is mine',
+    `text=/You put in ${money(1000).replace('.', '\\.')}, share ${money(evenShare).replace('.', '\\.')}/`
+  );
+  await visible('Add expense', 'and the outcome spelled out', `text=owed ${money(1000 - evenShare)}`);
+  await visible('Add expense', 'somebody who put in nothing owes theirs', `text=owes ${money(evenShare)}`);
   await noOverflow('Add expense');
   await shot('03b-many-payers');
   await page.keyboard.press('Escape');
@@ -572,7 +614,11 @@ const run = async () => {
   await visible('Friend sheet', 'clear deleted records', 'text=Clear deleted records');
   await visible('Friend sheet', 'remove friend', 'text=Remove friend');
   // One settle control, not one per group: the same action used to appear twice.
+  // Scoped to the open sheet. Unscoped, this counted rows sitting behind it —
+  // a friend row reading "Settled · all square" is a button whose text
+  // contains "Settle", which made the count say two and the check lie.
   const settleButtons = await page
+    .locator('[role="dialog"]')
     .locator('button:has-text("Settle"), button:has-text("Record payment"), button:has-text("received")')
     .count();
   check('Friend sheet', 'exactly one settle control', settleButtons === 1, `${settleButtons} found`);

@@ -522,6 +522,12 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
 
         <div className="field" aria-label="Who paid">
           <span className="label label-block">Who paid?</span>
+          {manyPayers && (
+            <span className="hint" style={{ display: 'block', marginBottom: 'var(--sp-2)' }}>
+              What each person actually handed over. How the bill is <em>split</em> is the next
+              question — you can put in different amounts and still share it evenly.
+            </span>
+          )}
 
           {!manyPayers ? (
             <>
@@ -854,6 +860,44 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
                 </span>
               </>
             )}
+          </div>
+        )}
+
+        {/* What the two halves come to together. Paying and owing are separate
+            questions, and with several payers neither number on its own tells
+            anybody where they stand — the arithmetic has to be on the page. */}
+        {manyPayers && computed.total > 0 && !computed.problem && !contributions.problem && (
+          <div className="card stack-sm">
+            <span className="label">What this comes to</span>
+            <span className="hint">
+              What each person put in, less what the split says is theirs.
+            </span>
+            {members.map((m) => {
+              const put = roundMoney(parseAmount(paidAmounts[m.user_id] ?? ''));
+              const owes = included[m.user_id] ? (computed.perUser[m.user_id] ?? 0) : 0;
+              if (put === 0 && owes === 0) return null;
+              const net = roundMoney(put - owes);
+              return (
+                <div key={m.user_id} className="row-between" style={{ gap: 'var(--sp-2)' }}>
+                  <span className="hint truncate" style={{ minWidth: 0 }}>
+                    {m.user_id === user.id ? 'You' : (m.user?.display_name ?? 'Member')} put in{' '}
+                    {formatLKR(put)}, share {formatLKR(owes)}
+                  </span>
+                  <span
+                    className={`tabular ${
+                      Math.abs(net) < 0.01 ? 'text-neutral' : net > 0 ? 'text-positive' : 'text-negative'
+                    }`}
+                    style={{ fontSize: '0.85rem', fontWeight: 700, flexShrink: 0 }}
+                  >
+                    {Math.abs(net) < 0.01
+                      ? 'square'
+                      : net > 0
+                        ? `owed ${formatLKR(net)}`
+                        : `owes ${formatLKR(-net)}`}
+                  </span>
+                </div>
+              );
+            })}
           </div>
         )}
 
