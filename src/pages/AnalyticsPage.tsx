@@ -30,6 +30,8 @@ interface SpendRow {
   paid: number;
   groupId: string;
   groupName: string;
+  /** A one-to-one ledger with a friend rather than a real group. */
+  isDirect: boolean;
   /** Everyone else on the bill. */
   withIds: string[];
 }
@@ -118,8 +120,13 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
           amount: Number(row.amount),
           paid: paidByExpense[row.expense_id] ?? 0,
           groupId: row.expenses.group_id,
+          isDirect: Boolean(row.expenses.groups?.is_direct),
+          // A one-to-one ledger is named after the person on the other side of
+          // it, resolved below from who is actually on the bill. The stored
+          // name reads from whoever opened it ("Between you and Ben"), so it is
+          // wrong for one of the two people every time.
           groupName: row.expenses.groups?.is_direct
-            ? 'Just the two of you'
+            ? ''
             : (row.expenses.groups?.name ?? 'A group'),
           withIds: withByExpense[row.expense_id] ?? [],
         }))
@@ -233,16 +240,34 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
       .sort((a, b) => b.value - a.value);
   }, [visible, people]);
 
+  /**
+   * Where the spending happened: a group, or a one-to-one ledger with one
+   * friend. Every pair record used to render as "Just the two of you", so two
+   * different friends produced two identical rows and neither could be told
+   * from the other. They are named after the person instead — worked out from
+   * who is actually on the bill, because the stored name is written from
+   * whoever opened the ledger and reads wrong for the other one.
+   */
   const byGroup = useMemo<Ranked[]>(() => {
-    const totals: Record<string, { name: string; value: number }> = {};
+    const totals: Record<string, { name: string; value: number; user?: User }> = {};
     for (const row of visible) {
-      const entry = (totals[row.groupId] ||= { name: row.groupName, value: 0 });
+      const other = row.isDirect ? people[row.withIds[0] ?? ''] : undefined;
+      const entry = (totals[row.groupId] ||= {
+        name: row.isDirect ? (other?.display_name ?? 'A friend') : row.groupName,
+        value: 0,
+        user: other,
+      });
+      // A later row may carry the name the first one could not resolve.
+      if (row.isDirect && other && entry.name === 'A friend') {
+        entry.name = other.display_name;
+        entry.user = other;
+      }
       entry.value = roundMoney(entry.value + row.amount);
     }
     return Object.entries(totals)
-      .map(([id, { name, value }]) => ({ key: id, label: name, value }))
+      .map(([id, { name, value, user: u }]) => ({ key: id, label: name, value, user: u }))
       .sort((a, b) => b.value - a.value);
-  }, [visible]);
+  }, [visible, people]);
 
   if (loading) {
     return (
@@ -392,12 +417,20 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
 
           {byGroup.length > 0 && (
             <>
-              <h2 className="section-title">Which group</h2>
+              <h2 className="section-title">Where you split it</h2>
+              <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+                Each group, and each friend you split with one to one.
+              </p>
               <div className="stack-sm">
                 {byGroup.map((row) => {
                   const pct = Math.round((row.value / windowTotal) * 100);
                   return (
                     <div key={row.key} className="card row">
+                      {/* A face for a person, so a one-to-one row is not mistaken
+                          for a group with somebody's name on it. */}
+                      {row.user && (
+                        <Avatar name={row.label} url={row.user.avatar_url} size={32} />
+                      )}
                       <span className="grow" style={{ minWidth: 0 }}>
                         <span
                           className="truncate"
@@ -405,7 +438,10 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
                         >
                           {row.label}
                         </span>
-                        <span className="hint">{pct}% of your share</span>
+                        <span className="hint">
+                          {row.user ? 'just the two of you · ' : ''}
+                          {pct}% of your share
+                        </span>
                       </span>
                       <span className="amount-md tabular" style={{ flexShrink: 0 }}>
                         {formatLKR(row.value)}
