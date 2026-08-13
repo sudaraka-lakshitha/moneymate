@@ -12,7 +12,7 @@ import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
 import { AddExpenseModal } from './AddExpenseModal';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/Confirm';
-import { Check, Clock, Eraser, HandCoins, Pencil, Trash2, UserMinus, UserPlus, Search, X, Pin } from 'lucide-react';
+import { Check, Clock, Eraser, HandCoins, History, Pencil, RotateCcw, Trash2, UserMinus, UserPlus, Search, X, Pin } from 'lucide-react';
 
 interface FriendsPageProps {
   user: User;
@@ -50,6 +50,10 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const [friends, setFriends] = useState<DisplayFriend[]>([]);
   const [settlements, setSettlements] = useState<GroupSettlement[]>([]);
   const [groupNames, setGroupNames] = useState<Record<string, string>>({});
+  /** groupId -> the cycle open in it now, so records from before a fresh start
+      can step out of the way without being destroyed. */
+  const [cycleByGroup, setCycleByGroup] = useState<Record<string, string | null>>({});
+  const [showEarlier, setShowEarlier] = useState(false);
   const [directGroupIds, setDirectGroupIds] = useState<Set<string>>(new Set());
   /** friendId -> the id of the hidden 1:1 group holding our direct records. */
   const [directGroupByFriend, setDirectGroupByFriend] = useState<Record<string, string>>({});
@@ -198,6 +202,9 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       setMembersByGroup(byGroup);
 
       setGroupNames(Object.fromEntries(groups.map((g) => [g.id, g.name])));
+      setCycleByGroup(
+        Object.fromEntries(groups.map((g) => [g.id, (g as any).current_cycle_id ?? null]))
+      );
       const directIdSet = new Set(groups.filter((g) => g.is_direct).map((g) => g.id));
       setDirectGroupIds(directIdSet);
       setDirectGroupByFriend(
@@ -358,6 +365,25 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       }
     },
     [user.id, groupNames, directGroupIds, toast]
+  );
+
+  // Split by which run of the group each record belongs to. A record whose
+  // group has moved on is history; everything else is live. The balances above
+  // are computed over the whole ledger regardless, and correctly so: a cycle
+  // only closes when everyone is square, so a closed one contributes zero.
+  const currentRecords = useMemo(
+    () =>
+      pairRecords.filter(
+        (r) => (r.expense.cycle_id ?? null) === (cycleByGroup[r.groupId] ?? null)
+      ),
+    [pairRecords, cycleByGroup]
+  );
+  const earlierRecords = useMemo(
+    () =>
+      pairRecords.filter(
+        (r) => (r.expense.cycle_id ?? null) !== (cycleByGroup[r.groupId] ?? null)
+      ),
+    [pairRecords, cycleByGroup]
   );
 
   useEffect(() => {
@@ -727,6 +753,45 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
    * stays readable; once you are square that is no longer holding anything up,
    * and the rows are pure storage.
    */
+  /**
+   * Draw a line under everything between the two of you. Keeping the records
+   * files them behind a closed cycle; erasing destroys them. Both are refused
+   * server-side unless you are square, whatever the button says.
+   */
+  const handleStartFresh = async (friend: DisplayFriend, erase: boolean) => {
+    const groupId = directGroupByFriend[friend.friend.id];
+    if (!groupId) return;
+
+    const name = friend.friend.display_name.split(' ')[0];
+    const ok = await confirm({
+      title: erase ? 'Erase everything between you?' : 'Start a fresh balance?',
+      message: erase
+        ? `Every record between you and ${name} is deleted for good, along with the payment history. You both start from zero. This cannot be undone.`
+        : `Your records with ${name} are closed off and you both start from zero. Nothing is deleted — they stay readable under Earlier records.`,
+      confirmLabel: erase ? 'Erase for good' : 'Start fresh',
+      danger: erase,
+    });
+    if (!ok) return;
+
+    setClearingDeleted(true);
+    try {
+      const { error: rpcError } = erase
+        ? await supabase.rpc('purge_group_history', { p_group_id: groupId })
+        : await supabase.rpc('start_new_cycle', { p_group_id: groupId });
+      if (rpcError) throw rpcError;
+
+      toast.success(
+        erase ? `Cleared everything between you and ${name}.` : `Fresh start with ${name}.`
+      );
+      await load();
+      if (selected) await loadPairRecords(selected.friend.id, selected.groupIds);
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not start fresh.'));
+    } finally {
+      setClearingDeleted(false);
+    }
+  };
+
   const handleClearDeleted = async (friend: DisplayFriend) => {
     const groupId = directGroupByFriend[friend.friend.id];
     if (!groupId) return;
@@ -1124,20 +1189,24 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
             )}
 
             <span className="label label-block">
-              Records between you{pairRecords.length > 0 ? ` (${pairRecords.length})` : ''}
+              Records between you{currentRecords.length > 0 ? ` (${currentRecords.length})` : ''}
             </span>
             {pairLoading ? (
               <SkeletonRows count={3} height={58} />
-            ) : pairRecords.length === 0 ? (
+            ) : currentRecords.length === 0 ? (
               <EmptyState
                 icon="🧾"
-                title="Nothing recorded yet"
-                text="Loans, shared bills and anything you have split in a group together will be listed here."
+                title={earlierRecords.length > 0 ? 'A clean slate' : 'Nothing recorded yet'}
+                text={
+                  earlierRecords.length > 0
+                    ? 'You started fresh. Anything new between you shows up here; the old records are below.'
+                    : 'Loans, shared bills and anything you have split in a group together will be listed here.'
+                }
               />
             ) : (
               <>
                 <div className="stack-sm">
-                  {pairRecords.map((record) => {
+                  {currentRecords.map((record) => {
                     const entry = record.expense;
                     const iPaidIt = entry.paid_by === user.id;
                     const locked = Boolean(entry.settled_at);
@@ -1224,15 +1293,85 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
               </>
             )}
 
+            {/* Everything from before the last fresh start — kept, readable,
+                and out of the way of what is happening now. */}
+            {earlierRecords.length > 0 && (
+              <>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-block btn-sm"
+                  onClick={() => setShowEarlier((on) => !on)}
+                  aria-expanded={showEarlier}
+                >
+                  <History size={15} />
+                  {showEarlier ? 'Hide earlier records' : `Earlier records (${earlierRecords.length})`}
+                </button>
+                {showEarlier && (
+                  <div className="stack-sm">
+                    {earlierRecords.map((record) => (
+                      <div key={record.expense.id} className="card row" style={{ opacity: 0.75 }}>
+                        <span className="emoji-badge">{categoryMeta(record.expense.category).emoji}</span>
+                        <span className="grow" style={{ minWidth: 0 }}>
+                          <span
+                            className="truncate"
+                            style={{ display: 'block', fontWeight: 600, fontSize: '0.86rem' }}
+                          >
+                            {record.expense.title}
+                          </span>
+                          <span className="hint">
+                            your share {formatLKR(record.myShare)} · theirs {formatLKR(record.theirShare)}
+                          </span>
+                        </span>
+                        <span className="amount-md tabular" style={{ flexShrink: 0 }}>
+                          {formatLKR(Number(record.expense.amount))}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* Once you are square, draw a line. Both ways are offered, and
+                both stay visible when they cannot be used — a control that
+                disappears reads as one the app does not have. */}
             {directGroupByFriend[selected.friend.id] && (
-              <button
-                type="button"
-                className="btn btn-ghost btn-block btn-sm"
-                onClick={() => handleClearDeleted(selected)}
-                disabled={clearingDeleted}
-              >
-                {clearingDeleted ? <Spinner /> : <Eraser size={15} />} Clear deleted records
-              </button>
+              <>
+                <span className="label label-block" style={{ marginTop: 'var(--sp-4)' }}>
+                  Start fresh
+                </span>
+                <span className="hint" style={{ display: 'block', marginBottom: 'var(--sp-2)' }}>
+                  {Math.abs(selected.net_balance) >= 0.01
+                    ? `Settle the ${formatLKR(Math.abs(selected.net_balance))} between you first.`
+                    : 'You are square. Clear the slate and start counting again from zero.'}
+                </span>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-block btn-sm"
+                  onClick={() => handleStartFresh(selected, false)}
+                  disabled={clearingDeleted || Math.abs(selected.net_balance) >= 0.01}
+                >
+                  {clearingDeleted ? <Spinner /> : <RotateCcw size={15} />} Start fresh, keep the records
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-block btn-sm"
+                  onClick={() => handleStartFresh(selected, true)}
+                  disabled={clearingDeleted || Math.abs(selected.net_balance) >= 0.01}
+                  style={{ color: 'var(--negative)' }}
+                >
+                  {clearingDeleted ? <Spinner /> : <Eraser size={15} />} Start fresh and erase everything
+                </button>
+
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-block btn-sm"
+                  onClick={() => handleClearDeleted(selected)}
+                  disabled={clearingDeleted}
+                >
+                  {clearingDeleted ? <Spinner /> : <Eraser size={15} />} Clear deleted records
+                </button>
+              </>
             )}
 
             {selected.isConnected && (

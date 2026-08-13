@@ -415,6 +415,20 @@ const run = async () => {
         (await rowErase.first().getAttribute('title')) || '');
   const reason = await page.locator('text=/can be erased once everyone in this group is settled up/').count();
   check('Group detail', 'and the section explains the condition', reason === 1);
+
+  // Both ways of starting fresh, side by side, and both present-but-disabled
+  // while the group is not settled — with the reason on the button itself.
+  await page.click('button[aria-label="Manage group"]');
+  await page.waitForTimeout(700);
+  await visible('Fresh start', 'keep-the-records option', 'text=Start a fresh balance');
+  await visible('Fresh start', 'erase option', 'text=Start fresh and erase everything');
+  const freshBtn = page.locator('button:has-text("Settle up first")');
+  check('Fresh start', 'offered but not usable while money is owed', (await freshBtn.count()) === 1);
+  check('Fresh start', 'and disabled rather than hidden', await freshBtn.first().isDisabled());
+  await noOverflow('Fresh start');
+  await shot('03c-fresh-start');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(500);
   await noOverflow('Group detail');
   await shot('03-group-detail');
 

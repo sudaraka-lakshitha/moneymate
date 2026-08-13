@@ -15,7 +15,7 @@ import { AddExpenseModal } from './AddExpenseModal';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
 import { DonutChart } from '../components/Charts';
 import {
-  ArrowLeft, ArrowRight, AtSign, Archive, ArchiveRestore, Check, ChevronRight, Copy, Eraser, Lock, Mail, Pencil, PieChart, Plus,
+  ArrowLeft, ArrowRight, AtSign, Archive, ArchiveRestore, Check, ChevronRight, Copy, Eraser, History, Lock, Mail, Pencil, PieChart, Plus, RotateCcw,
   LogOut, RefreshCw, Settings2, Share2, Trash2, UserCheck, X,
 } from 'lucide-react';
 
@@ -75,6 +75,7 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   const [statsLoading, setStatsLoading] = useState(false);
   const [showManage, setShowManage] = useState(false);
   const [cleaning, setCleaning] = useState(false);
+  const [showEarlier, setShowEarlier] = useState(false);
   const [busyErase, setBusyErase] = useState<string | null>(null);
 
   const [showEdit, setShowEdit] = useState(false);
@@ -188,7 +189,14 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   const myBalance = balances[user.id] ?? 0;
   const simplified = useMemo(() => simplifyDebts(balances, userMap), [balances, userMap]);
   const myDebts = simplified.filter((d) => d.from.id === user.id);
-  const activeExpenses = expenses.filter((e) => !e.is_deleted);
+  // Records from before a fresh start are kept but move out of the way. The
+  // balance is still computed over all of them — it does not need filtering,
+  // because a cycle can only close when everyone is square, so a closed one
+  // nets to zero per person for ever.
+  const cycleId = group?.current_cycle_id ?? null;
+  const inThisCycle = (e: Expense) => (e.cycle_id ?? null) === cycleId;
+  const activeExpenses = expenses.filter((e) => !e.is_deleted && inThisCycle(e));
+  const earlierExpenses = expenses.filter((e) => !e.is_deleted && !inThisCycle(e));
   // Deleted records are kept so the reversal that balances the ledger stays
   // readable. Once the group is square that is no longer holding anything up.
   const deletedExpenses = expenses.filter((e) => e.is_deleted);
@@ -339,6 +347,29 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
       await load();
     } catch (error) {
       toast.error(friendlyDbError(error, 'Could not clear those records.'));
+    } finally {
+      setCleaning(false);
+    }
+  };
+
+  const handleStartFresh = async () => {
+    const ok = await confirm({
+      title: 'Start a fresh balance?',
+      message: `The ${activeExpenses.length} record${activeExpenses.length === 1 ? '' : 's'} here move to Earlier records and this group starts again from zero. Nothing is deleted, and everyone can still read them.`,
+      confirmLabel: 'Start fresh',
+    });
+    if (!ok) return;
+
+    setCleaning(true);
+    try {
+      const { error } = await supabase.rpc('start_new_cycle', { p_group_id: groupId });
+      if (error) throw error;
+      toast.success('Fresh balance started. The old records are under Earlier records.');
+      setShowManage(false);
+      setShowEarlier(false);
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not start a fresh balance.'));
     } finally {
       setCleaning(false);
     }
@@ -857,6 +888,52 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
             </div>
           )}
 
+          {/* Everything from before the last fresh start. Kept, reachable, and
+              out of the way — the point of starting fresh is that the current
+              view is about what is happening now. */}
+          {earlierExpenses.length > 0 && (
+            <>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                style={{ marginTop: 'var(--sp-4)' }}
+                onClick={() => setShowEarlier((on) => !on)}
+                aria-expanded={showEarlier}
+              >
+                <History size={14} />
+                {showEarlier ? 'Hide earlier records' : `Earlier records (${earlierExpenses.length})`}
+              </button>
+
+              {showEarlier && (
+                <div className="stack-sm" style={{ marginTop: 'var(--sp-3)' }}>
+                  <span className="hint">
+                    Settled and closed off when this group started fresh. Kept for the record.
+                  </span>
+                  {earlierExpenses.map((expense) => (
+                    <div key={expense.id} className="card row" style={{ opacity: 0.75 }}>
+                      <span className="emoji-badge">{categoryMeta(expense.category).emoji}</span>
+                      <span className="grow" style={{ minWidth: 0 }}>
+                        <span className="truncate" style={{ display: 'block', fontWeight: 600, fontSize: '0.88rem' }}>
+                          {expense.title}
+                        </span>
+                        <span className="hint">
+                          {userMap[expense.paid_by ?? '']?.display_name ?? 'Someone'} paid ·{' '}
+                          {new Date(expense.created_at).toLocaleDateString(undefined, {
+                            day: 'numeric',
+                            month: 'short',
+                          })}
+                        </span>
+                      </span>
+                      <span className="amount-md tabular" style={{ flexShrink: 0 }}>
+                        {formatLKR(Number(expense.amount))}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
           {/* Deleted records get their own section rather than sitting greyed
               out among the live ones. They were unreachable there: nothing to
               tap, and the count above says zero expenses while four rows show. */}
@@ -1239,8 +1316,8 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
               <>
               {!allSettled && (
                 <Alert variant="warning">
-                  Someone in this group is still up or down. Settle every balance before archiving or clearing
-                  the history — otherwise those debts would be silently written off.
+                  Someone in this group is still up or down. Settle every balance before archiving, starting
+                  fresh or clearing the history — otherwise those debts would be silently written off.
                 </Alert>
               )}
 
@@ -1291,16 +1368,43 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                 </button>
               </div>
 
+              {/* ---- Start fresh, keeping the records ---- */}
+              <div className="card">
+                <span className="row" style={{ gap: 8, marginBottom: 6 }}>
+                  <RotateCcw size={16} color="var(--primary)" />
+                  <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Start a fresh balance</span>
+                </span>
+                <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+                  Draws a line under everything so far and starts this group again from zero. Nothing is
+                  deleted — the old records move to <strong>Earlier records</strong>, where anyone in the group
+                  can still read them. Available once everyone here is settled up.
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-block"
+                  onClick={handleStartFresh}
+                  disabled={cleaning || !allSettled || activeExpenses.length === 0}
+                >
+                  {cleaning && <Spinner />}
+                  {activeExpenses.length === 0
+                    ? 'Nothing to close off yet'
+                    : !allSettled
+                      ? 'Settle up first'
+                      : 'Start fresh, keep the records'}
+                </button>
+              </div>
+
               {/* ---- Purge: irreversible ---- */}
               <div className="card" style={{ borderColor: 'var(--negative)' }}>
                 <span className="row" style={{ gap: 8, marginBottom: 6 }}>
                   <Eraser size={16} color="var(--negative)" />
-                  <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Clear history permanently</span>
+                  <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Start fresh and erase everything</span>
                 </span>
                 <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
-                  Frees up storage by erasing every expense, split, settlement and ledger entry in this group.
-                  The group and its members stay, ready to reuse. <strong>This cannot be undone</strong> — the
-                  record of who paid what will be gone for good, so archive instead if you might ever need it.
+                  The same fresh start, except the old records are destroyed rather than kept — every expense,
+                  split, settlement and ledger entry in this group, freeing the storage. The group and its
+                  members stay. <strong>This cannot be undone</strong>, so use the option above if you might
+                  ever want to look back.
                 </p>
                 <button
                   type="button"
@@ -1309,7 +1413,7 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                   disabled={cleaning || !allSettled || activeExpenses.length === 0}
                 >
                   {cleaning && <Spinner />}
-                  {activeExpenses.length === 0 ? 'Nothing to clear' : 'Clear history permanently'}
+                  {activeExpenses.length === 0 ? 'Nothing to clear' : 'Erase everything and start fresh'}
                 </button>
               </div>
 

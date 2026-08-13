@@ -5170,3 +5170,153 @@ BEGIN
     END IF;
 END
 $rt_payers$;
+
+-- ========================================
+-- STARTING A FRESH BALANCE
+-- ========================================
+-- Once everybody is square, a group or a pair should be able to draw a line and
+-- start again — a trip that ended, a flat-share year that closed — without
+-- carrying every old bill forward for ever.
+--
+-- Two ways, because they answer different needs and neither is always right:
+--
+--   Clear it out    purge_group_history(), already here: the records are gone.
+--   Keep it         this: the records stay, filed under a closed cycle, and the
+--                   current view starts empty.
+--
+-- The second is what keeps member_balance and group_is_settled out of this
+-- entirely. A boundary is only allowed when everyone is square, so every closed
+-- cycle nets to exactly zero per person, for ever — which means an unfiltered
+-- balance already equals the current cycle's balance. The money core never
+-- learns cycles exist.
+CREATE OR REPLACE FUNCTION public.start_new_cycle(p_group_id UUID)
+RETURNS UUID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_closing UUID;
+    v_new     UUID;
+BEGIN
+    IF NOT public.is_group_admin(p_group_id) THEN
+        RAISE EXCEPTION 'Only a group admin can start a fresh balance here';
+    END IF;
+
+    -- Re-checked here, not just in the UI. This is the condition that makes a
+    -- boundary safe: without it a cycle could close with money still owed
+    -- across it, and the filtered view would stop matching the balance.
+    IF NOT public.group_is_settled(p_group_id) THEN
+        RAISE EXCEPTION 'Settle every balance here before starting fresh';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM expenses WHERE group_id = p_group_id) THEN
+        RAISE EXCEPTION 'There is nothing to close off yet';
+    END IF;
+
+    SELECT id INTO v_closing FROM settlement_cycles
+    WHERE group_id = p_group_id AND status = 'ACTIVE'
+    ORDER BY started_at DESC LIMIT 1;
+
+    -- Everything recorded before cycles were ever used belongs to the cycle
+    -- being closed. Leaving those rows NULL would make the filter ambiguous:
+    -- NULL would mean both "before the first boundary" and "current".
+    IF v_closing IS NULL THEN
+        INSERT INTO settlement_cycles (group_id, initiated_by, started_at)
+        VALUES (p_group_id, auth.uid(),
+                COALESCE((SELECT MIN(created_at) FROM expenses WHERE group_id = p_group_id), NOW()))
+        RETURNING id INTO v_closing;
+    END IF;
+
+    UPDATE expenses          SET cycle_id = v_closing WHERE group_id = p_group_id AND cycle_id IS NULL;
+    UPDATE ledger_entries    SET cycle_id = v_closing WHERE group_id = p_group_id AND cycle_id IS NULL;
+    UPDATE group_settlements SET cycle_id = v_closing WHERE group_id = p_group_id AND cycle_id IS NULL;
+
+    UPDATE settlement_cycles
+    SET ended_at = NOW(), status = 'SETTLED'
+    WHERE id = v_closing;
+
+    INSERT INTO settlement_cycles (group_id, initiated_by)
+    VALUES (p_group_id, auth.uid())
+    RETURNING id INTO v_new;
+
+    UPDATE groups SET current_cycle_id = v_new, updated_at = NOW() WHERE id = p_group_id;
+
+    RETURN v_new;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.start_new_cycle(UUID) TO authenticated;
+
+-- What the group's current view is showing, and what sits behind "Earlier".
+-- One round trip rather than three, and it answers for a pair record just as
+-- well as a group.
+CREATE OR REPLACE FUNCTION public.group_cycle_info(p_group_id UUID)
+RETURNS TABLE (
+    out_cycle_id    UUID,
+    out_started_at  TIMESTAMPTZ,
+    out_current     INT,
+    out_earlier     INT,
+    out_closed      INT
+)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+    SELECT
+        g.current_cycle_id,
+        (SELECT started_at FROM settlement_cycles WHERE id = g.current_cycle_id),
+        (SELECT COUNT(*)::INT FROM expenses e
+          WHERE e.group_id = p_group_id AND NOT e.is_deleted
+            AND e.cycle_id IS NOT DISTINCT FROM g.current_cycle_id),
+        (SELECT COUNT(*)::INT FROM expenses e
+          WHERE e.group_id = p_group_id AND NOT e.is_deleted
+            AND e.cycle_id IS DISTINCT FROM g.current_cycle_id),
+        (SELECT COUNT(*)::INT FROM settlement_cycles c
+          WHERE c.group_id = p_group_id AND c.status = 'SETTLED')
+    FROM groups g
+    WHERE g.id = p_group_id AND public.is_group_member(p_group_id);
+$$;
+
+GRANT EXECUTE ON FUNCTION public.group_cycle_info(UUID) TO authenticated;
+
+-- New records join the cycle that is open now, so the boundary means something
+-- the moment it is drawn.
+CREATE OR REPLACE FUNCTION public.stamp_expense_cycle()
+RETURNS TRIGGER
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+    IF NEW.cycle_id IS NULL THEN
+        SELECT current_cycle_id INTO NEW.cycle_id FROM groups WHERE id = NEW.group_id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_stamp_expense_cycle ON expenses;
+CREATE TRIGGER trg_stamp_expense_cycle
+    BEFORE INSERT ON expenses
+    FOR EACH ROW EXECUTE FUNCTION public.stamp_expense_cycle();
+
+-- The same for the ledger and for settlements, so a closed cycle keeps a
+-- complete, self-contained account of itself.
+CREATE OR REPLACE FUNCTION public.stamp_ledger_cycle()
+RETURNS TRIGGER
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+    IF NEW.cycle_id IS NULL THEN
+        SELECT current_cycle_id INTO NEW.cycle_id FROM groups WHERE id = NEW.group_id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_stamp_ledger_cycle ON ledger_entries;
+CREATE TRIGGER trg_stamp_ledger_cycle
+    BEFORE INSERT ON ledger_entries
+    FOR EACH ROW EXECUTE FUNCTION public.stamp_ledger_cycle();
+
+DROP TRIGGER IF EXISTS trg_stamp_settlement_cycle ON group_settlements;
+CREATE TRIGGER trg_stamp_settlement_cycle
+    BEFORE INSERT ON group_settlements
+    FOR EACH ROW EXECUTE FUNCTION public.stamp_ledger_cycle();
+
+CREATE INDEX IF NOT EXISTS idx_expenses_cycle ON expenses(group_id, cycle_id);
