@@ -199,6 +199,65 @@ RAISE NOTICE '--- 7. Ben pays an 800 bill of Ann''s ---';
   RAISE NOTICE '  ✓ Ann owes 800 less and counts it; Ben fronted it and does not';
 
 -- =====================================================================
+RAISE NOTICE '--- 7b. A 1,500 item they both put money into ---';
+-- =====================================================================
+-- One puts in 1,000, the other 500, split down the middle. Naming either of
+-- them "the payer" would be wrong by 500 in opposite directions.
+  e := add_direct_expense(BEN, 1500, 'Rice cooker', TRUE, 750, FALSE, 'SHOPPING', 1000);
+
+  ba := member_balance(pair, ANN);
+  IF ba <> 5150 THEN
+    RAISE EXCEPTION 'stage 7b failed: balance % (want 5150) — 4900 + 250, not + 750', ba;
+  END IF;
+  IF pg_temp.spend(ANN) <> 3050 OR pg_temp.spend(BEN) <> 3450 THEN
+    RAISE EXCEPTION 'stage 7b failed: each is charged their share, not their payment (Ann % Ben %)',
+      pg_temp.spend(ANN), pg_temp.spend(BEN);
+  END IF;
+  SELECT COUNT(*) INTO n FROM expense_payers WHERE expense_id = e;
+  IF n <> 2 THEN RAISE EXCEPTION 'stage 7b failed: % contributions recorded', n; END IF;
+  RAISE NOTICE '  ✓ 250 owed, not 750; both contributions on record';
+
+-- =====================================================================
+RAISE NOTICE '--- 7c. Ann tries to change it a day later ---';
+-- =====================================================================
+-- Past ten minutes it is a proposal, not a change. This is the cheat the app
+-- has to stop: quietly turning a 1,500 purchase into 3,000 afterwards.
+  EXECUTE 'RESET ROLE';
+  UPDATE expenses SET updated_at = NOW() - INTERVAL '1 day',
+                      created_at = NOW() - INTERVAL '1 day' WHERE id = e;
+  EXECUTE 'SET ROLE authenticated';
+
+  st := update_direct_expense(e, 3000, 'Rice cooker', TRUE, 1500, FALSE, 'SHOPPING', 2000);
+  IF st <> 'PENDING' THEN
+    RAISE EXCEPTION 'stage 7c failed: an old record changed on one person''s say-so (%)', st;
+  END IF;
+  IF member_balance(pair, ANN) <> 5150 THEN
+    RAISE EXCEPTION 'stage 7c failed: the balance moved to % before Ben agreed',
+      member_balance(pair, ANN);
+  END IF;
+  IF pg_temp.spend(BEN) <> 3450 THEN
+    RAISE EXCEPTION 'stage 7c failed: Ben''s spending moved to % before he agreed',
+      pg_temp.spend(BEN);
+  END IF;
+  RAISE NOTICE '  ✓ asked, not done — nothing moved while it waited';
+
+  SELECT id INTO req FROM expense_change_requests WHERE expense_id = e AND status = 'PENDING';
+  PERFORM set_config('request.jwt.claim.sub', BEN::TEXT, true);
+  st := vote_on_expense_change(req, TRUE);
+  PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
+  IF st <> 'APPROVED' THEN RAISE EXCEPTION 'stage 7c failed: Ben''s yes did not carry (%)', st; END IF;
+
+  ba := member_balance(pair, ANN);
+  IF ba <> 5400 THEN
+    RAISE EXCEPTION 'stage 7c failed: balance % after approval (want 5400)', ba;
+  END IF;
+  IF pg_temp.spend(ANN) <> 3800 OR pg_temp.spend(BEN) <> 4200 THEN
+    RAISE EXCEPTION 'stage 7c failed: spending after approval (Ann % Ben %)',
+      pg_temp.spend(ANN), pg_temp.spend(BEN);
+  END IF;
+  RAISE NOTICE '  ✓ once he agreed, it moved — once, and by the right amount';
+
+-- =====================================================================
 RAISE NOTICE '--- 8. Ben pays back 2,000 of it ---';
 -- =====================================================================
   PERFORM set_config('request.jwt.claim.sub', BEN::TEXT, true);
@@ -206,14 +265,14 @@ RAISE NOTICE '--- 8. Ben pays back 2,000 of it ---';
   PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
 
   ba := member_balance(pair, ANN);
-  IF ba <> 2900 THEN RAISE EXCEPTION 'stage 8 failed: balance % (want 2900)', ba; END IF;
-  IF pg_temp.spend(ANN) <> 2300 OR pg_temp.spend(BEN) <> 2700 THEN
+  IF ba <> 3400 THEN RAISE EXCEPTION 'stage 8 failed: balance % (want 3400)', ba; END IF;
+  IF pg_temp.spend(ANN) <> 3800 OR pg_temp.spend(BEN) <> 4200 THEN
     RAISE EXCEPTION 'stage 8 failed: settling changed somebody''s spending (Ann % Ben %)',
       pg_temp.spend(ANN), pg_temp.spend(BEN);
   END IF;
   SELECT COUNT(*) INTO n FROM group_settlements WHERE group_id = pair;
   IF n <> 1 THEN RAISE EXCEPTION 'stage 8 failed: % payment records', n; END IF;
-  RAISE NOTICE '  ✓ 2,900 left; paying somebody back is not spending; the payment is on record';
+  RAISE NOTICE '  ✓ 3,400 left; paying somebody back is not spending; the payment is on record';
 
 -- =====================================================================
 RAISE NOTICE '--- 9. A real group with Cara, on top of all that ---';
@@ -238,7 +297,7 @@ RAISE NOTICE '--- 9. A real group with Cara, on top of all that ---';
       jsonb_build_object('user_id',ANN,'amount',0,'is_included',false)),'[]'::jsonb);
   PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
 
-  IF pg_temp.spend(ANN) <> 2600 OR pg_temp.spend(BEN) <> 3100 OR pg_temp.spend(CAR) <> 400 THEN
+  IF pg_temp.spend(ANN) <> 4100 OR pg_temp.spend(BEN) <> 4600 OR pg_temp.spend(CAR) <> 400 THEN
     RAISE EXCEPTION 'stage 9 failed: group shares not counted (Ann % Ben % Cara %)',
       pg_temp.spend(ANN), pg_temp.spend(BEN), pg_temp.spend(CAR);
   END IF;
@@ -250,7 +309,7 @@ RAISE NOTICE '--- 10. Ann tries to remove Ben mid-debt ---';
   blocked := FALSE;
   BEGIN PERFORM remove_friend(BEN); EXCEPTION WHEN OTHERS THEN blocked := TRUE; END;
   IF NOT blocked THEN
-    RAISE EXCEPTION 'stage 10 failed: removed a friend who still owes 2,900';
+    RAISE EXCEPTION 'stage 10 failed: removed a friend who still owes 3,400';
   END IF;
   IF NOT pg_temp.listed(ANN, BEN) THEN
     RAISE EXCEPTION 'stage 10 failed: the refusal still dropped him off the list';
@@ -261,7 +320,7 @@ RAISE NOTICE '--- 10. Ann tries to remove Ben mid-debt ---';
 RAISE NOTICE '--- 11. Ben clears the rest ---';
 -- =====================================================================
   PERFORM set_config('request.jwt.claim.sub', BEN::TEXT, true);
-  PERFORM record_settlement(pair, ANN, 2900, 'the rest', 'BANK');
+  PERFORM record_settlement(pair, ANN, 3400, 'the rest', 'BANK');
   PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
 
   IF member_balance(pair, ANN) <> 0 OR member_balance(pair, BEN) <> 0 THEN
@@ -289,9 +348,9 @@ RAISE NOTICE '--- 12. Old records are locked now ---';
 -- =====================================================================
 RAISE NOTICE '--- 13. Ann removes Ben, keeping the history ---';
 -- =====================================================================
-  -- Two loans, a shared dinner, his phone bill and her top-up.
-  IF friend_record_count(BEN) <> 5 THEN
-    RAISE EXCEPTION 'stage 13 failed: % records between them (want 5)', friend_record_count(BEN);
+  -- Two loans, a shared dinner, his phone bill, her top-up and the rice cooker.
+  IF friend_record_count(BEN) <> 6 THEN
+    RAISE EXCEPTION 'stage 13 failed: % records between them (want 6)', friend_record_count(BEN);
   END IF;
 
   PERFORM remove_friend(BEN);          -- history kept by default
@@ -301,9 +360,9 @@ RAISE NOTICE '--- 13. Ann removes Ben, keeping the history ---';
   IF n <> 0 THEN RAISE EXCEPTION 'stage 13 failed: still connected'; END IF;
 
   SELECT COUNT(*) INTO n FROM expenses WHERE group_id = pair AND NOT is_deleted;
-  IF n <> 5 THEN RAISE EXCEPTION 'stage 13 failed: shared history destroyed (% left)', n; END IF;
+  IF n <> 6 THEN RAISE EXCEPTION 'stage 13 failed: shared history destroyed (% left)', n; END IF;
 
-  IF pg_temp.spend(ANN) <> 2600 OR pg_temp.spend(BEN) <> 3100 THEN
+  IF pg_temp.spend(ANN) <> 4100 OR pg_temp.spend(BEN) <> 4600 THEN
     RAISE EXCEPTION 'stage 13 failed: unfriending rewrote spending (Ann % Ben %)',
       pg_temp.spend(ANN), pg_temp.spend(BEN);
   END IF;
@@ -345,8 +404,8 @@ RAISE NOTICE '--- 14b. What Ann keeps of the group she left, and what she does n
 -- =====================================================================
   -- She really did pay for that hotel. Her own share is hers whatever happened
   -- to her membership afterwards.
-  IF pg_temp.spend(ANN) <> 2600 THEN
-    RAISE EXCEPTION 'stage 14b failed: leaving erased her own spending (% of 2600)',
+  IF pg_temp.spend(ANN) <> 4100 THEN
+    RAISE EXCEPTION 'stage 14b failed: leaving erased her own spending (% of 4100)',
       pg_temp.spend(ANN);
   END IF;
 
@@ -384,7 +443,7 @@ RAISE NOTICE '--- 14b. What Ann keeps of the group she left, and what she does n
   IF n <> 2 THEN
     RAISE EXCEPTION 'stage 14b failed: the group lost bills when she left (% of 2)', n;
   END IF;
-  IF pg_temp.spend(BEN) <> 3100 THEN
+  IF pg_temp.spend(BEN) <> 4600 THEN
     RAISE EXCEPTION 'stage 14b failed: her leaving changed Ben''s spending (%)', pg_temp.spend(BEN);
   END IF;
   PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
@@ -402,7 +461,7 @@ RAISE NOTICE '--- 15. Ann adds him again ---';
     RAISE EXCEPTION 'stage 15 failed: re-added and still not listed';
   END IF;
   SELECT COUNT(*) INTO n FROM expenses WHERE group_id = pair AND NOT is_deleted;
-  IF n <> 5 THEN RAISE EXCEPTION 'stage 15 failed: history did not come back (%)', n; END IF;
+  IF n <> 6 THEN RAISE EXCEPTION 'stage 15 failed: history did not come back (%)', n; END IF;
   IF member_balance(pair, ANN) <> 0 THEN
     RAISE EXCEPTION 'stage 15 failed: re-adding invented a balance (%)', member_balance(pair, ANN);
   END IF;
@@ -422,7 +481,7 @@ RAISE NOTICE '--- 16. The ledgers still add up ---';
   RAISE NOTICE '  ✓ both ledgers net to zero after all of it';
 
   RAISE NOTICE '';
-  RAISE NOTICE '=== PAIR E2E: 17/17 STAGES PASSED ===';
+  RAISE NOTICE '=== PAIR E2E: 19/19 STAGES PASSED ===';
   RAISE NOTICE '    final: Ann spent %, Ben spent %, Cara spent %',
     pg_temp.spend(ANN), pg_temp.spend(BEN), pg_temp.spend(CAR);
 END $t$;

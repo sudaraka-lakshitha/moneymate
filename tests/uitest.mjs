@@ -16,6 +16,9 @@ fs.mkdirSync(SHOTS, { recursive: true });
 const ME = '11111111-1111-1111-1111-111111111111';
 const BEN = '22222222-2222-2222-2222-222222222222';
 const CARA = '33333333-3333-3333-3333-333333333333';
+// A group-mate who is not a friend and is square with me. Sharing a group
+// makes somebody a group-mate, not a friend — she must not be in the list.
+const DANA = '44444444-4444-4444-4444-444444444444';
 const G1 = 'aaaaaaaa-0000-0000-0000-000000000001';
 const DIRECT = 'aaaaaaaa-0000-0000-0000-000000000002';
 
@@ -23,6 +26,7 @@ const user = (id, name, email) => ({ id, display_name: name, email, avatar_url: 
 const meU = user(ME, 'Sudaraka Lakshitha', 'me@t.lk');
 const benU = user(BEN, 'Ben Perera', 'ben@t.lk');
 const caraU = user(CARA, 'Cara Silva', 'cara@t.lk');
+const danaU = user(DANA, 'Dana Fernando', 'dana@t.lk');
 
 const today = new Date().toISOString();
 const day = (n) => new Date(Date.now() - n * 864e5).toISOString().slice(0, 10);
@@ -40,6 +44,7 @@ const members = [
   { group_id: G1, user_id: ME, role: 'ADMIN', users: meU, user: meU, groups: groups[0] },
   { group_id: G1, user_id: BEN, role: 'MEMBER', users: benU, user: benU, groups: groups[0] },
   { group_id: G1, user_id: CARA, role: 'MEMBER', users: caraU, user: caraU, groups: groups[0] },
+  { group_id: G1, user_id: DANA, role: 'MEMBER', users: danaU, user: danaU, groups: groups[0] },
   { group_id: DIRECT, user_id: ME, role: 'ADMIN', users: meU, user: meU, groups: groups[1] },
   { group_id: DIRECT, user_id: BEN, role: 'ADMIN', users: benU, user: benU, groups: groups[1] },
 ];
@@ -145,7 +150,7 @@ const friendRequests = [
 ];
 
 
-const byId = { [ME]: meU, [BEN]: benU, [CARA]: caraU };
+const byId = { [ME]: meU, [BEN]: benU, [CARA]: caraU, [DANA]: danaU };
 const splitsFlat = expenses.flatMap((e) =>
   (e.expense_splits ?? []).map((s) => ({
     ...s, expense_id: e.id, percentage: 0, shares: 1, users: byId[s.user_id],
@@ -157,7 +162,7 @@ const splitsFlat = expenses.flatMap((e) =>
 );
 
 const TABLES = {
-  users: [meU, benU, caraU],
+  users: [meU, benU, caraU, danaU],
   groups,
   group_members: members,
   expenses,
@@ -189,7 +194,10 @@ const TABLES = {
 const RPC = {
   run_due_recurring: 0,
   claim_pending_invitations: null,
-  member_balance: 1600,
+  // Per person, so the Friends list is answering about somebody rather than
+  // about a constant. Dana is square with me and no connection of mine, which
+  // is exactly the row that must not appear.
+  member_balance: ({ p_user_id }) => (p_user_id === DANA ? 0 : 1600),
   group_is_settled: false,
   deleted_expense_count: 1,
   friend_record_count: 2,
@@ -290,7 +298,17 @@ const run = async () => {
 
     if (path.startsWith('/rest/v1/rpc/')) {
       const fn = path.split('/').pop();
-      const body = fn in RPC ? RPC[fn] : null;
+      // A function entry gets the arguments, so a stub can answer differently
+      // per person — a flat constant would make "who belongs in the list" pass
+      // whatever the screen filtered on.
+      const entry = fn in RPC ? RPC[fn] : null;
+      let args = {};
+      try {
+        args = JSON.parse(route.request().postData() || '{}');
+      } catch {
+        /* GET-style rpc call */
+      }
+      const body = typeof entry === 'function' ? entry(args) : entry;
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
     }
 
@@ -485,8 +503,14 @@ const run = async () => {
   await page.waitForTimeout(400);
 
   // One amount per member, so "we put in 1,000 and 500" is expressible at all.
+  const groupSize = members.filter((m) => m.group_id === G1).length;
   const payerFields = await page.locator('div[aria-label="Who paid"] input[inputmode="decimal"]').count();
-  check('Add expense', 'an amount per member appears', payerFields === 3, `${payerFields} fields`);
+  check(
+    'Add expense',
+    'an amount per member appears',
+    payerFields === groupSize,
+    `${payerFields} fields for ${groupSize} members`
+  );
 
   // The remainder is the number people watch while typing, so it has to be
   // right before it is reassuring.
@@ -530,6 +554,11 @@ const run = async () => {
   await goTab('Friends');
   await visible('Friends', 'friend listed', 'text=Ben Perera');
   await visible('Friends', 'incoming request', 'text=Cara Silva');
+  // Sharing a group makes somebody a group-mate, not a friend. Dana is in the
+  // flat-share and square with me, so she belongs in that group's screen and
+  // nowhere near this list.
+  const danaRows = await page.locator('text=Dana Fernando').count();
+  check('Friends', 'a settled group-mate is not a friend', danaRows === 0, `${danaRows} rows`);
   await noOverflow('Friends');
   await shot('06-friends');
 
