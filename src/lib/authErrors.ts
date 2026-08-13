@@ -136,10 +136,37 @@ export const friendlyAuthError = (error: unknown): string => {
     return 'Cannot reach the server. Check your internet connection.';
   }
   if (haystack.includes('infinite recursion')) {
-    return 'The database security policies need updating — re-run supabase_schema.sql in the Supabase SQL editor.';
+    return 'Something went wrong on our side. Please try again in a moment.';
   }
   return raw || 'Something went wrong. Please try again.';
 };
+
+/**
+ * Database plumbing that means nothing to the person holding the phone.
+ *
+ * The server raises its own refusals in plain English — "Only a group admin can
+ * remove members" — and those are worth showing verbatim. Postgres's own errors
+ * are not: constraint names and column types are for us, in the console. Anything
+ * matching here falls back to the caller's wording instead.
+ */
+const INTERNAL_ERROR = new RegExp(
+  [
+    'violates',
+    'constraint',
+    'duplicate key',
+    'null value in column',
+    'invalid input syntax',
+    'syntax error',
+    'permission denied for',
+    'relation "',
+    'column "',
+    'operator does not exist',
+    'out of range',
+    'pgrst',
+    'jwt',
+  ].join('|'),
+  'i'
+);
 
 /** Shared wording for non-auth Supabase failures. */
 export const friendlyDbError = (error: unknown, fallback: string): string => {
@@ -147,16 +174,21 @@ export const friendlyDbError = (error: unknown, fallback: string): string => {
   const haystack = raw.toLowerCase();
 
   if (haystack.includes('infinite recursion')) {
-    return 'Database policies are out of date — re-run supabase_schema.sql in the Supabase SQL editor.';
+    return 'Something went wrong on our side. Please try again in a moment.';
   }
   if (haystack.includes('row-level security') || haystack.includes('violates row-level')) {
     return 'You do not have permission to do that.';
   }
   if (haystack.includes('could not find the function') || haystack.includes('does not exist')) {
-    return 'This feature needs the latest database schema — re-run supabase_schema.sql in the Supabase SQL editor.';
+    return 'This part of the app is being updated. Please refresh and try again.';
   }
   if (haystack.includes('failed to fetch') || haystack.includes('networkerror')) {
     return 'Cannot reach the server. Check your internet connection.';
   }
-  return raw || fallback;
+  if (!raw || INTERNAL_ERROR.test(raw)) {
+    // Keep the detail where it is useful rather than throwing it away.
+    if (raw) console.error('Database error:', raw);
+    return fallback;
+  }
+  return raw;
 };

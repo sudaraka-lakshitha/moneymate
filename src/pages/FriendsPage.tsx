@@ -1,19 +1,50 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { useLiveRefresh } from '../lib/realtime';
-import { Expense, FriendRequest, Group, GroupSettlement, User } from '../types';
+import { Expense, ExpenseCategory, FriendRequest, Group, GroupMember, GroupSettlement, User } from '../types';
 import { formatLKR, formatLKRSigned, parseAmount, roundMoney } from '../lib/currency';
 import { computeFriendBalances, FriendBalanceDetail, GroupLedger, netByUser } from '../lib/balances';
 import { friendlyDbError } from '../lib/authErrors';
+import { CATEGORIES, categoryMeta } from '../lib/categories';
 import { friendlyDate } from '../lib/dates';
 import { Alert, Avatar, EmptyState, Sheet, SkeletonRows, Spinner } from '../components/ui';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
+import { AddExpenseModal } from './AddExpenseModal';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/Confirm';
-import { Check, Clock, HandCoins, Pencil, Trash2, UserMinus, UserPlus, Search, X, Pin } from 'lucide-react';
+import { Check, Clock, Eraser, HandCoins, History, Pencil, RotateCcw, Trash2, UserMinus, UserPlus, Search, X, Pin } from 'lucide-react';
 
 interface FriendsPageProps {
   user: User;
+}
+
+/**
+ * One transaction the two of you are both on. A friend's balance is the sum of
+ * these, and a total on its own is not something anybody can check or correct —
+ * so the sheet lists them.
+ */
+interface PairRecord {
+  expense: Expense;
+  groupId: string;
+  groupName?: string;
+  isDirect: boolean;
+  /** What this expense charged you, and what it charged them. */
+  myShare: number;
+  theirShare: number;
+}
+
+/** A proposed edit or delete, waiting on the people it affects. */
+interface PendingChange {
+  out_request_id: string;
+  out_expense_id: string;
+  out_kind: 'EDIT' | 'DELETE';
+  out_requested_by: string;
+  out_requester: string;
+  out_payload: { title?: string; amount?: number } | null;
+  out_approvals: number;
+  out_needed: number;
+  out_my_vote: boolean | null;
+  out_can_vote: boolean;
 }
 
 /** A row shown in the list — either shared-balance data, a direct connection, or both. */
@@ -33,6 +64,10 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const [friends, setFriends] = useState<DisplayFriend[]>([]);
   const [settlements, setSettlements] = useState<GroupSettlement[]>([]);
   const [groupNames, setGroupNames] = useState<Record<string, string>>({});
+  /** groupId -> the cycle open in it now, so records from before a fresh start
+      can step out of the way without being destroyed. */
+  const [cycleByGroup, setCycleByGroup] = useState<Record<string, string | null>>({});
+  const [showEarlier, setShowEarlier] = useState(false);
   const [directGroupIds, setDirectGroupIds] = useState<Set<string>>(new Set());
   /** friendId -> the id of the hidden 1:1 group holding our direct records. */
   const [directGroupByFriend, setDirectGroupByFriend] = useState<Record<string, string>>({});
@@ -43,6 +78,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<DisplayFriend | null>(null);
   const [settleTarget, setSettleTarget] = useState<SettleTarget | null>(null);
+  const [settleChoices, setSettleChoices] = useState<SettleTarget[]>([]);
 
   const [showAdd, setShowAdd] = useState(false);
   const [addEmail, setAddEmail] = useState('');
@@ -54,17 +90,32 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const [lendTo, setLendTo] = useState<User | null>(null);
   const [lendAmount, setLendAmount] = useState('');
   const [lendNote, setLendNote] = useState('');
+  const [lendCategory, setLendCategory] = useState<ExpenseCategory>('OTHER');
   const [lendMode, setLendMode] = useState<'LENT' | 'BORROWED' | 'SHARED'>('LENT');
   const [iPaid, setIPaid] = useState(true);
   const [theirShare, setTheirShare] = useState('');
+  /** Both of you put money in. What you paid; theirs is whatever is left. */
+  const [bothPaid, setBothPaid] = useState(false);
+  const [myPayment, setMyPayment] = useState('');
   const [lending, setLending] = useState(false);
   const [lendError, setLendError] = useState<string | null>(null);
   const [editingEntry, setEditingEntry] = useState<Expense | null>(null);
   const [directEntries, setDirectEntries] = useState<Expense[]>([]);
   /** expenseId -> friendId -> their stored share, so editing never guesses. */
   const [directShares, setDirectShares] = useState<Record<string, Record<string, number>>>({});
+  /** expenseId -> what I put in, so a record we both paid for reopens as it is. */
+  const [directPaid, setDirectPaid] = useState<Record<string, Record<string, number>>>({});
   const [busyEntry, setBusyEntry] = useState<string | null>(null);
   const [removingFriend, setRemovingFriend] = useState(false);
+  const [clearingDeleted, setClearingDeleted] = useState(false);
+  /** groupId -> its members, so a group bill can be edited from here. */
+  const [membersByGroup, setMembersByGroup] = useState<Record<string, GroupMember[]>>({});
+  /** Every expense the two of you are both on, direct or in a shared group. */
+  const [pairRecords, setPairRecords] = useState<PairRecord[]>([]);
+  /** expenseId -> the change waiting on it, if somebody has proposed one. */
+  const [pairChanges, setPairChanges] = useState<Record<string, PendingChange>>({});
+  const [pairLoading, setPairLoading] = useState(false);
+  const [editingGroupExpense, setEditingGroupExpense] = useState<Expense | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -130,23 +181,46 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
         // The stored split, not a guess. Opening an edit without it would fall
         // back to an even split and silently halve a loan on save.
         if (entries.length > 0) {
-          const { data: splitData } = await supabase
-            .from('expense_splits')
-            .select('expense_id, user_id, amount')
-            .in('expense_id', entries.map((x) => x.id));
+          const ids = entries.map((x) => x.id);
+          const [{ data: splitData }, { data: payerData }] = await Promise.all([
+            supabase
+              .from('expense_splits')
+              .select('expense_id, user_id, amount')
+              .in('expense_id', ids),
+            // What each of you actually put in, which is a separate question
+            // from what each of you owes.
+            supabase.from('expense_payers').select('expense_id, user_id, amount').in('expense_id', ids),
+          ]);
           const map: Record<string, Record<string, number>> = {};
           for (const row of (splitData ?? []) as any[]) {
             (map[row.expense_id] ||= {})[row.user_id] = Number(row.amount);
           }
           setDirectShares(map);
+
+          const paid: Record<string, Record<string, number>> = {};
+          for (const row of (payerData ?? []) as any[]) {
+            (paid[row.expense_id] ||= {})[row.user_id] = Number(row.amount);
+          }
+          setDirectPaid(paid);
         } else {
           setDirectShares({});
+          setDirectPaid({});
         }
       } else {
         setDirectEntries([]);
         setDirectShares({});
+        setDirectPaid({});
       }
+      const byGroup: Record<string, GroupMember[]> = {};
+      for (const row of (memberRes.data ?? []) as any[]) {
+        (byGroup[row.group_id] ||= []).push({ ...row, user: row.users } as GroupMember);
+      }
+      setMembersByGroup(byGroup);
+
       setGroupNames(Object.fromEntries(groups.map((g) => [g.id, g.name])));
+      setCycleByGroup(
+        Object.fromEntries(groups.map((g) => [g.id, (g as any).current_cycle_id ?? null]))
+      );
       const directIdSet = new Set(groups.filter((g) => g.is_direct).map((g) => g.id));
       setDirectGroupIds(directIdSet);
       setDirectGroupByFriend(
@@ -205,17 +279,26 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
           total_i_owe_them: 0,
           shared_group_count: 0,
           perGroup: [],
+          groupIds: [],
           isConnected: true,
           isPinned: pinnedIds.has(resolved.id),
         });
       }
 
+      // A row earns its place by being a connection or by having money
+      // outstanding. Sharing a group makes somebody a group-mate, not a friend —
+      // they are already listed inside that group, and keeping them here is why
+      // people who are no longer friends never left the list.
+      const visible = merged.filter(
+        (f) => f.isConnected || Math.abs(f.net_balance) >= 0.01
+      );
+
       // Pinned first, then by how much money is at stake, then settled friends.
-      merged.sort((a, b) => {
+      visible.sort((a, b) => {
         if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
         return Math.abs(b.net_balance) - Math.abs(a.net_balance);
       });
-      setFriends(merged);
+      setFriends(visible);
       setIncoming(requests.filter((r) => r.status === 'PENDING' && r.addressee_id === user.id));
       setOutgoing(requests.filter((r) => r.status === 'PENDING' && r.requester_id === user.id));
     } catch (err) {
@@ -229,7 +312,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     void load();
   }, [load]);
 
-  useLiveRefresh('friends', ['expenses','ledger_entries','group_settlements','friend_requests','group_members'], load);
+  useLiveRefresh('friends', ['expenses','expense_payers','ledger_entries','group_settlements','friend_requests','group_members','expense_change_requests','expense_change_votes'], load);
 
   const totals = useMemo(() => {
     let owedToMe = 0;
@@ -245,18 +328,124 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     f.friend.display_name.toLowerCase().includes(search.trim().toLowerCase())
   );
 
-  /** The loans and shared bills recorded directly with the open friend. */
-  const selectedEntries = useMemo(() => {
+  /**
+   * Everything the two of you are both on — the direct records plus every bill
+   * in a shared group that charged you both. Fetched when the sheet opens
+   * rather than up front, because it is per friend and the list screen never
+   * needs it.
+   */
+  const loadPairRecords = useCallback(
+    async (friendId: string, groupIds: string[]) => {
+      if (groupIds.length === 0) {
+        setPairRecords([]);
+        return;
+      }
+      setPairLoading(true);
+      try {
+        const { data, error: pairError } = await supabase
+          .from('expenses')
+          .select('*, paid_by_user:users!expenses_paid_by_fkey(*), expense_splits(user_id, amount, is_included)')
+          .in('group_id', groupIds)
+          .eq('is_deleted', false)
+          .order('created_at', { ascending: false })
+          .limit(200);
+        if (pairError) throw pairError;
+
+        const rows: PairRecord[] = [];
+        for (const row of (data ?? []) as any[]) {
+          const splits = (row.expense_splits ?? []) as { user_id: string; amount: number; is_included: boolean }[];
+          const mine = splits.find((sp) => sp.user_id === user.id && sp.is_included);
+          const theirs = splits.find((sp) => sp.user_id === friendId && sp.is_included);
+
+          // Both of you have to be on it, as a payer or as a share. A bill your
+          // flatmate split with somebody else is not a transaction between you.
+          const iAmOn = Boolean(mine) || row.paid_by === user.id;
+          const theyAreOn = Boolean(theirs) || row.paid_by === friendId;
+          if (!iAmOn || !theyAreOn) continue;
+
+          rows.push({
+            expense: row as Expense,
+            groupId: row.group_id,
+            groupName: groupNames[row.group_id],
+            isDirect: directGroupIds.has(row.group_id),
+            myShare: Number(mine?.amount ?? 0),
+            theirShare: Number(theirs?.amount ?? 0),
+          });
+        }
+        setPairRecords(rows);
+
+        // Changes somebody has proposed to any of these records. One call per
+        // group because the records here span the pair ledger and every group
+        // you are both in.
+        const changeLists = await Promise.all(
+          groupIds.map((id) => supabase.rpc('pending_changes_for_group', { p_group_id: id }))
+        );
+        const byExpense: Record<string, PendingChange> = {};
+        for (const res of changeLists) {
+          for (const row of (res.data ?? []) as PendingChange[]) byExpense[row.out_expense_id] = row;
+        }
+        setPairChanges(byExpense);
+      } catch (err) {
+        toast.error(friendlyDbError(err, 'Could not load the records between you.'));
+        setPairRecords([]);
+        setPairChanges({});
+      } finally {
+        setPairLoading(false);
+      }
+    },
+    [user.id, groupNames, directGroupIds, toast]
+  );
+
+  // Split by which run of the group each record belongs to. A record whose
+  // group has moved on is history; everything else is live. The balances above
+  // are computed over the whole ledger regardless, and correctly so: a cycle
+  // only closes when everyone is square, so a closed one contributes zero.
+  const currentRecords = useMemo(
+    () =>
+      pairRecords.filter(
+        (r) => (r.expense.cycle_id ?? null) === (cycleByGroup[r.groupId] ?? null)
+      ),
+    [pairRecords, cycleByGroup]
+  );
+  const earlierRecords = useMemo(
+    () =>
+      pairRecords.filter(
+        (r) => (r.expense.cycle_id ?? null) !== (cycleByGroup[r.groupId] ?? null)
+      ),
+    [pairRecords, cycleByGroup]
+  );
+
+  useEffect(() => {
+    if (!selected) {
+      setPairRecords([]);
+      return;
+    }
+    const direct = directGroupByFriend[selected.friend.id];
+    const ids = Array.from(new Set([...(direct ? [direct] : []), ...selected.groupIds]));
+    void loadPairRecords(selected.friend.id, ids);
+  }, [selected?.friend.id, loadPairRecords, directGroupByFriend]);
+
+  /** Every outstanding part of this friend's balance, largest first. */
+  const settleOptions = useMemo<SettleTarget[]>(() => {
     if (!selected) return [];
-    const groupId = directGroupByFriend[selected.friend.id];
-    if (!groupId) return [];
-    return directEntries.filter((x) => x.group_id === groupId);
-  }, [selected, directEntries, directGroupByFriend]);
+    return selected.perGroup
+      .filter((entry) => Math.abs(entry.net) >= 0.01)
+      .sort((a, b) => Math.abs(b.net) - Math.abs(a.net))
+      .map((entry) => ({
+        groupId: entry.groupId,
+        // The pair group's internal name would read "Between you and X" on X's
+        // own settle sheet.
+        groupName: directGroupIds.has(entry.groupId) ? undefined : entry.groupName,
+        payee: selected.friend,
+        suggestedAmount: Math.abs(entry.net),
+        // Positive means they owe me, so the payment comes from them.
+        direction: entry.net > 0 ? ('THEY_PAY' as const) : ('I_PAY' as const),
+      }));
+  }, [selected, directGroupIds]);
 
   /**
-   * Settlements post against one group, so the headline button acts on the
-   * largest outstanding balance rather than pretending to clear several at
-   * once. The per-group rows below remain available for the rest.
+   * Settlements post against one group, so the single button opens on the
+   * largest outstanding balance; the sheet lets you switch to another.
    */
   const settleablePart = useMemo(() => {
     if (!selected) return null;
@@ -374,6 +563,9 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     setLendMode('LENT');
     setIPaid(true);
     setTheirShare('');
+    setBothPaid(false);
+    setMyPayment('');
+    setLendCategory('OTHER');
     setLendError(null);
     setSelected(null);
   };
@@ -389,10 +581,21 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     setLendNote(entry.title === 'Loan' || entry.title === 'Shared expense' ? '' : entry.title);
     setIPaid(iPaidIt);
     setTheirShare(String(theirs));
+    setLendCategory((entry.category ?? 'OTHER') as ExpenseCategory);
 
-    // Reopen in the shape it was recorded in, so saving without touching
-    // anything cannot quietly change what the record means.
-    if (iPaidIt && Math.abs(theirs - total) < 0.01) setLendMode('LENT');
+    // A record you both put money into reopens showing both amounts, rather
+    // than collapsing onto whoever paid more and losing the other half.
+    const paidRows = directPaid[entry.id] ?? {};
+    const mineIn = paidRows[user.id] ?? 0;
+    const both = Object.values(paidRows).filter((v) => v > 0).length > 1;
+    setBothPaid(both);
+    setMyPayment(both ? String(mineIn) : '');
+
+    // Reopen as it was recorded, so saving without touching anything cannot
+    // quietly change what the record means. The stored flag decides, not the
+    // numbers: "I lent you 5,000" and "I paid your 5,000 bill" look the same.
+    if (entry.is_loan === false) setLendMode('SHARED');
+    else if (iPaidIt && Math.abs(theirs - total) < 0.01) setLendMode('LENT');
     else if (!iPaidIt && Math.abs(theirs) < 0.01) setLendMode('BORROWED');
     else setLendMode('SHARED');
 
@@ -401,25 +604,79 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   };
 
   const handleDeleteEntry = async (entry: Expense) => {
+    // Past ten minutes the other person has to agree, so say so up front.
+    const needsApproval =
+      Date.now() - new Date(entry.updated_at ?? entry.created_at).getTime() > 10 * 60 * 1000;
+
     const ok = await confirm({
-      title: 'Delete this record?',
-      message: `"${entry.title}" will be removed and your balance updated.`,
-      confirmLabel: 'Delete',
-      danger: true,
+      title: needsApproval ? 'Ask to delete this record?' : 'Delete this record?',
+      message: needsApproval
+        ? `"${entry.title}" is older than ten minutes, so it stays until the other person agrees. Your balance does not change in the meantime.`
+        : `"${entry.title}" will be removed and your balance updated.`,
+      confirmLabel: needsApproval ? 'Ask to delete' : 'Delete',
+      danger: !needsApproval,
     });
     if (!ok) return;
 
     setBusyEntry(entry.id);
     try {
-      const { error: rpcError } = await supabase.rpc('delete_expense', {
+      const { data, error: rpcError } = await supabase.rpc('delete_expense', {
         p_expense_id: entry.id,
         p_reason: 'Removed from Friends',
       });
       if (rpcError) throw rpcError;
-      toast.success('Record deleted.');
+      toast.success(
+        data === 'PENDING'
+          ? 'Asked. The record stays until they agree.'
+          : 'Record deleted.'
+      );
       await load();
+      if (selected) await loadPairRecords(selected.friend.id, selected.groupIds);
     } catch (err) {
       toast.error(friendlyDbError(err, 'Could not delete that record.'));
+    } finally {
+      setBusyEntry(null);
+    }
+  };
+
+  const handleVoteOnChange = async (requestId: string, approved: boolean) => {
+    setBusyEntry(requestId);
+    try {
+      const { data, error: rpcError } = await supabase.rpc('vote_on_expense_change', {
+        p_request_id: requestId,
+        p_approved: approved,
+      });
+      if (rpcError) throw rpcError;
+      toast.success(
+        data === 'APPROVED'
+          ? 'Approved — the record and your balance are updated.'
+          : data === 'REJECTED'
+            ? 'Turned down. The record stays as it was.'
+            : data === 'CANCELLED'
+              ? 'That record was settled in the meantime, so the change was dropped.'
+              : 'Noted.'
+      );
+      await load();
+      if (selected) await loadPairRecords(selected.friend.id, selected.groupIds);
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not record your answer.'));
+    } finally {
+      setBusyEntry(null);
+    }
+  };
+
+  const handleWithdrawChange = async (requestId: string) => {
+    setBusyEntry(requestId);
+    try {
+      const { error: rpcError } = await supabase.rpc('cancel_expense_change', {
+        p_request_id: requestId,
+      });
+      if (rpcError) throw rpcError;
+      toast.success('Withdrawn.');
+      await load();
+      if (selected) await loadPairRecords(selected.friend.id, selected.groupIds);
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not withdraw that.'));
     } finally {
       setBusyEntry(null);
     }
@@ -440,6 +697,10 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     //   borrowed -> they paid, none of it is theirs
     //   shared   -> whoever paid, split (evenly unless overridden)
     const paidByMe = lendMode === 'SHARED' ? iPaid : lendMode === 'LENT';
+    // Lending and paying somebody's bill produce identical numbers and mean
+    // opposite things, so the choice made here travels with the record instead
+    // of being guessed back out of the split later.
+    const isLoan = lendMode !== 'SHARED';
     let share: number;
     if (lendMode === 'LENT') share = amount;
     else if (lendMode === 'BORROWED') share = 0;
@@ -450,15 +711,29 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       return;
     }
 
+    // Null unless you both put money in, which the database reads as "one of
+    // you paid all of it", chosen by p_i_paid — the behaviour that was here
+    // before contributions existed.
+    const mineIn =
+      lendMode === 'SHARED' && bothPaid ? roundMoney(parseAmount(myPayment)) : null;
+
+    if (mineIn !== null && (mineIn < 0 || mineIn > amount)) {
+      setLendError(`What you paid must be between Rs. 0 and ${formatLKR(amount)}.`);
+      return;
+    }
+
     setLending(true);
     try {
-      const { error: rpcError } = editingEntry
+      const { data: outcome, error: rpcError } = editingEntry
         ? await supabase.rpc('update_direct_expense', {
             p_expense_id: editingEntry.id,
             p_amount: amount,
             p_note: lendNote.trim(),
             p_i_paid: paidByMe,
             p_their_share: share,
+            p_is_loan: isLoan,
+            p_category: isLoan ? 'OTHER' : lendCategory,
+            p_my_payment: mineIn,
           })
         : await supabase.rpc('add_direct_expense', {
             p_friend_id: lendTo.id,
@@ -466,21 +741,34 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
             p_note: lendNote.trim(),
             p_i_paid: paidByMe,
             p_their_share: share,
+            p_is_loan: isLoan,
+            p_category: isLoan ? 'OTHER' : lendCategory,
+            p_my_payment: mineIn,
           });
       if (rpcError) throw rpcError;
 
-      // What changes hands is their share when I paid, my share when they did.
-      const delta = paidByMe ? share : amount - share;
+      // What changes hands is the gap between what you put in and what was
+      // yours to pay. With one payer that reduces to their share, or to yours
+      // when they paid — the two cases this used to handle separately.
+      const myShare = roundMoney(amount - share);
+      const myPaid = mineIn ?? (paidByMe ? amount : 0);
+      const delta = roundMoney(myPaid - myShare);
       toast.success(
-        delta === 0
-          ? 'Recorded.'
-          : paidByMe
-            ? `Recorded — ${lendTo.display_name} owes you ${formatLKR(delta)}.`
-            : `Recorded — you owe ${lendTo.display_name} ${formatLKR(delta)}.`
+        // Editing a record more than ten minutes old is a proposal: nothing
+        // moves until the other person agrees, so promising a new balance here
+        // would be a lie.
+        outcome === 'PENDING'
+          ? `Asked ${lendTo.display_name.split(' ')[0]}. Nothing changes until they agree.`
+          : Math.abs(delta) < 0.01
+            ? 'Recorded — you are square on this one.'
+            : delta > 0
+              ? `Recorded — ${lendTo.display_name} owes you ${formatLKR(delta)}.`
+              : `Recorded — you owe ${lendTo.display_name} ${formatLKR(-delta)}.`
       );
       setLendTo(null);
       setEditingEntry(null);
       await load();
+      if (selected) await loadPairRecords(selected.friend.id, selected.groupIds);
     } catch (err) {
       setLendError(friendlyDbError(err, 'Could not record that.'));
     } finally {
@@ -490,29 +778,144 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
 
   const handleRemoveFriend = async (friend: DisplayFriend) => {
     const owing = Math.abs(friend.net_balance) >= 0.01;
+
+    // How much shared history removal would leave behind, asked before the
+    // confirmation so it can name a number rather than warn vaguely.
+    let records = 0;
+    if (!owing) {
+      const { data } = await supabase.rpc('friend_record_count', { p_friend_id: friend.friend.id });
+      records = Number(data ?? 0);
+    }
+
     const ok = await confirm({
       title: `Remove ${friend.friend.display_name}?`,
       message: owing
         ? `There is still ${formatLKR(Math.abs(friend.net_balance))} between you. Settle up first.`
-        : 'You will no longer be connected. Past records stay on both sides, and you can add them again later.',
+        : records > 0
+          ? `They will leave your friends list. The ${records} ${records === 1 ? 'record' : 'records'} between you stay saved on both sides — you will be asked next whether to erase those too.`
+          : 'They will leave your friends list. You can add them again later.',
       confirmLabel: owing ? 'OK' : 'Remove',
       danger: !owing,
     });
     if (!ok || owing) return;
 
+    // Erasing is a separate answer because it is the destructive half: it takes
+    // the records off the other person's screen as well, and they never agreed
+    // to that. Saying no still removes the friend.
+    let purge = false;
+    if (records > 0) {
+      purge = await confirm({
+        title: 'Erase the records too?',
+        message: `This permanently deletes the ${records} ${records === 1 ? 'record' : 'records'} between you, for both of you. It cannot be undone. Choose Keep to remove the friend but leave the history in place.`,
+        confirmLabel: 'Erase',
+        cancelLabel: 'Keep',
+        danger: true,
+      });
+    }
+
     setRemovingFriend(true);
     try {
       const { error: rpcError } = await supabase.rpc('remove_friend', {
         p_friend_id: friend.friend.id,
+        p_purge_history: purge,
       });
       if (rpcError) throw rpcError;
-      toast.info(`${friend.friend.display_name} removed.`);
+      toast.info(
+        purge
+          ? `${friend.friend.display_name} removed and the shared records erased.`
+          : `${friend.friend.display_name} removed.`
+      );
       setSelected(null);
       await load();
     } catch (err) {
       toast.error(friendlyDbError(err, 'Could not remove that friend.'));
     } finally {
       setRemovingFriend(false);
+    }
+  };
+
+  /**
+   * Permanently erases records between the two of you that were already
+   * deleted. A deleted record is kept so the reversal that balances the ledger
+   * stays readable; once you are square that is no longer holding anything up,
+   * and the rows are pure storage.
+   */
+  /**
+   * Draw a line under everything between the two of you. Keeping the records
+   * files them behind a closed cycle; erasing destroys them. Both are refused
+   * server-side unless you are square, whatever the button says.
+   */
+  const handleStartFresh = async (friend: DisplayFriend, erase: boolean) => {
+    const groupId = directGroupByFriend[friend.friend.id];
+    if (!groupId) return;
+
+    const name = friend.friend.display_name.split(' ')[0];
+    const ok = await confirm({
+      title: erase ? 'Erase everything between you?' : 'Start a fresh balance?',
+      message: erase
+        ? `Every record between you and ${name} is deleted for good, along with the payment history. You both start from zero. This cannot be undone.`
+        : `Your records with ${name} are closed off and you both start from zero. Nothing is deleted — they stay readable under Earlier records.`,
+      confirmLabel: erase ? 'Erase for good' : 'Start fresh',
+      danger: erase,
+    });
+    if (!ok) return;
+
+    setClearingDeleted(true);
+    try {
+      const { error: rpcError } = erase
+        ? await supabase.rpc('purge_group_history', { p_group_id: groupId })
+        : await supabase.rpc('start_new_cycle', { p_group_id: groupId });
+      if (rpcError) throw rpcError;
+
+      toast.success(
+        erase ? `Cleared everything between you and ${name}.` : `Fresh start with ${name}.`
+      );
+      await load();
+      if (selected) await loadPairRecords(selected.friend.id, selected.groupIds);
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not start fresh.'));
+    } finally {
+      setClearingDeleted(false);
+    }
+  };
+
+  const handleClearDeleted = async (friend: DisplayFriend) => {
+    const groupId = directGroupByFriend[friend.friend.id];
+    if (!groupId) return;
+
+    setClearingDeleted(true);
+    try {
+      const { data, error: countError } = await supabase.rpc('deleted_expense_count', {
+        p_group_id: groupId,
+      });
+      if (countError) throw countError;
+
+      const count = Number(data ?? 0);
+      if (count === 0) {
+        toast.info('Nothing to clear — no deleted records between you.');
+        return;
+      }
+
+      const ok = await confirm({
+        title: `Clear ${count} deleted ${count === 1 ? 'record' : 'records'}?`,
+        message:
+          'These were already deleted and are not part of any balance. Erasing them frees the space for good and cannot be undone.',
+        confirmLabel: 'Erase',
+        danger: true,
+      });
+      if (!ok) return;
+
+      const { data: cleared, error: purgeError } = await supabase.rpc('purge_deleted_expenses', {
+        p_group_id: groupId,
+      });
+      if (purgeError) throw purgeError;
+      toast.success(`Cleared ${Number(cleared ?? 0)} deleted ${Number(cleared) === 1 ? 'record' : 'records'}.`);
+      await load();
+    } catch (err) {
+      // The commonest refusal is an unsettled balance, and the server says so.
+      toast.error(friendlyDbError(err, 'Could not clear those records.'));
+    } finally {
+      setClearingDeleted(false);
     }
   };
 
@@ -808,15 +1211,8 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                 type="button"
                 className="btn btn-primary btn-block btn-lg"
                 onClick={() => {
-                  setSettleTarget({
-                    groupId: settleablePart.groupId,
-                    groupName: directGroupIds.has(settleablePart.groupId)
-                      ? undefined
-                      : settleablePart.groupName,
-                    payee: selected.friend,
-                    suggestedAmount: Math.abs(settleablePart.net),
-                    direction: settleablePart.net > 0 ? 'THEY_PAY' : 'I_PAY',
-                  });
+                  setSettleTarget(settleOptions[0] ?? null);
+                  setSettleChoices(settleOptions);
                   setSelected(null);
                 }}
               >
@@ -840,20 +1236,19 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
             {selected.perGroup.length === 0 ? (
               <EmptyState
                 icon="✅"
-                title="Nothing outstanding"
-                text={
-                  selected.shared_group_count === 0
-                    ? 'Nothing between you yet — record a loan above, or split a bill in a group.'
-                    : 'No open balances with this friend.'
-                }
+                title="All square"
+                text="Nothing is owed either way. Whatever you have recorded together is still listed below."
               />
             ) : (
               <>
                 <span className="label label-block">Breakdown by group</span>
                 <div className="stack-sm">
                   {selected.perGroup.map((entry) => (
-                    <div key={entry.groupId} className="card row-between">
-                      <span className="grow" style={{ minWidth: 0 }}>
+                    // The group name gets the full width; the figure and the
+                    // button sit underneath. Side by side, all three fought over
+                    // a 390px row and the name lost — "Boarding …".
+                    <div key={entry.groupId} className="card">
+                      <span style={{ minWidth: 0 }}>
                         <span className="truncate" style={{ display: 'block', fontWeight: 600, fontSize: '0.9rem' }}>
                           {/* Inside this friend's own sheet the pair group's name
                               ("Between you and X") just repeats the heading. */}
@@ -861,36 +1256,15 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                         </span>
                         <span className="hint">{entry.net > 0 ? 'owes you' : 'you owe'}</span>
                       </span>
-                      <span className="row" style={{ gap: 'var(--sp-3)', flexShrink: 0 }}>
+                      <span
+                        className="row-between"
+                        style={{ gap: 'var(--sp-3)', marginTop: 'var(--sp-2)' }}
+                      >
                         <span
                           className={`amount-md tabular ${entry.net > 0 ? 'text-positive' : 'text-negative'}`}
                         >
                           {formatLKR(Math.abs(entry.net))}
                         </span>
-                        {Math.abs(entry.net) >= 0.01 && (
-                          <button
-                            type="button"
-                            className="btn btn-primary btn-sm"
-                            onClick={() => {
-                              setSettleTarget({
-                                groupId: entry.groupId,
-                                // The pair group's internal name would read
-                                // "Between you and X" on X's own settle sheet.
-                                groupName: directGroupIds.has(entry.groupId)
-                                  ? undefined
-                                  : entry.groupName,
-                                payee: selected.friend,
-                                suggestedAmount: Math.abs(entry.net),
-                                // Positive means they owe me, so the payment
-                                // comes from them — previously unrecordable.
-                                direction: entry.net > 0 ? 'THEY_PAY' : 'I_PAY',
-                              });
-                              setSelected(null);
-                            }}
-                          >
-                            {entry.net > 0 ? 'Record payment' : 'Settle'}
-                          </button>
-                        )}
                       </span>
                     </div>
                   ))}
@@ -901,45 +1275,91 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
               </>
             )}
 
-            {selectedEntries.length > 0 && (
+            <span className="label label-block">
+              Records between you{currentRecords.length > 0 ? ` (${currentRecords.length})` : ''}
+            </span>
+            {pairLoading ? (
+              <SkeletonRows count={3} height={58} />
+            ) : currentRecords.length === 0 ? (
+              <EmptyState
+                icon="🧾"
+                title={earlierRecords.length > 0 ? 'A clean slate' : 'Nothing recorded yet'}
+                text={
+                  earlierRecords.length > 0
+                    ? 'You started fresh. Anything new between you shows up here; the old records are below.'
+                    : 'Loans, shared bills and anything you have split in a group together will be listed here.'
+                }
+              />
+            ) : (
               <>
-                <span className="label label-block">
-                  Direct records ({selectedEntries.length})
-                </span>
                 <div className="stack-sm">
-                  {selectedEntries.map((entry) => {
+                  {currentRecords.map((record) => {
+                    const entry = record.expense;
                     const iPaidIt = entry.paid_by === user.id;
                     const locked = Boolean(entry.settled_at);
+                    const meta = categoryMeta(entry.category);
+                    // Same rule the server enforces: the person who added it, or
+                    // an admin of the group it lives in. Showing the buttons to
+                    // anyone else only produces a refusal.
+                    const myRole = (membersByGroup[record.groupId] ?? []).find(
+                      (m) => m.user_id === user.id
+                    )?.role;
+                    // A record with a change waiting takes no further changes
+                    // until that one is answered.
+                    const change = pairChanges[entry.id];
+                    const canEdit =
+                      (entry.created_by === user.id || myRole === 'ADMIN') && !change;
                     return (
-                      <div key={entry.id} className="card row">
-                        <span className="icon-tile" style={{ width: 34, height: 34, fontSize: 15 }}>
-                          🤝
+                      // Amount on the title line and the buttons on the last one,
+                      // rather than all three competing for the right-hand edge:
+                      // on a phone that squeezed the title down to a few letters
+                      // and wrapped the date onto three lines.
+                      <div key={entry.id} className="card row" style={{ alignItems: 'flex-start' }}>
+                        <span
+                          className="icon-tile"
+                          style={{ width: 34, height: 34, fontSize: 15, flexShrink: 0 }}
+                        >
+                          {record.isDirect ? '🤝' : meta.emoji}
                         </span>
                         <span className="grow" style={{ minWidth: 0 }}>
-                          <span className="row" style={{ gap: 5 }}>
-                            <span
-                              className="truncate"
-                              style={{ fontSize: '0.88rem', fontWeight: 600 }}
-                            >
-                              {entry.title}
+                          <span className="row-between" style={{ gap: 'var(--sp-2)' }}>
+                            <span className="row" style={{ gap: 5, minWidth: 0 }}>
+                              <span className="truncate" style={{ fontSize: '0.88rem', fontWeight: 600 }}>
+                                {entry.title}
+                              </span>
+                              {locked && <span className="badge">Settled</span>}
+                              {change && (
+                                <span className="badge badge-primary">
+                                  {change.out_kind === 'DELETE' ? 'Deletion proposed' : 'Change proposed'}
+                                </span>
+                              )}
                             </span>
-                            {locked && <span className="badge">Settled</span>}
+                            <span className="amount-md tabular" style={{ flexShrink: 0 }}>
+                              {formatLKR(entry.amount)}
+                            </span>
                           </span>
-                          <span className="hint">
+                          <span className="hint" style={{ display: 'block' }}>
                             {friendlyDate(entry.created_at.slice(0, 10))} ·{' '}
                             {iPaidIt ? 'you paid' : `${selected.friend.display_name} paid`}
+                            {!record.isDirect && record.groupName ? ` · ${record.groupName}` : ''}
                           </span>
-                        </span>
-                        <span className="amount-md tabular" style={{ flexShrink: 0 }}>
-                          {formatLKR(entry.amount)}
-                        </span>
-                        {!locked && (
+                          {/* The totals people actually argue about: not what the
+                              bill came to, but what each of you carried of it. */}
+                          <span className="row-between" style={{ gap: 'var(--sp-2)' }}>
+                            <span className="hint truncate">
+                              your share {formatLKR(record.myShare)} · theirs {formatLKR(record.theirShare)}
+                            </span>
+                        {!locked && canEdit && (
                           <span className="row" style={{ gap: 4, flexShrink: 0 }}>
                             <button
                               type="button"
                               className="btn-icon"
                               style={{ width: 30, height: 30 }}
-                              onClick={() => openEditEntry(entry, selected.friend)}
+                              onClick={() =>
+                                record.isDirect
+                                  ? openEditEntry(entry, selected.friend)
+                                  : setEditingGroupExpense(entry)
+                              }
                               aria-label={`Edit ${entry.title}`}
                             >
                               <Pencil size={13} />
@@ -956,13 +1376,155 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                             </button>
                           </span>
                         )}
+                          </span>
+
+                          {/* What is being asked, and the answer, right under
+                              the record it concerns. */}
+                          {change && (
+                            <span
+                              className="stack-sm card-divider"
+                              style={{ display: 'block', marginTop: 'var(--sp-2)', paddingTop: 'var(--sp-2)' }}
+                            >
+                              <span className="hint" style={{ display: 'block' }}>
+                                {change.out_requested_by === user.id
+                                  ? 'You'
+                                  : selected.friend.display_name.split(' ')[0]}{' '}
+                                {change.out_kind === 'DELETE'
+                                  ? 'asked to remove this.'
+                                  : `asked to change it${
+                                      change.out_payload?.amount !== undefined
+                                        ? ` to ${formatLKR(Number(change.out_payload.amount))}`
+                                        : ''
+                                    }.`}{' '}
+                                Your balance has not moved.
+                              </span>
+                              {change.out_requested_by === user.id ? (
+                                <button
+                                  type="button"
+                                  className="btn btn-ghost btn-sm"
+                                  onClick={() => handleWithdrawChange(change.out_request_id)}
+                                  disabled={busyEntry === change.out_request_id}
+                                >
+                                  {busyEntry === change.out_request_id ? <Spinner /> : <X size={13} />}
+                                  Withdraw
+                                </button>
+                              ) : change.out_my_vote !== null ? (
+                                <span className="hint">
+                                  You said {change.out_my_vote ? 'yes' : 'no'}.
+                                </span>
+                              ) : change.out_can_vote ? (
+                                <span className="row" style={{ gap: 'var(--sp-2)' }}>
+                                  <button
+                                    type="button"
+                                    className="btn btn-primary btn-sm grow"
+                                    onClick={() => handleVoteOnChange(change.out_request_id, true)}
+                                    disabled={busyEntry === change.out_request_id}
+                                  >
+                                    {busyEntry === change.out_request_id ? <Spinner /> : <Check size={13} />}
+                                    Approve
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary btn-sm grow"
+                                    onClick={() => handleVoteOnChange(change.out_request_id, false)}
+                                    disabled={busyEntry === change.out_request_id}
+                                  >
+                                    <X size={13} /> Reject
+                                  </button>
+                                </span>
+                              ) : null}
+                            </span>
+                          )}
+                        </span>
                       </div>
                     );
                   })}
                 </div>
                 <span className="hint">
-                  Settled records are locked, so a paid-up balance cannot reopen.
+                  Settled records are locked, so a paid-up balance cannot reopen. Add a new record to
+                  correct one after settling.
                 </span>
+              </>
+            )}
+
+            {/* Everything from before the last fresh start — kept, readable,
+                and out of the way of what is happening now. */}
+            {earlierRecords.length > 0 && (
+              <>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-block btn-sm"
+                  onClick={() => setShowEarlier((on) => !on)}
+                  aria-expanded={showEarlier}
+                >
+                  <History size={15} />
+                  {showEarlier ? 'Hide earlier records' : `Earlier records (${earlierRecords.length})`}
+                </button>
+                {showEarlier && (
+                  <div className="stack-sm">
+                    {earlierRecords.map((record) => (
+                      <div key={record.expense.id} className="card row" style={{ opacity: 0.75 }}>
+                        <span className="emoji-badge">{categoryMeta(record.expense.category).emoji}</span>
+                        <span className="grow" style={{ minWidth: 0 }}>
+                          <span
+                            className="truncate"
+                            style={{ display: 'block', fontWeight: 600, fontSize: '0.86rem' }}
+                          >
+                            {record.expense.title}
+                          </span>
+                          <span className="hint">
+                            your share {formatLKR(record.myShare)} · theirs {formatLKR(record.theirShare)}
+                          </span>
+                        </span>
+                        <span className="amount-md tabular" style={{ flexShrink: 0 }}>
+                          {formatLKR(Number(record.expense.amount))}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* Once you are square, draw a line. Both ways are offered, and
+                both stay visible when they cannot be used — a control that
+                disappears reads as one the app does not have. */}
+            {directGroupByFriend[selected.friend.id] && (
+              <>
+                <span className="label label-block" style={{ marginTop: 'var(--sp-4)' }}>
+                  Start fresh
+                </span>
+                <span className="hint" style={{ display: 'block', marginBottom: 'var(--sp-2)' }}>
+                  {Math.abs(selected.net_balance) >= 0.01
+                    ? `Settle the ${formatLKR(Math.abs(selected.net_balance))} between you first.`
+                    : 'You are square. Clear the slate and start counting again from zero.'}
+                </span>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-block btn-sm"
+                  onClick={() => handleStartFresh(selected, false)}
+                  disabled={clearingDeleted || Math.abs(selected.net_balance) >= 0.01}
+                >
+                  {clearingDeleted ? <Spinner /> : <RotateCcw size={15} />} Start fresh, keep the records
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-block btn-sm"
+                  onClick={() => handleStartFresh(selected, true)}
+                  disabled={clearingDeleted || Math.abs(selected.net_balance) >= 0.01}
+                  style={{ color: 'var(--negative)' }}
+                >
+                  {clearingDeleted ? <Spinner /> : <Eraser size={15} />} Start fresh and erase everything
+                </button>
+
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-block btn-sm"
+                  onClick={() => handleClearDeleted(selected)}
+                  disabled={clearingDeleted}
+                >
+                  {clearingDeleted ? <Spinner /> : <Eraser size={15} />} Clear deleted records
+                </button>
               </>
             )}
 
@@ -1023,9 +1585,29 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
         </Sheet>
       )}
 
+      {/* A bill from a shared group opens the group's own editor: it has the
+          whole membership and every split method, which a two-person form does
+          not. Deleting is handled here; editing needs the full picture. */}
+      {editingGroupExpense && membersByGroup[editingGroupExpense.group_id ?? ''] && (
+        <AddExpenseModal
+          groupId={editingGroupExpense.group_id as string}
+          user={user}
+          members={membersByGroup[editingGroupExpense.group_id as string]}
+          expense={editingGroupExpense}
+          onClose={() => setEditingGroupExpense(null)}
+          onSaved={async () => {
+            setEditingGroupExpense(null);
+            await load();
+            if (selected) await loadPairRecords(selected.friend.id, selected.groupIds);
+          }}
+        />
+      )}
+
       {settleTarget && (
         <SettleUpSheet
           target={settleTarget}
+          options={settleChoices}
+          onPick={setSettleTarget}
           onClose={() => setSettleTarget(null)}
           onSettled={() => {
             setSettleTarget(null);
@@ -1099,26 +1681,96 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
               maxLength={140}
             />
 
+            {/* Only a shared bill has a category. Lending is money moving
+                between two people, not a kind of spending. */}
+            {lendMode === 'SHARED' && (
+              <div className="field">
+                <span className="label label-block">Category</span>
+                <div className="rail">
+                  {CATEGORIES.map((cat) => (
+                    <button
+                      key={cat.id}
+                      type="button"
+                      className={`chip ${lendCategory === cat.id ? 'is-selected' : ''}`}
+                      onClick={() => setLendCategory(cat.id)}
+                    >
+                      {cat.emoji} {cat.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {lendMode === 'SHARED' && (
               <>
                 <div className="segmented" role="group" aria-label="Who paid">
                   <button
                     type="button"
-                    className={`segmented-option ${iPaid ? 'is-active' : ''}`}
-                    onClick={() => setIPaid(true)}
-                    aria-pressed={iPaid}
+                    className={`segmented-option ${iPaid && !bothPaid ? 'is-active' : ''}`}
+                    onClick={() => {
+                      setIPaid(true);
+                      setBothPaid(false);
+                    }}
+                    aria-pressed={iPaid && !bothPaid}
                   >
                     I paid
                   </button>
                   <button
                     type="button"
-                    className={`segmented-option ${!iPaid ? 'is-active' : ''}`}
-                    onClick={() => setIPaid(false)}
-                    aria-pressed={!iPaid}
+                    className={`segmented-option ${!iPaid && !bothPaid ? 'is-active' : ''}`}
+                    onClick={() => {
+                      setIPaid(false);
+                      setBothPaid(false);
+                    }}
+                    aria-pressed={!iPaid && !bothPaid}
                   >
                     {lendTo.display_name.split(' ')[0]} paid
                   </button>
+                  {/* The case the app could not record: you put in 1,000 and
+                      they put in 500 of a 1,500 bill, and you still split it
+                      down the middle. */}
+                  <button
+                    type="button"
+                    className={`segmented-option ${bothPaid ? 'is-active' : ''}`}
+                    onClick={() => {
+                      setBothPaid(true);
+                      setLendError(null);
+                    }}
+                    aria-pressed={bothPaid}
+                  >
+                    Both did
+                  </button>
                 </div>
+
+                {bothPaid && (
+                  <div className="field">
+                    <label className="label label-block" htmlFor="my-payment">
+                      What you put in
+                    </label>
+                    <div className="input-prefixed">
+                      <span className="input-prefix">Rs.</span>
+                      <input
+                        id="my-payment"
+                        type="text"
+                        inputMode="decimal"
+                        className="input tabular"
+                        placeholder="0.00"
+                        value={myPayment}
+                        onChange={(e) => {
+                          setMyPayment(e.target.value);
+                          setLendError(null);
+                        }}
+                      />
+                    </div>
+                    <span className="hint">
+                      {parseAmount(lendAmount) > 0
+                        ? `${lendTo.display_name.split(' ')[0]} put in the rest: ${formatLKR(
+                            roundMoney(parseAmount(lendAmount) - parseAmount(myPayment))
+                          )}.`
+                        : 'Enter the bill above first.'}
+                    </span>
+                  </div>
+                )}
 
                 <div className="field">
                   <label className="label label-block" htmlFor="their-share">
@@ -1148,6 +1800,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                     theirShareRaw={theirShare}
                     friendName={lendTo.display_name.split(' ')[0]}
                     iPaid={iPaid}
+                    myPaymentRaw={bothPaid ? myPayment : null}
                   />
                 </div>
               </>
@@ -1215,12 +1868,22 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
  * where an uneven split goes wrong, so the remainder is computed and displayed
  * before the record is saved — including when it does not add up.
  */
+/**
+ * What the record will mean once it is saved: what each of you put in, what
+ * each of you owes, and the one line that matters — who ends up owing whom.
+ *
+ * The two are genuinely independent. Paying 1,000 of a 1,500 bill you split
+ * evenly leaves you 250 up; the shares alone cannot say that, and neither can
+ * the payments.
+ */
 const SplitPreview: React.FC<{
   total: number;
   theirShareRaw: string;
   friendName: string;
   iPaid: boolean;
-}> = ({ total, theirShareRaw, friendName, iPaid }) => {
+  /** What I put in, when we both did. Null means one of us paid all of it. */
+  myPaymentRaw?: string | null;
+}> = ({ total, theirShareRaw, friendName, iPaid, myPaymentRaw = null }) => {
   if (total <= 0) {
     return <span className="hint">Leave blank to split it down the middle.</span>;
   }
@@ -1228,15 +1891,42 @@ const SplitPreview: React.FC<{
   const typed = theirShareRaw.trim();
   const theirs = typed ? roundMoney(parseAmount(typed)) : roundMoney(total / 2);
   const mine = roundMoney(total - theirs);
-  const invalid = theirs < 0 || theirs > total;
 
-  // What actually changes hands: their share if I paid, my share if they did.
-  // This is the line that moves when you flip who paid — the shares alone do
-  // not, which made the payer toggle look like it did nothing.
-  const owed = iPaid ? theirs : mine;
+  const split = myPaymentRaw !== null;
+  const myPaid = split ? roundMoney(parseAmount(myPaymentRaw)) : iPaid ? total : 0;
+  const theirPaid = roundMoney(total - myPaid);
+
+  const invalid = theirs < 0 || theirs > total || myPaid < 0 || myPaid > total;
+
+  // Put in minus owed. With one payer this is their share, or yours when they
+  // paid — the two cases this used to handle separately.
+  const owed = roundMoney(myPaid - mine);
 
   return (
     <div className="stack-sm" style={{ marginTop: 'var(--sp-2)' }}>
+      {split && (
+        <>
+          <div className="row-between">
+            <span className="hint">You put in</span>
+            <span
+              className={`tabular ${invalid ? 'text-negative' : ''}`}
+              style={{ fontSize: '0.85rem', fontWeight: 700 }}
+            >
+              {formatLKR(myPaid)}
+            </span>
+          </div>
+          <div className="row-between">
+            <span className="hint">{friendName} put in</span>
+            <span
+              className={`tabular ${invalid ? 'text-negative' : ''}`}
+              style={{ fontSize: '0.85rem', fontWeight: 700 }}
+            >
+              {formatLKR(theirPaid)}
+            </span>
+          </div>
+        </>
+      )}
+
       <div className="row-between">
         <span className="hint">{friendName}&rsquo;s share</span>
         <span
@@ -1263,24 +1953,28 @@ const SplitPreview: React.FC<{
         >
           <span className="hint">Result</span>
           <span
-            className={`tabular ${owed < 0.01 ? 'text-neutral' : iPaid ? 'text-positive' : 'text-negative'}`}
+            className={`tabular ${
+              Math.abs(owed) < 0.01 ? 'text-neutral' : owed > 0 ? 'text-positive' : 'text-negative'
+            }`}
             style={{ fontSize: '0.85rem', fontWeight: 700 }}
           >
-            {owed < 0.01
+            {Math.abs(owed) < 0.01
               ? 'Nothing owed'
-              : iPaid
+              : owed > 0
                 ? `${friendName} owes you ${formatLKR(owed)}`
-                : `You owe ${friendName} ${formatLKR(owed)}`}
+                : `You owe ${friendName} ${formatLKR(-owed)}`}
           </span>
         </div>
       )}
 
       <span className="hint">
         {invalid
-          ? `That is more than the bill — ${friendName}'s share must be between Rs. 0 and ${formatLKR(total)}.`
-          : typed
-            ? `Adds up to ${formatLKR(total)}.`
-            : 'Split down the middle. Type a number to change it.'}
+          ? `That is more than the bill — every amount must be between Rs. 0 and ${formatLKR(total)}.`
+          : split
+            ? `The two payments add up to ${formatLKR(total)}.`
+            : typed
+              ? `Adds up to ${formatLKR(total)}.`
+              : 'Split down the middle. Type a number to change it.'}
       </span>
     </div>
   );

@@ -86,6 +86,12 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
   const [paidBy, setPaidBy] = useState(expense?.paid_by ?? user.id);
   const [notes, setNotes] = useState(expense?.notes ?? '');
 
+  // Who put money in, which is a different question from who owes what. One
+  // person paying for everything is the common case and stays one tap; the
+  // toggle opens an amount per member for the times it was not.
+  const [manyPayers, setManyPayers] = useState(false);
+  const [paidAmounts, setPaidAmounts] = useState<Record<string, string>>({});
+
   // When editing, these start neutral and are replaced by the expense's stored
   // splits in the effect below. Defaulting everyone to `true` here is what made
   // an edit silently re-include people the bill had deliberately left out.
@@ -111,7 +117,6 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [statsChoice, setStatsChoice] = useState(false);
 
   // Rebuild the form from what was actually saved: who was in, and the exact
   // per-person figures for whichever split method was used. Without this an edit
@@ -121,16 +126,26 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
     let active = true;
 
     void (async () => {
-      const { data, error: splitError } = await supabase
-        .from('expense_splits')
-        .select('user_id, is_included, amount, percentage, shares, include_in_stats')
-        .eq('expense_id', expense.id);
+      const [{ data, error: splitError }, { data: payerRows }] = await Promise.all([
+        supabase
+          .from('expense_splits')
+          .select('user_id, is_included, amount, percentage, shares')
+          .eq('expense_id', expense.id),
+        supabase.from('expense_payers').select('user_id, amount').eq('expense_id', expense.id),
+      ]);
 
       if (!active) return;
       if (splitError || !data) {
         setLoadingSplits(false);
         return;
       }
+
+      // Reopen a bill several people paid for showing what each of them put in,
+      // rather than quietly collapsing it onto whoever paid the most.
+      const paid: Record<string, string> = {};
+      for (const row of (payerRows ?? []) as any[]) paid[row.user_id] = String(Number(row.amount));
+      setPaidAmounts(paid);
+      setManyPayers((payerRows ?? []).length > 1);
 
       const inc: Record<string, boolean> = {};
       const amts: Record<string, string> = {};
@@ -142,7 +157,6 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
         amts[row.user_id] = String(Number(row.amount));
         pcts[row.user_id] = String(Number(row.percentage ?? 0));
         shr[row.user_id] = String(Number(row.shares ?? 1));
-        if (row.user_id === user.id) setStatsChoice(row.include_in_stats === true);
       }
 
       // A member added to the group after this bill has no split row at all.
@@ -262,6 +276,35 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
   const toggleIncluded = (userId: string) =>
     setIncluded((prev) => ({ ...prev, [userId]: !prev[userId] }));
 
+  /**
+   * What everyone put in. Has to reconstruct the bill exactly, for the same
+   * reason the shares do: the database refuses anything else, because the
+   * difference would be money appearing from nowhere.
+   */
+  const contributions = useMemo(() => {
+    if (!manyPayers) {
+      return { rows: [] as { user_id: string; amount: number }[], paid: computed.total, problem: null as string | null };
+    }
+    const rows = members
+      .map((m) => ({ user_id: m.user_id, amount: roundMoney(parseAmount(paidAmounts[m.user_id] ?? '')) }))
+      .filter((row) => row.amount > 0);
+    const paid = roundMoney(rows.reduce((sum, row) => sum + row.amount, 0));
+
+    if (rows.length === 0) return { rows, paid, problem: 'Enter what at least one person paid.' };
+    if (paid !== computed.total) {
+      const gap = roundMoney(computed.total - paid);
+      return {
+        rows,
+        paid,
+        problem:
+          gap > 0
+            ? `${formatLKR(gap)} of the bill is unaccounted for.`
+            : `That is ${formatLKR(-gap)} more than the bill.`,
+      };
+    }
+    return { rows, paid, problem: null };
+  }, [manyPayers, members, paidAmounts, computed.total]);
+
   /** Remembers this configuration so the next bill in this group starts here. */
   const handleSaveDefaults = async () => {
     setSavingDefaults(true);
@@ -311,6 +354,7 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
       );
     }
     if (computed.problem) return setError(computed.problem);
+    if (contributions.problem) return setError(contributions.problem);
 
     // The database rejects a split set that does not reconstruct the total, so
     // build the payload from the derived amounts rather than raw input.
@@ -325,7 +369,6 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
         shares: splitMethod === 'SHARES' ? parseInt(shares[m.user_id] ?? '1', 10) || 0 : 1,
         // Answered here only for myself. Everyone else's split is left undecided
         // so their own charts are never changed by a bill I typed.
-        stats: m.user_id === user.id ? statsChoice : undefined,
       };
     });
 
@@ -342,15 +385,25 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
 
     setSaving(true);
     try {
+      // Null when one person paid for all of it, which the database reads as
+      // "credit the whole thing to p_paid_by" — exactly what it did before any
+      // of this existed.
+      const payers = manyPayers ? contributions.rows : null;
+
       const args = {
         p_title: title.trim(),
         p_amount: total,
-        p_paid_by: paidBy,
+        // With several payers the principal is whoever put in the most, so the
+        // lists still show a face beside the bill.
+        p_paid_by: payers
+          ? payers.reduce((top, row) => (row.amount > top.amount ? row : top)).user_id
+          : paidBy,
         p_category: category,
         p_split_method: splitMethod,
         p_notes: notes.trim(),
         p_splits: splits,
         p_items: payloadItems,
+        p_payers: payers,
       };
 
       // Both RPCs write the expense, its splits, its items and the ledger pair
@@ -361,11 +414,23 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
 
       if (rpcError) throw rpcError;
 
+      // An edit to a record more than ten minutes old is a proposal, not a
+      // change: the others have to agree before any balance moves. The server
+      // says which of the two happened.
+      const pending = isEditing && savedId === 'PENDING';
+
       // The receipt is attached after the row exists, so a failed save never
-      // leaves an orphaned image reference.
+      // leaves an orphaned image reference. Not while a change is only
+      // proposed — the record on screen is still the old one.
       const expenseId = isEditing ? expense!.id : (savedId as string);
-      if (receiptPath && expenseId) {
+      if (receiptPath && expenseId && !pending) {
         await supabase.from('expenses').update({ receipt_url: receiptPath }).eq('id', expenseId);
+      }
+
+      if (pending) {
+        toast.success('Sent for approval. Nothing changes until the others agree.');
+        onSaved();
+        return;
       }
 
       if (recurring && !isEditing) {
@@ -376,9 +441,10 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
           amount: total,
           category,
           notes: notes.trim(),
-          paid_by: paidBy,
+          paid_by: args.p_paid_by,
           split_method: splitMethod,
           splits,
+          payers: args.p_payers,
           frequency,
           // The bill just posted counts as this period, so schedule the next.
           next_run: nextRunAfter(todayISO(), frequency),
@@ -454,22 +520,99 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
           </div>
         </div>
 
-        <div className="field">
-          <label className="label label-block" htmlFor="paid-by">
-            Who paid?
-          </label>
-          <select id="paid-by" className="input" value={paidBy} onChange={(e) => setPaidBy(e.target.value)}>
-            {members.map((m) => (
-              <option key={m.user_id} value={m.user_id}>
-                {m.user_id === user.id ? 'Me' : `${m.user?.display_name ?? 'Member'} (proxy entry)`}
-              </option>
-            ))}
-          </select>
-          {paidBy !== user.id && (
-            <span className="hint">
-              Recorded on their behalf — they get the credit, you stay logged as the author.
-            </span>
+        <div className="field" aria-label="Who paid">
+          <span className="label label-block">Who paid?</span>
+
+          {!manyPayers ? (
+            <>
+              <select
+                id="paid-by"
+                className="input"
+                value={paidBy}
+                onChange={(e) => setPaidBy(e.target.value)}
+              >
+                {members.map((m) => (
+                  <option key={m.user_id} value={m.user_id}>
+                    {m.user_id === user.id ? 'Me' : `${m.user?.display_name ?? 'Member'} (proxy entry)`}
+                  </option>
+                ))}
+              </select>
+              {paidBy !== user.id && (
+                <span className="hint">
+                  Recorded on their behalf — they get the credit, you stay logged as the author.
+                </span>
+              )}
+            </>
+          ) : (
+            /* One row per person, and a running remainder — the number people
+               actually watch while they are typing. Splitting stays a separate
+               question below: "we put in 1,000 and 500 but split it evenly" is
+               these amounts plus Equal, with no new split maths at all. */
+            <div className="stack-sm">
+              {members.map((m) => (
+                <div key={m.user_id} className="row" style={{ gap: 'var(--sp-3)' }}>
+                  <Avatar
+                    name={m.user?.display_name ?? 'Member'}
+                    url={m.user?.avatar_url}
+                    size={28}
+                  />
+                  <span className="grow truncate" style={{ fontSize: '0.85rem' }}>
+                    {m.user_id === user.id ? 'Me' : (m.user?.display_name ?? 'Member')}
+                  </span>
+                  <div className="input-prefixed" style={{ maxWidth: 130 }}>
+                    <span className="input-prefix">Rs.</span>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      className="input tabular"
+                      placeholder="0.00"
+                      aria-label={`What ${m.user_id === user.id ? 'I' : (m.user?.display_name ?? 'they')} paid`}
+                      value={paidAmounts[m.user_id] ?? ''}
+                      onChange={(e) =>
+                        setPaidAmounts((prev) => ({ ...prev, [m.user_id]: e.target.value }))
+                      }
+                    />
+                  </div>
+                </div>
+              ))}
+              {/* Show what is still missing while it is missing, and the total
+                  once it is not. A remainder of zero is not information. */}
+              <div className="row-between card" style={{ padding: 'var(--sp-3) var(--sp-4)' }}>
+                <span className="label">
+                  {contributions.problem ? 'Left to account for' : 'Adds up to the bill'}
+                </span>
+                <span
+                  className="amount-md tabular"
+                  style={{ color: contributions.problem ? 'var(--negative)' : 'var(--positive)' }}
+                >
+                  {formatLKR(
+                    contributions.problem
+                      ? roundMoney(computed.total - contributions.paid)
+                      : contributions.paid
+                  )}
+                </span>
+              </div>
+            </div>
           )}
+
+          <button
+            type="button"
+            className="btn btn-outline btn-sm"
+            style={{ marginTop: 'var(--sp-3)', alignSelf: 'flex-start' }}
+            onClick={() => {
+              setManyPayers((on) => !on);
+              // Seed the first row with the person already named, so turning
+              // this on is a starting point rather than a blank form.
+              if (!manyPayers) {
+                setPaidAmounts((prev) => ({
+                  ...prev,
+                  [paidBy]: prev[paidBy] ?? (computed.total > 0 ? String(computed.total) : ''),
+                }));
+              }
+            }}
+          >
+            {manyPayers ? 'One person paid' : 'More than one person paid'}
+          </button>
         </div>
 
         <div className="field">
@@ -721,25 +864,6 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
           value={notes}
           onChange={(e) => setNotes(e.target.value)}
         />
-
-        {includedMembers.some((m) => m.user_id === user.id) && (
-          <label className="card row" style={{ cursor: 'pointer', gap: 'var(--sp-3)' }}>
-            <input
-              type="checkbox"
-              className="checkbox"
-              checked={statsChoice}
-              onChange={(e) => setStatsChoice(e.target.checked)}
-            />
-            <span className="grow" style={{ minWidth: 0 }}>
-              <span style={{ display: 'block', fontWeight: 600, fontSize: '0.88rem' }}>
-                Count my share in my stats
-              </span>
-              <span className="hint">
-                Only affects your own charts. Everyone else decides for themselves.
-              </span>
-            </span>
-          </label>
-        )}
 
         {error && <Alert variant="error">{error}</Alert>}
 

@@ -15,7 +15,7 @@ import { AddExpenseModal } from './AddExpenseModal';
 import { SettleUpSheet, SettleTarget } from '../components/SettleUpSheet';
 import { DonutChart } from '../components/Charts';
 import {
-  ArrowLeft, ArrowRight, AtSign, Archive, ArchiveRestore, Check, Copy, Eraser, Lock, Mail, Pencil, PieChart, Plus,
+  ArrowLeft, ArrowRight, AtSign, Archive, ArchiveRestore, Check, ChevronRight, Copy, Eraser, History, Lock, Mail, Pencil, PieChart, Plus, RotateCcw,
   LogOut, RefreshCw, Settings2, Share2, Trash2, UserCheck, X,
 } from 'lucide-react';
 
@@ -38,6 +38,21 @@ interface JoinRequest {
   user_id: string;
   requested_at: string;
   users?: User;
+}
+
+/** A proposed edit or delete, waiting on the people it affects. */
+interface PendingChange {
+  out_request_id: string;
+  out_expense_id: string;
+  out_kind: 'EDIT' | 'DELETE';
+  out_requested_by: string;
+  out_requester: string;
+  out_payload: { title?: string; amount?: number } | null;
+  out_reason: string;
+  out_approvals: number;
+  out_needed: number;
+  out_my_vote: boolean | null;
+  out_can_vote: boolean;
 }
 
 export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user, onBack }) => {
@@ -75,6 +90,10 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   const [statsLoading, setStatsLoading] = useState(false);
   const [showManage, setShowManage] = useState(false);
   const [cleaning, setCleaning] = useState(false);
+  const [showEarlier, setShowEarlier] = useState(false);
+  /** Changes somebody has proposed to a record and is waiting on answers for. */
+  const [pendingChanges, setPendingChanges] = useState<PendingChange[]>([]);
+  const [busyErase, setBusyErase] = useState<string | null>(null);
 
   const [showEdit, setShowEdit] = useState(false);
   const [draftName, setDraftName] = useState('');
@@ -142,6 +161,14 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
       if (invitationError) console.error('Group invitations failed to load:', invitationError);
       setInvitations((invitationData ?? []) as unknown as GroupInvitation[]);
 
+      // Proposed changes waiting on the people they affect.
+      const { data: changeData, error: changeError } = await supabase.rpc(
+        'pending_changes_for_group',
+        { p_group_id: groupId }
+      );
+      if (changeError) console.error('Pending changes failed to load:', changeError);
+      setPendingChanges((changeData ?? []) as PendingChange[]);
+
       // Your connections, so inviting somebody you already know does not mean
       // retyping an address the app already has.
       const { data: friendData } = await supabase
@@ -165,7 +192,7 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
     void load();
   }, [load]);
 
-  useLiveRefresh(`group-detail:${groupId}`, ['expenses','expense_splits','ledger_entries','group_settlements','group_members','group_invitations','group_join_requests'], load);
+  useLiveRefresh(`group-detail:${groupId}`, ['expenses','expense_splits','expense_payers','ledger_entries','group_settlements','group_members','group_invitations','group_join_requests','expense_change_requests','expense_change_votes'], load);
 
   const userMap = useMemo(() => {
     const map: Record<string, User> = {};
@@ -187,7 +214,17 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   const myBalance = balances[user.id] ?? 0;
   const simplified = useMemo(() => simplifyDebts(balances, userMap), [balances, userMap]);
   const myDebts = simplified.filter((d) => d.from.id === user.id);
-  const activeExpenses = expenses.filter((e) => !e.is_deleted);
+  // Records from before a fresh start are kept but move out of the way. The
+  // balance is still computed over all of them — it does not need filtering,
+  // because a cycle can only close when everyone is square, so a closed one
+  // nets to zero per person for ever.
+  const cycleId = group?.current_cycle_id ?? null;
+  const inThisCycle = (e: Expense) => (e.cycle_id ?? null) === cycleId;
+  const activeExpenses = expenses.filter((e) => !e.is_deleted && inThisCycle(e));
+  const earlierExpenses = expenses.filter((e) => !e.is_deleted && !inThisCycle(e));
+  // Deleted records are kept so the reversal that balances the ledger stays
+  // readable. Once the group is square that is no longer holding anything up.
+  const deletedExpenses = expenses.filter((e) => e.is_deleted);
 
   const handleApprove = async (request: JoinRequest) => {
     setBusyRequest(request.id);
@@ -230,24 +267,75 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   };
 
   const handleDeleteExpense = async (expense: Expense) => {
+    // More than ten minutes old means the others have to agree, so say that
+    // before the tap rather than after it.
+    const needsApproval = Date.now() - new Date(expense.updated_at ?? expense.created_at).getTime() > 10 * 60 * 1000;
+
     const ok = await confirm({
-      title: 'Delete this expense?',
-      message: `"${expense.title}" will be marked deleted and a reversal entry keeps everyone's balance correct. The ledger history is preserved.`,
-      confirmLabel: 'Delete',
-      danger: true,
+      title: needsApproval ? 'Ask to delete this expense?' : 'Delete this expense?',
+      message: needsApproval
+        ? `"${expense.title}" has been on the books a while, so the others on it have to agree before it goes. Nothing changes until they do.`
+        : `"${expense.title}" will be marked deleted and a reversal entry keeps everyone's balance correct. The ledger history is preserved.`,
+      confirmLabel: needsApproval ? 'Ask to delete' : 'Delete',
+      danger: !needsApproval,
     });
     if (!ok) return;
 
     try {
-      const { error } = await supabase.rpc('delete_expense', {
+      const { data, error } = await supabase.rpc('delete_expense', {
         p_expense_id: expense.id,
         p_reason: 'Deleted from the app',
       });
       if (error) throw error;
-      toast.success('Expense deleted and balances reversed.');
+      toast.success(
+        data === 'PENDING'
+          ? 'Asked. It stays on the books until the others agree.'
+          : 'Expense deleted and balances reversed.'
+      );
       await load();
     } catch (error) {
       toast.error(friendlyDbError(error, 'Could not delete the expense.'));
+    }
+  };
+
+  const handleVote = async (requestId: string, approved: boolean) => {
+    setBusyRequest(requestId);
+    try {
+      const { data, error } = await supabase.rpc('vote_on_expense_change', {
+        p_request_id: requestId,
+        p_approved: approved,
+      });
+      if (error) throw error;
+      toast.success(
+        data === 'APPROVED'
+          ? 'Approved — the change is in and balances are updated.'
+          : data === 'REJECTED'
+            ? 'Turned down. The record stays as it was.'
+            : data === 'CANCELLED'
+              ? 'That record was settled in the meantime, so the change was dropped.'
+              : approved
+                ? 'Your approval is in. Still waiting on the others.'
+                : 'Noted. Still waiting on the others.'
+      );
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not record your answer.'));
+    } finally {
+      setBusyRequest(null);
+    }
+  };
+
+  const handleWithdrawChange = async (requestId: string) => {
+    setBusyRequest(requestId);
+    try {
+      const { error } = await supabase.rpc('cancel_expense_change', { p_request_id: requestId });
+      if (error) throw error;
+      toast.success('Withdrawn.');
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not withdraw that.'));
+    } finally {
+      setBusyRequest(null);
     }
   };
 
@@ -260,6 +348,8 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
     () => Object.values(balances).every((amount) => Math.abs(amount) < 0.01),
     [balances]
   );
+  /** The server's own two conditions for erasing, so the UI can explain itself. */
+  const canErase = isAdmin && allSettled;
 
   const handleToggleArchive = async () => {
     const archiving = !group?.archived_at;
@@ -286,6 +376,76 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
       await load();
     } catch (error) {
       toast.error(friendlyDbError(error, 'Could not update the group.'));
+    } finally {
+      setCleaning(false);
+    }
+  };
+
+  const handleEraseOne = async (expense: Expense) => {
+    const ok = await confirm({
+      title: 'Erase this record for good?',
+      message: `"${expense.title}" was already deleted and counts towards nobody's balance. Erasing it removes it permanently and cannot be undone.`,
+      confirmLabel: 'Erase',
+      danger: true,
+    });
+    if (!ok) return;
+
+    setBusyErase(expense.id);
+    try {
+      const { error } = await supabase.rpc('purge_deleted_expense', { p_expense_id: expense.id });
+      if (error) throw error;
+      toast.success('Erased.');
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not erase that record.'));
+    } finally {
+      setBusyErase(null);
+    }
+  };
+
+  const handleClearDeleted = async () => {
+    const count = deletedExpenses.length;
+    const ok = await confirm({
+      title: `Clear ${count} deleted ${count === 1 ? 'record' : 'records'}?`,
+      message:
+        'These were already deleted and count towards nobody\'s balance. Erasing them frees the space for good. Live expenses are left alone.',
+      confirmLabel: 'Erase',
+      danger: true,
+    });
+    if (!ok) return;
+
+    setCleaning(true);
+    try {
+      const { data, error } = await supabase.rpc('purge_deleted_expenses', { p_group_id: groupId });
+      if (error) throw error;
+      const cleared = Number(data ?? 0);
+      toast.success(`Cleared ${cleared} deleted ${cleared === 1 ? 'record' : 'records'}.`);
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not clear those records.'));
+    } finally {
+      setCleaning(false);
+    }
+  };
+
+  const handleStartFresh = async () => {
+    const ok = await confirm({
+      title: 'Start a fresh balance?',
+      message: `The ${activeExpenses.length} record${activeExpenses.length === 1 ? '' : 's'} here move to Earlier records and this group starts again from zero. Nothing is deleted, and everyone can still read them.`,
+      confirmLabel: 'Start fresh',
+    });
+    if (!ok) return;
+
+    setCleaning(true);
+    try {
+      const { error } = await supabase.rpc('start_new_cycle', { p_group_id: groupId });
+      if (error) throw error;
+      toast.success('Fresh balance started. The old records are under Earlier records.');
+      setShowManage(false);
+      setShowEarlier(false);
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not start a fresh balance.'));
     } finally {
       setCleaning(false);
     }
@@ -718,7 +878,7 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
             </button>
           </div>
 
-          {expenses.length === 0 ? (
+          {activeExpenses.length === 0 ? (
             <EmptyState
               icon="🧾"
               title="No expenses yet"
@@ -731,21 +891,25 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
             />
           ) : (
             <div className="stack-sm">
-              {expenses.some((e) => e.settled_at && !e.is_deleted) && (
+              {activeExpenses.some((e) => e.settled_at) && (
                 <span className="hint" style={{ marginBottom: 2 }}>
                   Bills marked Settled are locked, so paid-up balances cannot reopen. To correct one, add a
                   new expense.
                 </span>
               )}
-              {expenses.map((expense) => {
+              {activeExpenses.map((expense) => {
                 const meta = categoryMeta(expense.category);
                 // Frozen once a payment covered it — the server refuses the edit
                 // either way, this just stops offering a button that cannot work.
                 const isSettled = Boolean(expense.settled_at);
-                const canManage = (expense.created_by === user.id || isAdmin) && !isSettled;
+                const change = pendingChanges.find((c) => c.out_expense_id === expense.id);
+                // A record with a change waiting cannot take another one, so the
+                // buttons come off until it is resolved.
+                const canManage =
+                  (expense.created_by === user.id || isAdmin) && !isSettled && !change;
                 return (
+                  <React.Fragment key={expense.id}>
                   <div
-                    key={expense.id}
                     className="card row"
                     style={{ opacity: expense.is_deleted ? 0.5 : 1, gap: 'var(--sp-3)' }}
                   >
@@ -799,15 +963,237 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                       )}
                     </span>
                   </div>
+
+                  {/* A change somebody wants to make, sitting with the record
+                      it concerns rather than in a list somewhere else. Before
+                      and after are both shown, because "Ben wants to change
+                      this" is not enough to answer on. */}
+                  {change && (
+                    <div
+                      className="card stack-sm"
+                      style={{ borderColor: 'var(--primary)', marginTop: -4 }}
+                    >
+                      <span className="row" style={{ gap: 6 }}>
+                        <span className="badge badge-primary">
+                          {change.out_kind === 'DELETE' ? 'Deletion proposed' : 'Change proposed'}
+                        </span>
+                        <span className="hint">
+                          {change.out_approvals} of {change.out_needed} agreed
+                        </span>
+                      </span>
+
+                      <span className="hint">
+                        {change.out_requested_by === user.id ? 'You' : change.out_requester}{' '}
+                        {change.out_kind === 'DELETE'
+                          ? 'asked to remove this record.'
+                          : `asked to change it${
+                              change.out_payload?.amount !== undefined
+                                ? ` from ${formatLKR(Number(expense.amount))} to ${formatLKR(
+                                    Number(change.out_payload.amount)
+                                  )}`
+                                : ''
+                            }.`}{' '}
+                        Nothing has moved yet.
+                      </span>
+
+                      {change.out_requested_by === user.id ? (
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-sm"
+                          onClick={() => handleWithdrawChange(change.out_request_id)}
+                          disabled={busyRequest === change.out_request_id}
+                        >
+                          {busyRequest === change.out_request_id ? <Spinner /> : <X size={14} />}
+                          Withdraw
+                        </button>
+                      ) : change.out_my_vote !== null ? (
+                        <span className="hint">
+                          You said {change.out_my_vote ? 'yes' : 'no'}. Waiting on the others.
+                        </span>
+                      ) : change.out_can_vote ? (
+                        <span className="row" style={{ gap: 'var(--sp-2)' }}>
+                          <button
+                            type="button"
+                            className="btn btn-primary btn-sm grow"
+                            onClick={() => handleVote(change.out_request_id, true)}
+                            disabled={busyRequest === change.out_request_id}
+                          >
+                            {busyRequest === change.out_request_id ? <Spinner /> : <Check size={14} />}
+                            Approve
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm grow"
+                            onClick={() => handleVote(change.out_request_id, false)}
+                            disabled={busyRequest === change.out_request_id}
+                          >
+                            <X size={14} /> Reject
+                          </button>
+                        </span>
+                      ) : (
+                        <span className="hint">
+                          This one is between the people on the record.
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  </React.Fragment>
                 );
               })}
             </div>
+          )}
+
+          {/* Everything from before the last fresh start. Kept, reachable, and
+              out of the way — the point of starting fresh is that the current
+              view is about what is happening now. */}
+          {earlierExpenses.length > 0 && (
+            <>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                style={{ marginTop: 'var(--sp-4)' }}
+                onClick={() => setShowEarlier((on) => !on)}
+                aria-expanded={showEarlier}
+              >
+                <History size={14} />
+                {showEarlier ? 'Hide earlier records' : `Earlier records (${earlierExpenses.length})`}
+              </button>
+
+              {showEarlier && (
+                <div className="stack-sm" style={{ marginTop: 'var(--sp-3)' }}>
+                  <span className="hint">
+                    Settled and closed off when this group started fresh. Kept for the record.
+                  </span>
+                  {earlierExpenses.map((expense) => (
+                    <div key={expense.id} className="card row" style={{ opacity: 0.75 }}>
+                      <span className="emoji-badge">{categoryMeta(expense.category).emoji}</span>
+                      <span className="grow" style={{ minWidth: 0 }}>
+                        <span className="truncate" style={{ display: 'block', fontWeight: 600, fontSize: '0.88rem' }}>
+                          {expense.title}
+                        </span>
+                        <span className="hint">
+                          {userMap[expense.paid_by ?? '']?.display_name ?? 'Someone'} paid ·{' '}
+                          {new Date(expense.created_at).toLocaleDateString(undefined, {
+                            day: 'numeric',
+                            month: 'short',
+                          })}
+                        </span>
+                      </span>
+                      <span className="amount-md tabular" style={{ flexShrink: 0 }}>
+                        {formatLKR(Number(expense.amount))}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Deleted records get their own section rather than sitting greyed
+              out among the live ones. They were unreachable there: nothing to
+              tap, and the count above says zero expenses while four rows show. */}
+          {deletedExpenses.length > 0 && (
+            <>
+              <div className="row-between" style={{ marginTop: 'var(--sp-5)', marginBottom: 'var(--sp-3)' }}>
+                <h2 className="section-title" style={{ margin: 0 }}>
+                  Deleted ({deletedExpenses.length})
+                </h2>
+                {/* Always here, disabled with a reason rather than hidden. A
+                    control that vanishes when you cannot use it reads as one
+                    the app does not have. */}
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  onClick={handleClearDeleted}
+                  disabled={cleaning || !canErase}
+                >
+                  {cleaning ? <Spinner /> : <Eraser size={14} />} Erase all
+                </button>
+              </div>
+
+              <span className="hint" style={{ display: 'block', marginBottom: 'var(--sp-2)' }}>
+                {!isAdmin
+                  ? 'Kept so the correction stays on record. A group admin can erase them for good.'
+                  : !allSettled
+                    ? 'Kept so the correction stays on record. They can be erased once everyone in this group is settled up — not just you.'
+                    : 'Kept so the correction stays on record. They count towards nobody\'s balance and can be erased for good.'}
+              </span>
+
+              <div className="stack-sm">
+                {deletedExpenses.map((expense) => {
+                  const meta = categoryMeta(expense.category);
+                  return (
+                    <div key={expense.id} className="card row" style={{ opacity: 0.6, gap: 'var(--sp-3)' }}>
+                      <span className="icon-tile" style={{ width: 36, height: 36, fontSize: 17 }}>
+                        {meta.emoji}
+                      </span>
+                      <span className="grow" style={{ minWidth: 0 }}>
+                        <span
+                          className="truncate"
+                          style={{ display: 'block', fontWeight: 600, fontSize: '0.9rem' }}
+                        >
+                          {expense.title}
+                        </span>
+                        <span className="hint" style={{ display: 'block' }}>
+                          {expense.paid_by_user?.display_name ?? 'Someone'} paid ·{' '}
+                          {friendlyDate(expense.created_at.slice(0, 10))}
+                        </span>
+                      </span>
+                      <span className="amount-md tabular" style={{ flexShrink: 0 }}>
+                        {formatLKR(expense.amount)}
+                      </span>
+                      <button
+                        type="button"
+                        className="btn-icon"
+                        style={{ width: 30, height: 30, color: 'var(--negative)', flexShrink: 0 }}
+                        onClick={() => handleEraseOne(expense)}
+                        disabled={busyErase === expense.id || !canErase}
+                        aria-label={`Erase ${expense.title} permanently`}
+                        title={
+                          !isAdmin
+                            ? 'Only a group admin can erase records'
+                            : !allSettled
+                              ? 'Settle every balance in this group first'
+                              : 'Erase permanently'
+                        }
+                      >
+                        {busyErase === expense.id ? <Spinner /> : <Trash2 size={13} />}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
           )}
         </>
       )}
 
       {tab === 'balances' && (
         <>
+          {/* The chart was only reachable from an unlabelled icon in the header,
+              which is not somewhere anyone looks for it. This is the screen you
+              are on when you want to know who has been paying. */}
+          <button
+            type="button"
+            className="card card-interactive row"
+            style={{ width: '100%', textAlign: 'left', marginBottom: 'var(--sp-4)' }}
+            onClick={openStats}
+          >
+            <span
+              className="icon-tile"
+              style={{ width: 38, height: 38, background: 'var(--primary-container)', color: 'var(--primary)' }}
+            >
+              <PieChart size={18} />
+            </span>
+            <span className="grow" style={{ minWidth: 0 }}>
+              <span style={{ display: 'block', fontWeight: 700, fontSize: '0.9rem' }}>Who paid what</span>
+              <span className="hint">
+                Each person&rsquo;s share of everything this group has spent, as a chart.
+              </span>
+            </span>
+            <ChevronRight size={16} color="var(--on-surface-faint)" />
+          </button>
+
           <h2 className="section-title" style={{ marginTop: 0 }}>Who owes whom</h2>
           {simplified.length === 0 ? (
             <EmptyState icon="✅" title="Everyone is square" text="No outstanding balances in this group." />
@@ -969,7 +1355,9 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                       const net = Number(row.out_net);
                       const pct = Math.round((paid / total) * 100);
                       return (
-                        <div key={row.out_user_id} className="card row">
+                        // Spending by a deleted account has no user id — it is
+                        // one aggregate row, so a fixed key is unique.
+                        <div key={row.out_user_id ?? 'former'} className="card row">
                           <span
                             aria-hidden="true"
                             style={{
@@ -1083,8 +1471,8 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
               <>
               {!allSettled && (
                 <Alert variant="warning">
-                  Someone in this group is still up or down. Settle every balance before archiving or clearing
-                  the history — otherwise those debts would be silently written off.
+                  Someone in this group is still up or down. Settle every balance before archiving, starting
+                  fresh or clearing the history — otherwise those debts would be silently written off.
                 </Alert>
               )}
 
@@ -1112,16 +1500,66 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                 </button>
               </div>
 
+              {/* ---- Clear only what was already deleted ---- */}
+              <div className="card">
+                <span className="row" style={{ gap: 8, marginBottom: 6 }}>
+                  <Eraser size={16} color="var(--primary)" />
+                  <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Clear deleted records</span>
+                </span>
+                <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+                  Expenses somebody deleted are kept until the group is settled, so the correction stays on
+                  record. Erasing them afterwards frees the space and leaves every live expense untouched.
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-block"
+                  onClick={handleClearDeleted}
+                  disabled={cleaning || !allSettled || deletedExpenses.length === 0}
+                >
+                  {cleaning && <Spinner />}
+                  {deletedExpenses.length === 0
+                    ? 'Nothing deleted to clear'
+                    : `Clear ${deletedExpenses.length} deleted record${deletedExpenses.length === 1 ? '' : 's'}`}
+                </button>
+              </div>
+
+              {/* ---- Start fresh, keeping the records ---- */}
+              <div className="card">
+                <span className="row" style={{ gap: 8, marginBottom: 6 }}>
+                  <RotateCcw size={16} color="var(--primary)" />
+                  <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Start a fresh balance</span>
+                </span>
+                <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+                  Draws a line under everything so far and starts this group again from zero. Nothing is
+                  deleted — the old records move to <strong>Earlier records</strong>, where anyone in the group
+                  can still read them. Available once everyone here is settled up.
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-block"
+                  onClick={handleStartFresh}
+                  disabled={cleaning || !allSettled || activeExpenses.length === 0}
+                >
+                  {cleaning && <Spinner />}
+                  {activeExpenses.length === 0
+                    ? 'Nothing to close off yet'
+                    : !allSettled
+                      ? 'Settle up first'
+                      : 'Start fresh, keep the records'}
+                </button>
+              </div>
+
               {/* ---- Purge: irreversible ---- */}
               <div className="card" style={{ borderColor: 'var(--negative)' }}>
                 <span className="row" style={{ gap: 8, marginBottom: 6 }}>
                   <Eraser size={16} color="var(--negative)" />
-                  <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Clear history permanently</span>
+                  <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Start fresh and erase everything</span>
                 </span>
                 <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
-                  Frees up storage by erasing every expense, split, settlement and ledger entry in this group.
-                  The group and its members stay, ready to reuse. <strong>This cannot be undone</strong> — the
-                  record of who paid what will be gone for good, so archive instead if you might ever need it.
+                  The same fresh start, except the old records are destroyed rather than kept — every expense,
+                  split, settlement and ledger entry in this group, freeing the storage. The group and its
+                  members stay. <strong>This cannot be undone</strong>, so use the option above if you might
+                  ever want to look back.
                 </p>
                 <button
                   type="button"
@@ -1130,7 +1568,7 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                   disabled={cleaning || !allSettled || activeExpenses.length === 0}
                 >
                   {cleaning && <Spinner />}
-                  {activeExpenses.length === 0 ? 'Nothing to clear' : 'Clear history permanently'}
+                  {activeExpenses.length === 0 ? 'Nothing to clear' : 'Erase everything and start fresh'}
                 </button>
               </div>
 

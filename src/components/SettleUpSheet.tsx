@@ -4,6 +4,7 @@ import { User } from '../types';
 import { formatLKR, parseAmount, roundMoney } from '../lib/currency';
 import { friendlyDbError } from '../lib/authErrors';
 import { Alert, Avatar, Sheet, Spinner } from './ui';
+import { Check } from 'lucide-react';
 import { useToast } from './Toast';
 import { useConfirm } from './Confirm';
 
@@ -23,13 +24,21 @@ export interface SettleTarget {
 
 interface SettleUpSheetProps {
   target: SettleTarget;
+  /**
+   * Every outstanding part of this friend's balance, when it spans more than
+   * one group. The Friends screen used to put a Settle button on each of them,
+   * which meant the same action appeared twice for the usual single-group case.
+   * One button opens this sheet; picking which group happens here.
+   */
+  options?: SettleTarget[];
+  onPick?: (target: SettleTarget) => void;
   onClose: () => void;
   onSettled: () => void;
 }
 
 const METHODS = ['CASH', 'BANK', 'CARD', 'OTHER'];
 
-export const SettleUpSheet: React.FC<SettleUpSheetProps> = ({ target, onClose, onSettled }) => {
+export const SettleUpSheet: React.FC<SettleUpSheetProps> = ({ target, options, onPick, onClose, onSettled }) => {
   const toast = useToast();
   const confirm = useConfirm();
   const theyPay = target.direction === 'THEY_PAY';
@@ -145,6 +154,41 @@ export const SettleUpSheet: React.FC<SettleUpSheetProps> = ({ target, onClose, o
             </div>
           </div>
         </div>
+
+        {options && options.length > 1 && (
+          <div className="field">
+            <span className="label label-block">Which balance</span>
+            <div className="stack-sm">
+              {options.map((option) => {
+                const active = option.groupId === target.groupId;
+                return (
+                  <button
+                    key={option.groupId}
+                    type="button"
+                    className={`card row-between ${active ? 'is-selected' : ''}`}
+                    style={{
+                      width: '100%',
+                      textAlign: 'left',
+                      borderColor: active ? 'var(--primary)' : undefined,
+                    }}
+                    onClick={() => onPick?.(option)}
+                  >
+                    <span className="truncate" style={{ fontSize: '0.88rem', fontWeight: 600 }}>
+                      {option.groupName ?? 'Money lent directly'}
+                    </span>
+                    <span className="row" style={{ gap: 'var(--sp-2)', flexShrink: 0 }}>
+                      <span className="amount-md tabular">{formatLKR(option.suggestedAmount)}</span>
+                      {active && <Check size={15} color="var(--primary)" />}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            <span className="hint">
+              A payment is recorded against one group so that group&rsquo;s ledger stays balanced.
+            </span>
+          </div>
+        )}
 
         {target.suggestedAmount > 0 && (
           <div className="segmented" role="group" aria-label="How much">

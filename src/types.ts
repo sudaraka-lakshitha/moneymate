@@ -49,6 +49,12 @@ export type SplitMethod = 'EQUAL' | 'UNEQUAL' | 'PERCENTAGE' | 'SHARES' | 'ITEMI
 export interface Expense {
   id: string;
   group_id?: string;
+  /**
+   * Which run of the group this belongs to. Null until somebody starts a fresh
+   * balance; after that, records from before the line carry the closed cycle
+   * and drop out of the current view without being destroyed.
+   */
+  cycle_id?: string | null;
   title: string;
   amount: number;
   paid_by?: string;
@@ -67,6 +73,8 @@ export interface Expense {
    * settled group would silently show a debt again.
    */
   settled_at?: string | null;
+  /** A record between two people that is lending rather than a shared bill. */
+  is_loan?: boolean;
 }
 
 export interface ExpenseSplit {
@@ -106,28 +114,6 @@ export type ExpenseCategory =
   | 'HEALTH'
   | 'UTILITIES'
   | 'OTHER';
-
-export interface DailyExpense {
-  id: string;
-  user_id: string;
-  title: string;
-  amount: number;
-  category: ExpenseCategory;
-  date: string;
-  note?: string;
-  receipt_url?: string | null;
-  is_deleted: boolean;
-  created_at: string;
-}
-
-export interface Budget {
-  id: string;
-  user_id: string;
-  category: ExpenseCategory;
-  monthly_limit: number;
-  /** yyyy-MM */
-  month: string;
-}
 
 export interface GroupSettlement {
   id: string;

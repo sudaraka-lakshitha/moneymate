@@ -9,7 +9,7 @@ type Mode = 'signIn' | 'signUp';
 const FEATURES = [
   { icon: Users, text: 'Split group bills four ways — equal, custom, % or shares' },
   { icon: Sparkles, text: 'Everything in LKR, down to the last cent' },
-  { icon: BarChart3, text: 'Daily tracker, budgets and 30-day trends' },
+  { icon: BarChart3, text: 'Shared spending stats and 30-day trends' },
   { icon: Shield, text: 'Append-only ledger keeps balances honest' },
 ];
 

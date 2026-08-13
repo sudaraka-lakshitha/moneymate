@@ -10,9 +10,11 @@ import { useConfirm } from '../components/Confirm';
 import { useInstall } from '../lib/install';
 import { IosInstallHelp } from '../components/InstallPrompt';
 import {
-  LogOut, Pencil, Globe, Shield, Database, ChevronRight,
+  LogOut, Pencil, Globe, Info, ChevronRight,
   Sun, Moon, Monitor, KeyRound, Camera, Trash2, Download, Check,
 } from 'lucide-react';
+
+const APP_VERSION = '1.0.0';
 
 const THEME_OPTIONS: { id: ThemePreference; label: string; icon: React.ElementType }[] = [
   { id: 'light', label: 'Light', icon: Sun },
@@ -175,7 +177,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
     const first = await confirm({
       title: 'Delete your account?',
       message:
-        'Your profile, personal expenses, budgets and friendships are erased permanently. Groups you share stay for the other members, and past shared bills remain on their records. This cannot be undone.',
+        'Your profile, your shared records and your friendships are erased permanently. Groups you share stay for the other members, and past shared bills remain on their records. This cannot be undone.',
       confirmLabel: 'Continue',
       danger: true,
     });
@@ -223,10 +225,12 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
     }
   };
 
+  // Only things a person using the app would want to know. What the backend is
+  // called and which database features are switched on are our concerns, not
+  // theirs — and listing them reads like a debug screen.
   const infoRows = [
     { icon: Globe, label: 'Currency', value: 'LKR (Rs.)' },
-    { icon: Database, label: 'Sync', value: 'Supabase, live' },
-    { icon: Shield, label: 'Row Level Security', value: 'Enabled' },
+    { icon: Info, label: 'Version', value: APP_VERSION },
   ];
 
   return (
@@ -493,7 +497,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ user, onUserUpdated,
           <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>Delete account</span>
         </span>
         <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
-          Erases your profile, personal expenses, budgets and friendships for good. Settle every balance
+          Erases your profile, your shared records and your friendships for good. Settle every balance
           first — an unsettled account cannot be deleted, because it would leave somebody else's books
           short.
         </p>

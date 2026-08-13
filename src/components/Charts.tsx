@@ -300,32 +300,6 @@ export const CategoryBars: React.FC<{ data: CategoryDatum[]; total: number }> = 
   );
 };
 
-/* ------------------------------------------------------------------------ */
-/* Sparkline for stat tiles                                                  */
-/* ------------------------------------------------------------------------ */
-
-export const Sparkline: React.FC<{ values: number[]; color?: string; width?: number; height?: number }> = ({
-  values,
-  color = 'var(--primary-light)',
-  width = 72,
-  height = 24,
-}) => {
-  if (values.length < 2) return null;
-
-  const max = Math.max(...values, 1);
-  const points = values.map((v, i) => {
-    const x = (i / (values.length - 1)) * width;
-    const y = height - (v / max) * height;
-    return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
-  });
-
-  return (
-    <svg width={width} height={height} aria-hidden="true" style={{ display: 'block', overflow: 'visible' }}>
-      <path d={points.join(' ')} fill="none" stroke={color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  );
-};
-
 /* Re-exported so pages can render a legend when they need one. */
 export const Legend: React.FC<{ items: { label: string; color: string }[] }> = ({ items }) => (
   <div className="legend">

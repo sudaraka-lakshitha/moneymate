@@ -6,7 +6,7 @@ import { clearAuthParamsFromUrl, messageFrom, readOAuthError } from './lib/authE
 import { ThemeProvider } from './lib/theme';
 import { ToastProvider } from './components/Toast';
 import { ConfirmProvider } from './components/Confirm';
-import { useOnline, useQueueFlush } from './lib/offline';
+import { useOnline } from './lib/offline';
 import { InstallPrompt } from './components/InstallPrompt';
 import { AuthPage } from './pages/AuthPage';
 import { ResetPasswordPage } from './pages/ResetPasswordPage';
@@ -15,10 +15,9 @@ import { HomePage } from './pages/HomePage';
 import { GroupsPage } from './pages/GroupsPage';
 import { GroupDetailPage } from './pages/GroupDetailPage';
 import { FriendsPage } from './pages/FriendsPage';
-import { TrackerPage } from './pages/TrackerPage';
 import { AnalyticsPage } from './pages/AnalyticsPage';
 import { SettingsPage } from './pages/SettingsPage';
-import { Home, Users, UserCheck, Calendar, BarChart3, Settings, WifiOff, RefreshCw, AlertTriangle } from 'lucide-react';
+import { Home, Users, UserCheck, BarChart3, Settings, WifiOff, RefreshCw } from 'lucide-react';
 
 // Search is a utility, not a destination — it lives as a header action on Home
 // rather than taking one of six already-tight nav slots from a core screen.
@@ -26,7 +25,6 @@ const NAV_ITEMS = [
   { id: 'home', label: 'Home', icon: Home },
   { id: 'groups', label: 'Groups', icon: Users },
   { id: 'friends', label: 'Friends', icon: UserCheck },
-  { id: 'tracker', label: 'Tracker', icon: Calendar },
   { id: 'analytics', label: 'Stats', icon: BarChart3 },
   { id: 'settings', label: 'You', icon: Settings },
 ];
@@ -90,37 +88,13 @@ const AppShell: React.FC = () => {
   const [syncNote, setSyncNote] = useState<string | null>(null);
 
   const online = useOnline();
-  const [syncFailed, setSyncFailed] = useState(false);
 
-  const handleFlushed = useCallback((sent: number, failed: number) => {
-    // A rejected entry is removed from the queue — say so, or it just disappears.
-    setSyncFailed(failed > 0);
-    if (failed > 0) {
-      setSyncNote(
-        sent > 0
-          ? `Synced ${sent}, but ${failed} offline ${failed === 1 ? 'entry' : 'entries'} could not be saved.`
-          : `${failed} offline ${failed === 1 ? 'entry' : 'entries'} could not be saved.`
-      );
-    } else {
-      setSyncNote(`Synced ${sent} offline ${sent === 1 ? 'entry' : 'entries'}.`);
-    }
-  }, []);
-
-  const queued = useQueueFlush(handleFlushed);
-
-  // Clear the sync confirmation after a moment. A failure reports lost data, so
-  // it stays up long enough to actually be read.
+  // Clear the note after a moment.
   useEffect(() => {
     if (!syncNote) return;
-    const timer = window.setTimeout(
-      () => {
-        setSyncNote(null);
-        setSyncFailed(false);
-      },
-      syncFailed ? 10000 : 4000
-    );
+    const timer = window.setTimeout(() => setSyncNote(null), 4000);
     return () => window.clearTimeout(timer);
-  }, [syncNote, syncFailed]);
+  }, [syncNote]);
 
   /**
    * Posts any recurring expenses that fell due while the app was closed. The
@@ -133,9 +107,6 @@ const AppShell: React.FC = () => {
       .rpc('run_due_recurring')
       .then(({ data, error }) => {
         if (!error && typeof data === 'number' && data > 0) {
-          // Reset the failure flag too, or this note inherits the warning
-          // styling and the longer timeout from a previous failed sync.
-          setSyncFailed(false);
           setSyncNote(`Added ${data} recurring ${data === 1 ? 'expense' : 'expenses'}.`);
         }
       });
@@ -315,8 +286,6 @@ const AppShell: React.FC = () => {
         return <SearchPage user={user} onNavigate={setRoute} />;
       case 'friends':
         return <FriendsPage user={user} />;
-      case 'tracker':
-        return <TrackerPage user={user} />;
       case 'analytics':
         return <AnalyticsPage user={user} />;
       case 'settings':
@@ -332,12 +301,12 @@ const AppShell: React.FC = () => {
         {!online && (
           <div className="offline-bar">
             <WifiOff size={13} />
-            Offline{queued > 0 ? ` · ${queued} waiting to sync` : ' · showing saved data'}
+            Offline · showing saved data
           </div>
         )}
         {online && syncNote && (
-          <div className={`offline-bar ${syncFailed ? '' : 'is-syncing'}`}>
-            {syncFailed ? <AlertTriangle size={13} /> : <RefreshCw size={13} />} {syncNote}
+          <div className="offline-bar is-syncing">
+            <RefreshCw size={13} /> {syncNote}
           </div>
         )}
 

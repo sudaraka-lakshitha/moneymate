@@ -1,5 +1,5 @@
 \set ON_ERROR_STOP on
--- Remove friend, per-person stats opt-in, and group contribution stats.
+-- Remove friend, what counts as spending, and group contribution stats.
 GRANT USAGE ON SCHEMA public TO authenticated;
 GRANT ALL ON ALL TABLES IN SCHEMA public TO authenticated;
 GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO authenticated;
@@ -28,74 +28,62 @@ BEGIN
   INSERT INTO group_members (group_id,user_id,role) VALUES (G,BEN,'MEMBER'),(G,CAR,'MEMBER');
   EXECUTE 'SET ROLE authenticated';
 
-  -- ===== stats opt-in =====
+  -- ===== what a group bill counts for =====
 
-  -- L1: Ann adds a bill and opts her own share IN
+  -- L1: a bill lands on everyone it names, at once
   e1 := save_expense(G,'Hotel',900,ANN,'ACCOMMODATION','EQUAL','',
     jsonb_build_array(
-      jsonb_build_object('user_id',ANN,'amount',300,'is_included',true,'stats',true),
+      jsonb_build_object('user_id',ANN,'amount',300,'is_included',true),
       jsonb_build_object('user_id',BEN,'amount',300,'is_included',true),
       jsonb_build_object('user_id',CAR,'amount',300,'is_included',true)),'[]'::jsonb);
 
-  SELECT include_in_stats INTO v FROM expense_splits WHERE expense_id=e1 AND user_id=ANN;
-  RAISE NOTICE 'L1 creator''s own choice recorded | pass=%', v IS TRUE;
-  IF v IS NOT TRUE THEN RAISE EXCEPTION 'L1 failed'; END IF;
+  SELECT COUNT(*) INTO n FROM expense_splits WHERE expense_id=e1 AND is_included;
+  RAISE NOTICE 'L1 everyone named is on the bill | pass=% (%)', n=3, n;
+  IF n<>3 THEN RAISE EXCEPTION 'L1 failed: % included shares', n; END IF;
 
-  -- L2: the others are left undecided, NOT silently counted
-  SELECT include_in_stats INTO v FROM expense_splits WHERE expense_id=e1 AND user_id=BEN;
-  RAISE NOTICE 'L2 other participants left undecided | pass=%', v IS NULL;
-  IF v IS NOT NULL THEN RAISE EXCEPTION 'L2 failed: someone else decided for Ben'; END IF;
+  -- L2: and it is their spending straight away — being asked to approve each
+  -- bill your own group adds is noise, not consent
+  SELECT COALESCE(SUM(s.amount),0) INTO shr
+  FROM expense_splits s JOIN expenses e ON e.id=s.expense_id
+  WHERE s.user_id=BEN AND s.is_included AND NOT e.is_deleted AND NOT e.is_loan;
+  RAISE NOTICE 'L2 a group share counts without asking | pass=% (%)', shr=300, shr;
+  IF shr<>300 THEN RAISE EXCEPTION 'L2 failed: Ben''s spending reads %', shr; END IF;
 
-  -- L3: but the expense itself exists for them regardless
+  -- L3: the record itself is readable by everyone on it
   PERFORM set_config('request.jwt.claim.sub', BEN::TEXT, true);
   SELECT COUNT(*) INTO n FROM expenses WHERE id=e1;
   IF n<>1 THEN RAISE EXCEPTION 'L3 failed: the record was blocked'; END IF;
   SELECT amount INTO shr FROM expense_splits WHERE expense_id=e1 AND user_id=BEN;
-  RAISE NOTICE 'L3 record still added for everyone | pass=% (share %)', n=1 AND shr=300, shr;
+  RAISE NOTICE 'L3 record readable by everyone on it | pass=% (share %)', n=1 AND shr=300, shr;
   IF shr<>300 THEN RAISE EXCEPTION 'L3 failed: share missing'; END IF;
 
-  -- L4: Ben's balance is unaffected by the stats question
+  -- L4: and the money side says the same thing
   IF member_balance(G,BEN) <> -300 THEN
-    RAISE EXCEPTION 'L4 failed: stats choice moved money (%)', member_balance(G,BEN);
+    RAISE EXCEPTION 'L4 failed: balance reads % against a 300 share', member_balance(G,BEN);
   END IF;
-  RAISE NOTICE 'L4 money side untouched by the stats question | pass=t';
+  RAISE NOTICE 'L4 balance agrees with the share | pass=t';
 
-  -- L5: Ben decides for himself
-  PERFORM set_split_stats_choice(e1, TRUE);
-  SELECT include_in_stats INTO v FROM expense_splits WHERE expense_id=e1 AND user_id=BEN;
-  RAISE NOTICE 'L5 participant can opt in | pass=%', v IS TRUE;
-  IF v IS NOT TRUE THEN RAISE EXCEPTION 'L5 failed'; END IF;
-
-  -- L6: and can opt back out
-  PERFORM set_split_stats_choice(e1, FALSE);
-  SELECT include_in_stats INTO v FROM expense_splits WHERE expense_id=e1 AND user_id=BEN;
-  RAISE NOTICE 'L6 participant can opt out | pass=%', v IS FALSE;
-  IF v IS NOT FALSE THEN RAISE EXCEPTION 'L6 failed'; END IF;
-
-  -- L7: Ben cannot decide on Ann's behalf
-  SELECT include_in_stats INTO v FROM expense_splits WHERE expense_id=e1 AND user_id=ANN;
-  RAISE NOTICE 'L7 one person''s choice does not change another''s | pass=%', v IS TRUE;
-  IF v IS NOT TRUE THEN RAISE EXCEPTION 'L7 failed'; END IF;
-
-  -- L8: no share in an expense means no choice to make
+  -- L5: somebody left off a bill is charged nothing for it
   PERFORM set_config('request.jwt.claim.sub', CAR::TEXT, true);
   e2 := save_expense(G,'Solo',100,CAR,'FOOD','UNEQUAL','',
     jsonb_build_array(
-      jsonb_build_object('user_id',CAR,'amount',100,'is_included',true,'stats',false)),'[]'::jsonb);
-  PERFORM set_config('request.jwt.claim.sub', BEN::TEXT, true);
-  f:=FALSE;
-  BEGIN PERFORM set_split_stats_choice(e2, TRUE); EXCEPTION WHEN OTHERS THEN f:=TRUE; END;
-  RAISE NOTICE 'L8 cannot opt into an expense you are not in | pass=%', f;
-  IF NOT f THEN RAISE EXCEPTION 'L8 failed'; END IF;
+      jsonb_build_object('user_id',CAR,'amount',100,'is_included',true)),'[]'::jsonb);
+  SELECT COUNT(*) INTO n FROM expense_splits WHERE expense_id=e2 AND user_id=BEN AND is_included;
+  RAISE NOTICE 'L5 nobody is charged for a bill they are off | pass=%', n=0;
+  IF n<>0 THEN RAISE EXCEPTION 'L5 failed'; END IF;
 
-  -- L9: bulk-answer everything outstanding
+  -- L6: a record between two people counts for both, same as a group bill
+  PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
+  PERFORM send_friend_request('s_cara@t.lk');
   PERFORM set_config('request.jwt.claim.sub', CAR::TEXT, true);
-  SELECT COUNT(*) INTO n FROM expense_splits WHERE user_id=CAR AND include_in_stats IS NULL;
-  IF n<1 THEN RAISE EXCEPTION 'L9 setup: expected pending rows'; END IF;
-  SELECT set_all_pending_stats_choices(TRUE) INTO cnt;
-  SELECT COUNT(*) INTO n FROM expense_splits WHERE user_id=CAR AND include_in_stats IS NULL;
-  RAISE NOTICE 'L9 bulk decision clears the queue | pass=% (answered %)', n=0, cnt;
-  IF n<>0 THEN RAISE EXCEPTION 'L9 failed'; END IF;
+  PERFORM respond_to_friend_request(
+    (SELECT id FROM friend_requests WHERE requester_id=ANN AND addressee_id=CAR), TRUE);
+  PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
+  PERFORM add_direct_expense(CAR, 500, 'Split taxi', TRUE, 250, FALSE, 'TRANSPORT');
+  SELECT COUNT(*) INTO n FROM expense_splits s JOIN expenses e ON e.id=s.expense_id
+   WHERE s.is_included AND NOT e.is_loan AND s.amount=250;
+  RAISE NOTICE 'L6 a pair record counts for both | pass=% (%)', n=2, n;
+  IF n<>2 THEN RAISE EXCEPTION 'L6 failed: % counted shares', n; END IF;
 
   -- ===== group contribution stats =====
 

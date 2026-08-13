@@ -95,22 +95,18 @@ BEGIN
 
   -- N3: Ben (a plain member, now square) can delete
   PERFORM set_config('request.jwt.claim.sub', BEN::TEXT, true);
-  INSERT INTO daily_expenses (user_id,title,amount,category,date)
-    VALUES (BEN,'Coffee',300,'FOOD',CURRENT_DATE);
   PERFORM delete_my_account();
   SELECT COUNT(*) INTO n FROM users WHERE id=BEN;
   RAISE NOTICE 'N3 settled account deletes | pass=%', n=0;
   IF n<>0 THEN RAISE EXCEPTION 'N3 failed'; END IF;
 
-  -- N4: their personal data goes with it
+  -- N4: their memberships and connections go with it
   EXECUTE 'RESET ROLE';
-  SELECT COUNT(*) INTO n FROM daily_expenses WHERE user_id=BEN;
-  IF n<>0 THEN RAISE EXCEPTION 'N4 failed: % personal rows left', n; END IF;
   SELECT COUNT(*) INTO n FROM group_members WHERE user_id=BEN;
   IF n<>0 THEN RAISE EXCEPTION 'N4 failed: still in a group'; END IF;
   SELECT COUNT(*) INTO n FROM friend_requests WHERE requester_id=BEN OR addressee_id=BEN;
   IF n<>0 THEN RAISE EXCEPTION 'N4 failed: friend links left'; END IF;
-  RAISE NOTICE 'N4 personal data, memberships and friendships removed | pass=t';
+  RAISE NOTICE 'N4 memberships and friendships removed | pass=t';
   EXECUTE 'SET ROLE authenticated';
 
   -- N5: the group survives with an admin

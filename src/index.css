@@ -679,19 +679,6 @@ select.input {
    Progress
    ========================================================================== */
 
-.progress {
-  width: 100%;
-  height: 8px;
-  border-radius: var(--r-full);
-  background: var(--surface-variant);
-  overflow: hidden;
-}
-.progress-bar {
-  height: 100%;
-  border-radius: var(--r-full);
-  transition: width var(--dur) var(--ease);
-}
-
 /* ==========================================================================
    Bottom navigation
    ========================================================================== */
