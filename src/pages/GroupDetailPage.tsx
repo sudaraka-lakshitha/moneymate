@@ -40,6 +40,21 @@ interface JoinRequest {
   users?: User;
 }
 
+/** A proposed edit or delete, waiting on the people it affects. */
+interface PendingChange {
+  out_request_id: string;
+  out_expense_id: string;
+  out_kind: 'EDIT' | 'DELETE';
+  out_requested_by: string;
+  out_requester: string;
+  out_payload: { title?: string; amount?: number } | null;
+  out_reason: string;
+  out_approvals: number;
+  out_needed: number;
+  out_my_vote: boolean | null;
+  out_can_vote: boolean;
+}
+
 export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user, onBack }) => {
   const toast = useToast();
   const confirm = useConfirm();
@@ -76,6 +91,8 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   const [showManage, setShowManage] = useState(false);
   const [cleaning, setCleaning] = useState(false);
   const [showEarlier, setShowEarlier] = useState(false);
+  /** Changes somebody has proposed to a record and is waiting on answers for. */
+  const [pendingChanges, setPendingChanges] = useState<PendingChange[]>([]);
   const [busyErase, setBusyErase] = useState<string | null>(null);
 
   const [showEdit, setShowEdit] = useState(false);
@@ -144,6 +161,14 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
       if (invitationError) console.error('Group invitations failed to load:', invitationError);
       setInvitations((invitationData ?? []) as unknown as GroupInvitation[]);
 
+      // Proposed changes waiting on the people they affect.
+      const { data: changeData, error: changeError } = await supabase.rpc(
+        'pending_changes_for_group',
+        { p_group_id: groupId }
+      );
+      if (changeError) console.error('Pending changes failed to load:', changeError);
+      setPendingChanges((changeData ?? []) as PendingChange[]);
+
       // Your connections, so inviting somebody you already know does not mean
       // retyping an address the app already has.
       const { data: friendData } = await supabase
@@ -167,7 +192,7 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
     void load();
   }, [load]);
 
-  useLiveRefresh(`group-detail:${groupId}`, ['expenses','expense_splits','ledger_entries','group_settlements','group_members','group_invitations','group_join_requests'], load);
+  useLiveRefresh(`group-detail:${groupId}`, ['expenses','expense_splits','expense_payers','ledger_entries','group_settlements','group_members','group_invitations','group_join_requests','expense_change_requests','expense_change_votes'], load);
 
   const userMap = useMemo(() => {
     const map: Record<string, User> = {};
@@ -242,24 +267,75 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   };
 
   const handleDeleteExpense = async (expense: Expense) => {
+    // More than ten minutes old means the others have to agree, so say that
+    // before the tap rather than after it.
+    const needsApproval = Date.now() - new Date(expense.updated_at ?? expense.created_at).getTime() > 10 * 60 * 1000;
+
     const ok = await confirm({
-      title: 'Delete this expense?',
-      message: `"${expense.title}" will be marked deleted and a reversal entry keeps everyone's balance correct. The ledger history is preserved.`,
-      confirmLabel: 'Delete',
-      danger: true,
+      title: needsApproval ? 'Ask to delete this expense?' : 'Delete this expense?',
+      message: needsApproval
+        ? `"${expense.title}" has been on the books a while, so the others on it have to agree before it goes. Nothing changes until they do.`
+        : `"${expense.title}" will be marked deleted and a reversal entry keeps everyone's balance correct. The ledger history is preserved.`,
+      confirmLabel: needsApproval ? 'Ask to delete' : 'Delete',
+      danger: !needsApproval,
     });
     if (!ok) return;
 
     try {
-      const { error } = await supabase.rpc('delete_expense', {
+      const { data, error } = await supabase.rpc('delete_expense', {
         p_expense_id: expense.id,
         p_reason: 'Deleted from the app',
       });
       if (error) throw error;
-      toast.success('Expense deleted and balances reversed.');
+      toast.success(
+        data === 'PENDING'
+          ? 'Asked. It stays on the books until the others agree.'
+          : 'Expense deleted and balances reversed.'
+      );
       await load();
     } catch (error) {
       toast.error(friendlyDbError(error, 'Could not delete the expense.'));
+    }
+  };
+
+  const handleVote = async (requestId: string, approved: boolean) => {
+    setBusyRequest(requestId);
+    try {
+      const { data, error } = await supabase.rpc('vote_on_expense_change', {
+        p_request_id: requestId,
+        p_approved: approved,
+      });
+      if (error) throw error;
+      toast.success(
+        data === 'APPROVED'
+          ? 'Approved — the change is in and balances are updated.'
+          : data === 'REJECTED'
+            ? 'Turned down. The record stays as it was.'
+            : data === 'CANCELLED'
+              ? 'That record was settled in the meantime, so the change was dropped.'
+              : approved
+                ? 'Your approval is in. Still waiting on the others.'
+                : 'Noted. Still waiting on the others.'
+      );
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not record your answer.'));
+    } finally {
+      setBusyRequest(null);
+    }
+  };
+
+  const handleWithdrawChange = async (requestId: string) => {
+    setBusyRequest(requestId);
+    try {
+      const { error } = await supabase.rpc('cancel_expense_change', { p_request_id: requestId });
+      if (error) throw error;
+      toast.success('Withdrawn.');
+      await load();
+    } catch (error) {
+      toast.error(friendlyDbError(error, 'Could not withdraw that.'));
+    } finally {
+      setBusyRequest(null);
     }
   };
 
@@ -826,10 +902,14 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                 // Frozen once a payment covered it — the server refuses the edit
                 // either way, this just stops offering a button that cannot work.
                 const isSettled = Boolean(expense.settled_at);
-                const canManage = (expense.created_by === user.id || isAdmin) && !isSettled;
+                const change = pendingChanges.find((c) => c.out_expense_id === expense.id);
+                // A record with a change waiting cannot take another one, so the
+                // buttons come off until it is resolved.
+                const canManage =
+                  (expense.created_by === user.id || isAdmin) && !isSettled && !change;
                 return (
+                  <React.Fragment key={expense.id}>
                   <div
-                    key={expense.id}
                     className="card row"
                     style={{ opacity: expense.is_deleted ? 0.5 : 1, gap: 'var(--sp-3)' }}
                   >
@@ -883,6 +963,81 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
                       )}
                     </span>
                   </div>
+
+                  {/* A change somebody wants to make, sitting with the record
+                      it concerns rather than in a list somewhere else. Before
+                      and after are both shown, because "Ben wants to change
+                      this" is not enough to answer on. */}
+                  {change && (
+                    <div
+                      className="card stack-sm"
+                      style={{ borderColor: 'var(--primary)', marginTop: -4 }}
+                    >
+                      <span className="row" style={{ gap: 6 }}>
+                        <span className="badge badge-primary">
+                          {change.out_kind === 'DELETE' ? 'Deletion proposed' : 'Change proposed'}
+                        </span>
+                        <span className="hint">
+                          {change.out_approvals} of {change.out_needed} agreed
+                        </span>
+                      </span>
+
+                      <span className="hint">
+                        {change.out_requested_by === user.id ? 'You' : change.out_requester}{' '}
+                        {change.out_kind === 'DELETE'
+                          ? 'asked to remove this record.'
+                          : `asked to change it${
+                              change.out_payload?.amount !== undefined
+                                ? ` from ${formatLKR(Number(expense.amount))} to ${formatLKR(
+                                    Number(change.out_payload.amount)
+                                  )}`
+                                : ''
+                            }.`}{' '}
+                        Nothing has moved yet.
+                      </span>
+
+                      {change.out_requested_by === user.id ? (
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-sm"
+                          onClick={() => handleWithdrawChange(change.out_request_id)}
+                          disabled={busyRequest === change.out_request_id}
+                        >
+                          {busyRequest === change.out_request_id ? <Spinner /> : <X size={14} />}
+                          Withdraw
+                        </button>
+                      ) : change.out_my_vote !== null ? (
+                        <span className="hint">
+                          You said {change.out_my_vote ? 'yes' : 'no'}. Waiting on the others.
+                        </span>
+                      ) : change.out_can_vote ? (
+                        <span className="row" style={{ gap: 'var(--sp-2)' }}>
+                          <button
+                            type="button"
+                            className="btn btn-primary btn-sm grow"
+                            onClick={() => handleVote(change.out_request_id, true)}
+                            disabled={busyRequest === change.out_request_id}
+                          >
+                            {busyRequest === change.out_request_id ? <Spinner /> : <Check size={14} />}
+                            Approve
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm grow"
+                            onClick={() => handleVote(change.out_request_id, false)}
+                            disabled={busyRequest === change.out_request_id}
+                          >
+                            <X size={14} /> Reject
+                          </button>
+                        </span>
+                      ) : (
+                        <span className="hint">
+                          This one is between the people on the record.
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  </React.Fragment>
                 );
               })}
             </div>

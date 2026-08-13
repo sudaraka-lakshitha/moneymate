@@ -414,11 +414,23 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
 
       if (rpcError) throw rpcError;
 
+      // An edit to a record more than ten minutes old is a proposal, not a
+      // change: the others have to agree before any balance moves. The server
+      // says which of the two happened.
+      const pending = isEditing && savedId === 'PENDING';
+
       // The receipt is attached after the row exists, so a failed save never
-      // leaves an orphaned image reference.
+      // leaves an orphaned image reference. Not while a change is only
+      // proposed — the record on screen is still the old one.
       const expenseId = isEditing ? expense!.id : (savedId as string);
-      if (receiptPath && expenseId) {
+      if (receiptPath && expenseId && !pending) {
         await supabase.from('expenses').update({ receipt_url: receiptPath }).eq('id', expenseId);
+      }
+
+      if (pending) {
+        toast.success('Sent for approval. Nothing changes until the others agree.');
+        onSaved();
+        return;
       }
 
       if (recurring && !isEditing) {

@@ -33,6 +33,20 @@ interface PairRecord {
   theirShare: number;
 }
 
+/** A proposed edit or delete, waiting on the people it affects. */
+interface PendingChange {
+  out_request_id: string;
+  out_expense_id: string;
+  out_kind: 'EDIT' | 'DELETE';
+  out_requested_by: string;
+  out_requester: string;
+  out_payload: { title?: string; amount?: number } | null;
+  out_approvals: number;
+  out_needed: number;
+  out_my_vote: boolean | null;
+  out_can_vote: boolean;
+}
+
 /** A row shown in the list — either shared-balance data, a direct connection, or both. */
 interface DisplayFriend extends FriendBalanceDetail {
   isConnected: boolean;
@@ -98,6 +112,8 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   const [membersByGroup, setMembersByGroup] = useState<Record<string, GroupMember[]>>({});
   /** Every expense the two of you are both on, direct or in a shared group. */
   const [pairRecords, setPairRecords] = useState<PairRecord[]>([]);
+  /** expenseId -> the change waiting on it, if somebody has proposed one. */
+  const [pairChanges, setPairChanges] = useState<Record<string, PendingChange>>({});
   const [pairLoading, setPairLoading] = useState(false);
   const [editingGroupExpense, setEditingGroupExpense] = useState<Expense | null>(null);
 
@@ -296,7 +312,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
     void load();
   }, [load]);
 
-  useLiveRefresh('friends', ['expenses','ledger_entries','group_settlements','friend_requests','group_members'], load);
+  useLiveRefresh('friends', ['expenses','expense_payers','ledger_entries','group_settlements','friend_requests','group_members','expense_change_requests','expense_change_votes'], load);
 
   const totals = useMemo(() => {
     let owedToMe = 0;
@@ -357,9 +373,22 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
           });
         }
         setPairRecords(rows);
+
+        // Changes somebody has proposed to any of these records. One call per
+        // group because the records here span the pair ledger and every group
+        // you are both in.
+        const changeLists = await Promise.all(
+          groupIds.map((id) => supabase.rpc('pending_changes_for_group', { p_group_id: id }))
+        );
+        const byExpense: Record<string, PendingChange> = {};
+        for (const res of changeLists) {
+          for (const row of (res.data ?? []) as PendingChange[]) byExpense[row.out_expense_id] = row;
+        }
+        setPairChanges(byExpense);
       } catch (err) {
         toast.error(friendlyDbError(err, 'Could not load the records between you.'));
         setPairRecords([]);
+        setPairChanges({});
       } finally {
         setPairLoading(false);
       }
@@ -575,26 +604,79 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
   };
 
   const handleDeleteEntry = async (entry: Expense) => {
+    // Past ten minutes the other person has to agree, so say so up front.
+    const needsApproval =
+      Date.now() - new Date(entry.updated_at ?? entry.created_at).getTime() > 10 * 60 * 1000;
+
     const ok = await confirm({
-      title: 'Delete this record?',
-      message: `"${entry.title}" will be removed and your balance updated.`,
-      confirmLabel: 'Delete',
-      danger: true,
+      title: needsApproval ? 'Ask to delete this record?' : 'Delete this record?',
+      message: needsApproval
+        ? `"${entry.title}" is older than ten minutes, so it stays until the other person agrees. Your balance does not change in the meantime.`
+        : `"${entry.title}" will be removed and your balance updated.`,
+      confirmLabel: needsApproval ? 'Ask to delete' : 'Delete',
+      danger: !needsApproval,
     });
     if (!ok) return;
 
     setBusyEntry(entry.id);
     try {
-      const { error: rpcError } = await supabase.rpc('delete_expense', {
+      const { data, error: rpcError } = await supabase.rpc('delete_expense', {
         p_expense_id: entry.id,
         p_reason: 'Removed from Friends',
       });
       if (rpcError) throw rpcError;
-      toast.success('Record deleted.');
+      toast.success(
+        data === 'PENDING'
+          ? 'Asked. The record stays until they agree.'
+          : 'Record deleted.'
+      );
       await load();
       if (selected) await loadPairRecords(selected.friend.id, selected.groupIds);
     } catch (err) {
       toast.error(friendlyDbError(err, 'Could not delete that record.'));
+    } finally {
+      setBusyEntry(null);
+    }
+  };
+
+  const handleVoteOnChange = async (requestId: string, approved: boolean) => {
+    setBusyEntry(requestId);
+    try {
+      const { data, error: rpcError } = await supabase.rpc('vote_on_expense_change', {
+        p_request_id: requestId,
+        p_approved: approved,
+      });
+      if (rpcError) throw rpcError;
+      toast.success(
+        data === 'APPROVED'
+          ? 'Approved — the record and your balance are updated.'
+          : data === 'REJECTED'
+            ? 'Turned down. The record stays as it was.'
+            : data === 'CANCELLED'
+              ? 'That record was settled in the meantime, so the change was dropped.'
+              : 'Noted.'
+      );
+      await load();
+      if (selected) await loadPairRecords(selected.friend.id, selected.groupIds);
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not record your answer.'));
+    } finally {
+      setBusyEntry(null);
+    }
+  };
+
+  const handleWithdrawChange = async (requestId: string) => {
+    setBusyEntry(requestId);
+    try {
+      const { error: rpcError } = await supabase.rpc('cancel_expense_change', {
+        p_request_id: requestId,
+      });
+      if (rpcError) throw rpcError;
+      toast.success('Withdrawn.');
+      await load();
+      if (selected) await loadPairRecords(selected.friend.id, selected.groupIds);
+    } catch (err) {
+      toast.error(friendlyDbError(err, 'Could not withdraw that.'));
     } finally {
       setBusyEntry(null);
     }
@@ -642,7 +724,7 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
 
     setLending(true);
     try {
-      const { error: rpcError } = editingEntry
+      const { data: outcome, error: rpcError } = editingEntry
         ? await supabase.rpc('update_direct_expense', {
             p_expense_id: editingEntry.id,
             p_amount: amount,
@@ -672,11 +754,16 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
       const myPaid = mineIn ?? (paidByMe ? amount : 0);
       const delta = roundMoney(myPaid - myShare);
       toast.success(
-        Math.abs(delta) < 0.01
-          ? 'Recorded — you are square on this one.'
-          : delta > 0
-            ? `Recorded — ${lendTo.display_name} owes you ${formatLKR(delta)}.`
-            : `Recorded — you owe ${lendTo.display_name} ${formatLKR(-delta)}.`
+        // Editing a record more than ten minutes old is a proposal: nothing
+        // moves until the other person agrees, so promising a new balance here
+        // would be a lie.
+        outcome === 'PENDING'
+          ? `Asked ${lendTo.display_name.split(' ')[0]}. Nothing changes until they agree.`
+          : Math.abs(delta) < 0.01
+            ? 'Recorded — you are square on this one.'
+            : delta > 0
+              ? `Recorded — ${lendTo.display_name} owes you ${formatLKR(delta)}.`
+              : `Recorded — you owe ${lendTo.display_name} ${formatLKR(-delta)}.`
       );
       setLendTo(null);
       setEditingEntry(null);
@@ -1217,7 +1304,11 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                     const myRole = (membersByGroup[record.groupId] ?? []).find(
                       (m) => m.user_id === user.id
                     )?.role;
-                    const canEdit = entry.created_by === user.id || myRole === 'ADMIN';
+                    // A record with a change waiting takes no further changes
+                    // until that one is answered.
+                    const change = pairChanges[entry.id];
+                    const canEdit =
+                      (entry.created_by === user.id || myRole === 'ADMIN') && !change;
                     return (
                       // Amount on the title line and the buttons on the last one,
                       // rather than all three competing for the right-hand edge:
@@ -1237,6 +1328,11 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                                 {entry.title}
                               </span>
                               {locked && <span className="badge">Settled</span>}
+                              {change && (
+                                <span className="badge badge-primary">
+                                  {change.out_kind === 'DELETE' ? 'Deletion proposed' : 'Change proposed'}
+                                </span>
+                              )}
                             </span>
                             <span className="amount-md tabular" style={{ flexShrink: 0 }}>
                               {formatLKR(entry.amount)}
@@ -1281,6 +1377,64 @@ export const FriendsPage: React.FC<FriendsPageProps> = ({ user }) => {
                           </span>
                         )}
                           </span>
+
+                          {/* What is being asked, and the answer, right under
+                              the record it concerns. */}
+                          {change && (
+                            <span
+                              className="stack-sm card-divider"
+                              style={{ display: 'block', marginTop: 'var(--sp-2)', paddingTop: 'var(--sp-2)' }}
+                            >
+                              <span className="hint" style={{ display: 'block' }}>
+                                {change.out_requested_by === user.id
+                                  ? 'You'
+                                  : selected.friend.display_name.split(' ')[0]}{' '}
+                                {change.out_kind === 'DELETE'
+                                  ? 'asked to remove this.'
+                                  : `asked to change it${
+                                      change.out_payload?.amount !== undefined
+                                        ? ` to ${formatLKR(Number(change.out_payload.amount))}`
+                                        : ''
+                                    }.`}{' '}
+                                Your balance has not moved.
+                              </span>
+                              {change.out_requested_by === user.id ? (
+                                <button
+                                  type="button"
+                                  className="btn btn-ghost btn-sm"
+                                  onClick={() => handleWithdrawChange(change.out_request_id)}
+                                  disabled={busyEntry === change.out_request_id}
+                                >
+                                  {busyEntry === change.out_request_id ? <Spinner /> : <X size={13} />}
+                                  Withdraw
+                                </button>
+                              ) : change.out_my_vote !== null ? (
+                                <span className="hint">
+                                  You said {change.out_my_vote ? 'yes' : 'no'}.
+                                </span>
+                              ) : change.out_can_vote ? (
+                                <span className="row" style={{ gap: 'var(--sp-2)' }}>
+                                  <button
+                                    type="button"
+                                    className="btn btn-primary btn-sm grow"
+                                    onClick={() => handleVoteOnChange(change.out_request_id, true)}
+                                    disabled={busyEntry === change.out_request_id}
+                                  >
+                                    {busyEntry === change.out_request_id ? <Spinner /> : <Check size={13} />}
+                                    Approve
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary btn-sm grow"
+                                    onClick={() => handleVoteOnChange(change.out_request_id, false)}
+                                    disabled={busyEntry === change.out_request_id}
+                                  >
+                                    <X size={13} /> Reject
+                                  </button>
+                                </span>
+                              ) : null}
+                            </span>
+                          )}
                         </span>
                       </div>
                     );

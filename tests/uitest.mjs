@@ -171,6 +171,8 @@ const TABLES = {
   recurring_expenses: [],
   expense_items: [],
   expense_edits: [],
+  expense_change_requests: [],
+  expense_change_votes: [],
   // Who put money in, mirroring the EXPENSE side of the ledger above. e1 is the
   // one two people paid for: 3,000 from me and 1,500 from Ben.
   expense_payers: [
@@ -192,7 +194,28 @@ const RPC = {
   deleted_expense_count: 1,
   friend_record_count: 2,
   add_direct_expense: 'new-id',
-  update_direct_expense: null,
+  update_direct_expense: 'APPLIED',
+  // A change Ben has proposed to the Groceries bill and is waiting on. It is
+  // his, not mine, so this screen has to offer me Approve and Reject.
+  pending_changes_for_group: [
+    {
+      out_request_id: 'cr1',
+      out_expense_id: 'e1',
+      out_kind: 'EDIT',
+      out_requested_by: BEN,
+      out_requester: 'Ben Perera',
+      out_payload: { title: 'Groceries', amount: 6000 },
+      out_reason: '',
+      out_created_at: today,
+      out_approvals: 0,
+      out_needed: 2,
+      out_my_vote: null,
+      out_can_vote: true,
+    },
+  ],
+  vote_on_expense_change: 'APPROVED',
+  cancel_expense_change: 'CANCELLED',
+  start_new_cycle: 'cycle-1',
   group_contribution_stats: [
     { out_user_id: ME, out_display_name: 'Sudaraka Lakshitha', out_avatar_url: null,
       out_paid: 4500, out_share: 3400, out_net: 1100, out_expenses: 1 },
@@ -394,6 +417,24 @@ const run = async () => {
   await visible('Group detail', 'balance hero', 'text=Your balance here');
   await visible('Group detail', 'live expense listed', 'text=Groceries');
   await visible('Group detail', 'settled bill marked', 'text=Settled');
+  // A change Ben has proposed, sitting with the record it concerns. What it
+  // must convey: what is being asked, and that nothing has moved yet.
+  await visible('Change proposed', 'the badge is on the record', 'text=Change proposed');
+  await visible('Change proposed', 'what is being asked', 'text=/asked to change it/');
+  await visible('Change proposed', 'nothing has moved yet', 'text=/Nothing has moved yet/');
+  await visible('Change proposed', 'how far along it is', 'text=/0 of 2 agreed/');
+  await visible('Change proposed', 'approve', 'button:has-text("Approve")');
+  await visible('Change proposed', 'reject', 'button:has-text("Reject")');
+
+  // A record with a change waiting takes no further changes until it is
+  // answered, so its own edit and delete buttons come off.
+  const pendingRowEdit = await page.locator('button[aria-label="Edit Groceries"]').count();
+  check('Change proposed', 'the record cannot be changed again meanwhile', pendingRowEdit === 0);
+  // Other records are untouched by that.
+  const otherRowEdit = await page.locator('button[aria-label="Edit Electricity bill"]').count();
+  check('Change proposed', 'other records still editable', otherRowEdit === 1);
+  await shot('03d-change-proposed');
+
   await visible('Group detail', 'deleted section heading', 'text=/Deleted \\(\\d+\\)/');
   await visible('Group detail', 'erase all button', 'button:has-text("Erase all")');
   const deletedInMain = await page.locator('text=Typo bill').count();

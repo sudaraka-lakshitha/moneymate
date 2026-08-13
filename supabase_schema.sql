@@ -844,6 +844,14 @@ $$;
 
 -- Editing re-derives the ledger by reversing the old entries and posting fresh
 -- ones, so history stays append-only and the audit trail records both states.
+--
+-- Dropped first because the final definition further down returns TEXT — which
+-- of the two states it landed in — and CREATE OR REPLACE cannot change a return
+-- type. Without this the second run of the file fails here rather than at the
+-- definition that actually changed.
+DROP FUNCTION IF EXISTS public.update_expense(UUID, TEXT, DECIMAL, UUID, TEXT, TEXT, TEXT, JSONB, JSONB, JSONB);
+DROP FUNCTION IF EXISTS public.update_expense(UUID, TEXT, DECIMAL, UUID, TEXT, TEXT, TEXT, JSONB, JSONB);
+
 CREATE OR REPLACE FUNCTION public.update_expense(
     p_expense_id   UUID,
     p_title        TEXT,
@@ -935,7 +943,10 @@ BEGIN
 END;
 $$;
 
--- Soft-delete plus a reversal pair, in one transaction.
+-- Soft-delete plus a reversal pair, in one transaction. Dropped first for the
+-- same reason as update_expense above: the final definition returns TEXT.
+DROP FUNCTION IF EXISTS public.delete_expense(UUID, TEXT);
+
 CREATE OR REPLACE FUNCTION public.delete_expense(p_expense_id UUID, p_reason TEXT DEFAULT '')
 RETURNS VOID
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
@@ -2609,6 +2620,13 @@ GRANT EXECUTE ON FUNCTION public.add_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN
 -- add_direct_expense already owns. This resolves the other party from the pair
 -- group, rebuilds the splits, and hands off to update_expense — so the audit
 -- trail, the ledger reversal and the settled-expense lock all still apply.
+--
+-- Dropped first: the final definition returns TEXT, passing on whether the edit
+-- took effect or is waiting for the other person.
+DROP FUNCTION IF EXISTS public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN, TEXT, DECIMAL);
+DROP FUNCTION IF EXISTS public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN, TEXT);
+DROP FUNCTION IF EXISTS public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN);
+
 CREATE OR REPLACE FUNCTION public.update_direct_expense(
     p_expense_id  UUID,
     p_amount      DECIMAL,
@@ -5320,3 +5338,624 @@ CREATE TRIGGER trg_stamp_settlement_cycle
     FOR EACH ROW EXECUTE FUNCTION public.stamp_ledger_cycle();
 
 CREATE INDEX IF NOT EXISTS idx_expenses_cycle ON expenses(group_id, cycle_id);
+
+-- ========================================
+-- CHANGING A RECORD AFTER THE FACT
+-- ========================================
+-- Anyone who added a record could edit or delete it later, and the other
+-- person's balance moved with it, silently. Between friends that is a way to
+-- cheat: record a 3,000 dinner, wait, quietly edit it to 6,000.
+--
+-- So a change needs the agreement of the people it affects — except for the
+-- first ten minutes, because correcting your own typo a minute after typing it
+-- should not need a committee. Ten minutes runs from the record's last change,
+-- not its creation, so an approved edit does not reopen an unguarded window.
+--
+-- A majority of the other affected people is enough: floor(others / 2) + 1.
+-- With one other person — a friend pair, a two-person group — that is
+-- unanimity, which is where it matters most.
+CREATE TABLE IF NOT EXISTS expense_change_requests (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    expense_id   UUID NOT NULL REFERENCES expenses(id) ON DELETE CASCADE,
+    requested_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind         TEXT NOT NULL CHECK (kind IN ('EDIT', 'DELETE')),
+    -- The proposed new state, in the shape expense_edits.new_snapshot already
+    -- uses, so one JSONB shape serves both the proposal and the audit trail.
+    -- NULL for a delete, which proposes nothing.
+    payload      JSONB,
+    reason       TEXT DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'PENDING'
+                 CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED', 'CANCELLED')),
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    resolved_at  TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS expense_change_votes (
+    request_id UUID NOT NULL REFERENCES expense_change_requests(id) ON DELETE CASCADE,
+    user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    approved   BOOLEAN NOT NULL,
+    voted_at   TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (request_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_change_requests_expense
+    ON expense_change_requests(expense_id) WHERE status = 'PENDING';
+
+-- One open request per record. A second proposal while the first is undecided
+-- would let somebody talk past their own pending change.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_request
+    ON expense_change_requests(expense_id) WHERE status = 'PENDING';
+
+ALTER TABLE expense_change_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE expense_change_votes    ENABLE ROW LEVEL SECURITY;
+
+-- Read-only policies. Every write goes through a SECURITY DEFINER function, so
+-- nobody can vote twice, vote for somebody else, or flip a status by hand.
+DROP POLICY IF EXISTS "Affected people read change requests" ON expense_change_requests;
+CREATE POLICY "Affected people read change requests" ON expense_change_requests FOR SELECT
+    USING (
+        requested_by = auth.uid()
+        OR EXISTS (
+            SELECT 1 FROM expenses e
+            WHERE e.id = expense_id
+              AND (public.is_group_member(e.group_id)
+                OR public.has_own_split(e.id)
+                OR public.is_payer(e.id))
+        )
+    );
+
+DROP POLICY IF EXISTS "Affected people read votes" ON expense_change_votes;
+CREATE POLICY "Affected people read votes" ON expense_change_votes FOR SELECT
+    USING (EXISTS (
+        SELECT 1 FROM expense_change_requests r
+        JOIN expenses e ON e.id = r.expense_id
+        WHERE r.id = request_id AND public.is_group_member(e.group_id)
+    ));
+
+-- Who a change is answerable to: everyone on the record other than whoever is
+-- asking. Both sides of it — the shares and the money — because paying for a
+-- bill you took no share of still makes its amount your business.
+CREATE OR REPLACE FUNCTION public.change_affected(p_expense_id UUID, p_except UUID)
+RETURNS TABLE (user_id UUID)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+    SELECT s.user_id FROM expense_splits s
+    WHERE s.expense_id = p_expense_id AND s.is_included AND s.user_id <> p_except
+    UNION
+    SELECT p.user_id FROM expense_payers p
+    WHERE p.expense_id = p_expense_id AND p.user_id IS NOT NULL AND p.user_id <> p_except;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.change_affected(UUID, UUID) TO authenticated;
+
+-- Ten minutes from the record's last change.
+CREATE OR REPLACE FUNCTION public.expense_in_grace(p_expense_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+    SELECT COALESCE(updated_at, created_at) > NOW() - INTERVAL '10 minutes'
+    FROM expenses WHERE id = p_expense_id;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.expense_in_grace(UUID) TO authenticated;
+
+-- The edit itself, with no gate on it. Both roads lead here: the direct one
+-- inside the grace window, and the approval one once a majority is in. Keeping
+-- one body means the ledger reversal and the audit row cannot drift apart
+-- between the two, which is exactly the kind of divergence that moves money.
+CREATE OR REPLACE FUNCTION public.apply_expense_edit(p_expense_id UUID, p_payload JSONB)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_old      expenses%ROWTYPE;
+    v_old_snap JSONB;
+    v_summary  TEXT := '';
+    v_title    TEXT    := p_payload->>'title';
+    v_amount   DECIMAL := (p_payload->>'amount')::DECIMAL;
+    v_paid_by  UUID    := (p_payload->>'paid_by')::UUID;
+    v_category TEXT    := COALESCE(p_payload->>'category', 'OTHER');
+    v_method   TEXT    := COALESCE(p_payload->>'split_method', 'EQUAL');
+    v_notes    TEXT    := COALESCE(p_payload->>'notes', '');
+    v_splits   JSONB   := COALESCE(p_payload->'splits', '[]'::jsonb);
+    v_items    JSONB   := COALESCE(p_payload->'items', '[]'::jsonb);
+    v_payers   JSONB   := p_payload->'payers';
+BEGIN
+    SELECT * INTO v_old FROM expenses WHERE id = p_expense_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+
+    v_old_snap := jsonb_build_object(
+        'title', v_old.title, 'amount', v_old.amount, 'paid_by', v_old.paid_by,
+        'category', v_old.category, 'split_method', v_old.split_method, 'notes', v_old.notes,
+        'payers', (SELECT COALESCE(jsonb_agg(jsonb_build_object('user_id', user_id, 'amount', amount)), '[]'::jsonb)
+                   FROM expense_payers WHERE expense_id = p_expense_id),
+        'splits', (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                       'user_id', user_id, 'amount', amount, 'is_included', is_included)), '[]'::jsonb)
+                   FROM expense_splits WHERE expense_id = p_expense_id)
+    );
+
+    IF v_old.title <> v_title THEN
+        v_summary := v_summary || format('title "%s" → "%s"; ', v_old.title, v_title);
+    END IF;
+    IF ROUND(v_old.amount, 2) <> ROUND(v_amount, 2) THEN
+        v_summary := v_summary || format('amount %s → %s; ', v_old.amount, v_amount);
+    END IF;
+    IF v_old.paid_by IS DISTINCT FROM v_paid_by THEN
+        v_summary := v_summary || 'payer changed; ';
+    END IF;
+    IF v_old.split_method <> v_method THEN
+        v_summary := v_summary || format('split %s → %s; ', v_old.split_method, v_method);
+    END IF;
+    IF v_summary = '' THEN
+        v_summary := 'splits adjusted';
+    END IF;
+
+    -- Zero out whatever this expense currently contributes, however many edits
+    -- it has already been through. Nothing is deleted: the ledger stays
+    -- append-only and auditable.
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    SELECT group_id, user_id, 'EDIT_REVERSAL', -SUM(amount), p_expense_id,
+           'Reversal for edit of ' || v_old.title
+    FROM ledger_entries
+    WHERE reference_id = p_expense_id
+    GROUP BY group_id, user_id
+    HAVING SUM(amount) <> 0;
+
+    DELETE FROM expense_splits WHERE expense_id = p_expense_id;
+    DELETE FROM expense_payers WHERE expense_id = p_expense_id;
+    DELETE FROM expense_items  WHERE expense_id = p_expense_id;
+
+    UPDATE expenses
+    SET title = v_title, amount = v_amount, paid_by = v_paid_by,
+        on_behalf_of = CASE WHEN v_paid_by <> v_old.created_by THEN v_paid_by END,
+        category = v_category,
+        split_method = v_method,
+        notes = v_notes,
+        updated_at = NOW()
+    WHERE id = p_expense_id;
+
+    PERFORM public.write_expense_rows(
+        p_expense_id, v_old.group_id, v_title, v_amount, v_paid_by, v_splits, v_items, v_payers);
+
+    INSERT INTO expense_edits (expense_id, edited_by, old_snapshot, new_snapshot, change_summary)
+    VALUES (p_expense_id, auth.uid(), v_old_snap,
+            jsonb_build_object(
+                'title', v_title, 'amount', v_amount, 'paid_by', v_paid_by,
+                'category', v_category, 'split_method', v_method, 'notes', v_notes,
+                'payers', (SELECT COALESCE(jsonb_agg(jsonb_build_object('user_id', user_id, 'amount', amount)), '[]'::jsonb)
+                           FROM expense_payers WHERE expense_id = p_expense_id),
+                'splits', v_splits),
+            RTRIM(v_summary, '; '));
+END;
+$$;
+
+-- Deliberately not granted to authenticated: the gate lives in update_expense,
+-- and a client able to call this directly would be able to walk straight past
+-- it. Both callers are SECURITY DEFINER functions in this schema.
+REVOKE ALL ON FUNCTION public.apply_expense_edit(UUID, JSONB) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION public.apply_expense_delete(p_expense_id UUID, p_reason TEXT)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    SELECT group_id, user_id, 'DELETE_REVERSAL', -SUM(amount), p_expense_id,
+           'Reversal of deleted expense'
+    FROM ledger_entries
+    WHERE reference_id = p_expense_id
+    GROUP BY group_id, user_id
+    HAVING SUM(amount) <> 0;
+
+    UPDATE expenses
+    SET is_deleted = TRUE, deleted_at = NOW(), deleted_by = auth.uid(),
+        delete_reason = COALESCE(p_reason, '')
+    WHERE id = p_expense_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.apply_expense_delete(UUID, TEXT) FROM PUBLIC;
+
+-- update_expense and delete_expense now decide between doing it and asking.
+--
+-- They return which one happened, because the screens have to say something
+-- different: "Saved" against "Waiting for Ben". Returning text rather than void
+-- means the old signatures have to be dropped first.
+DROP FUNCTION IF EXISTS public.update_expense(UUID, TEXT, DECIMAL, UUID, TEXT, TEXT, TEXT, JSONB, JSONB, JSONB);
+
+CREATE OR REPLACE FUNCTION public.update_expense(
+    p_expense_id   UUID,
+    p_title        TEXT,
+    p_amount       DECIMAL,
+    p_paid_by      UUID,
+    p_category     TEXT,
+    p_split_method TEXT,
+    p_notes        TEXT,
+    p_splits       JSONB,
+    p_items        JSONB DEFAULT '[]'::jsonb,
+    p_payers       JSONB DEFAULT NULL
+)
+RETURNS TEXT
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_old     expenses%ROWTYPE;
+    v_payload JSONB;
+    v_others  INT;
+BEGIN
+    SELECT * INTO v_old FROM expenses WHERE id = p_expense_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+    IF v_old.is_deleted THEN
+        RAISE EXCEPTION 'This expense has been deleted';
+    END IF;
+    IF v_old.created_by <> auth.uid() AND NOT public.is_group_admin(v_old.group_id) THEN
+        RAISE EXCEPTION 'Only the person who added this expense, or a group admin, can edit it';
+    END IF;
+    IF public.expense_is_locked(p_expense_id) THEN
+        RAISE EXCEPTION 'This expense has already been settled and cannot be changed. Add a new expense to correct it.';
+    END IF;
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+    IF EXISTS (SELECT 1 FROM expense_change_requests
+               WHERE expense_id = p_expense_id AND status = 'PENDING') THEN
+        RAISE EXCEPTION 'There is already a change waiting on this record';
+    END IF;
+
+    v_payload := jsonb_build_object(
+        'title', p_title, 'amount', p_amount, 'paid_by', p_paid_by,
+        'category', COALESCE(p_category, 'OTHER'),
+        'split_method', COALESCE(p_split_method, 'EQUAL'),
+        'notes', COALESCE(p_notes, ''),
+        'splits', p_splits, 'items', COALESCE(p_items, '[]'::jsonb),
+        'payers', p_payers
+    );
+
+    SELECT COUNT(*) INTO v_others FROM public.change_affected(p_expense_id, auth.uid());
+
+    -- Nobody else on it, or still inside the ten minutes: just do it. A record
+    -- only you are on has nobody to ask, and a typo caught a minute later is
+    -- not the thing this guards against.
+    IF v_others = 0 OR public.expense_in_grace(p_expense_id) THEN
+        PERFORM public.apply_expense_edit(p_expense_id, v_payload);
+        RETURN 'APPLIED';
+    END IF;
+
+    INSERT INTO expense_change_requests (expense_id, requested_by, kind, payload)
+    VALUES (p_expense_id, auth.uid(), 'EDIT', v_payload);
+
+    RETURN 'PENDING';
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.update_expense(UUID, TEXT, DECIMAL, UUID, TEXT, TEXT, TEXT, JSONB, JSONB, JSONB) TO authenticated;
+
+DROP FUNCTION IF EXISTS public.delete_expense(UUID, TEXT);
+
+CREATE OR REPLACE FUNCTION public.delete_expense(p_expense_id UUID, p_reason TEXT DEFAULT '')
+RETURNS TEXT
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_old    expenses%ROWTYPE;
+    v_others INT;
+BEGIN
+    SELECT * INTO v_old FROM expenses WHERE id = p_expense_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+    IF v_old.is_deleted THEN
+        RETURN 'APPLIED';  -- already gone; nothing to reverse twice
+    END IF;
+    IF v_old.created_by <> auth.uid() AND NOT public.is_group_admin(v_old.group_id) THEN
+        RAISE EXCEPTION 'Only the person who added this expense, or a group admin, can delete it';
+    END IF;
+    IF public.expense_is_locked(p_expense_id) THEN
+        RAISE EXCEPTION 'This expense has already been settled and cannot be deleted. Add a new expense to correct it.';
+    END IF;
+    IF EXISTS (SELECT 1 FROM expense_change_requests
+               WHERE expense_id = p_expense_id AND status = 'PENDING') THEN
+        RAISE EXCEPTION 'There is already a change waiting on this record';
+    END IF;
+
+    SELECT COUNT(*) INTO v_others FROM public.change_affected(p_expense_id, auth.uid());
+
+    IF v_others = 0 OR public.expense_in_grace(p_expense_id) THEN
+        PERFORM public.apply_expense_delete(p_expense_id, p_reason);
+        RETURN 'APPLIED';
+    END IF;
+
+    INSERT INTO expense_change_requests (expense_id, requested_by, kind, payload, reason)
+    VALUES (p_expense_id, auth.uid(), 'DELETE', NULL, COALESCE(p_reason, ''));
+
+    RETURN 'PENDING';
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.delete_expense(UUID, TEXT) TO authenticated;
+
+-- Voting, and what happens when the count lands.
+--
+-- Modelled on respond_to_group_invitation: the addressee is checked, a resolved
+-- request is a no-op rather than an error, the side effect and the status flip
+-- happen in one transaction, and the resulting status comes back as text.
+CREATE OR REPLACE FUNCTION public.vote_on_expense_change(p_request_id UUID, p_approved BOOLEAN)
+RETURNS TEXT
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_req     expense_change_requests%ROWTYPE;
+    v_others  INT;
+    v_needed  INT;
+    v_yes     INT;
+    v_no      INT;
+BEGIN
+    SELECT * INTO v_req FROM expense_change_requests WHERE id = p_request_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'That request no longer exists';
+    END IF;
+    IF v_req.status <> 'PENDING' THEN
+        RETURN v_req.status;   -- somebody else already settled it
+    END IF;
+    IF v_req.requested_by = auth.uid() THEN
+        RAISE EXCEPTION 'You cannot approve your own change';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM public.change_affected(v_req.expense_id, v_req.requested_by)
+        WHERE user_id = auth.uid()
+    ) THEN
+        RAISE EXCEPTION 'This change does not affect you';
+    END IF;
+
+    INSERT INTO expense_change_votes (request_id, user_id, approved)
+    VALUES (p_request_id, auth.uid(), p_approved)
+    ON CONFLICT (request_id, user_id) DO UPDATE SET approved = EXCLUDED.approved, voted_at = NOW();
+
+    SELECT COUNT(*) INTO v_others
+    FROM public.change_affected(v_req.expense_id, v_req.requested_by);
+
+    v_needed := v_others / 2 + 1;   -- integer division: floor(others/2) + 1
+
+    SELECT COUNT(*) FILTER (WHERE approved), COUNT(*) FILTER (WHERE NOT approved)
+    INTO v_yes, v_no
+    FROM expense_change_votes WHERE request_id = p_request_id;
+
+    IF v_yes >= v_needed THEN
+        -- A settlement can land while a request sits waiting, and a settled
+        -- record is closed for good. Re-checked here rather than trusting the
+        -- check made when the request was opened.
+        IF public.expense_is_locked(v_req.expense_id) THEN
+            UPDATE expense_change_requests
+            SET status = 'CANCELLED', resolved_at = NOW() WHERE id = p_request_id;
+            RETURN 'CANCELLED';
+        END IF;
+
+        IF v_req.kind = 'EDIT' THEN
+            PERFORM public.apply_expense_edit(v_req.expense_id, v_req.payload);
+        ELSE
+            PERFORM public.apply_expense_delete(v_req.expense_id, v_req.reason);
+        END IF;
+
+        UPDATE expense_change_requests
+        SET status = 'APPROVED', resolved_at = NOW() WHERE id = p_request_id;
+        RETURN 'APPROVED';
+    END IF;
+
+    -- Rejected the moment a majority becomes unreachable, rather than leaving
+    -- the record hanging until everyone has bothered to vote.
+    IF v_no > v_others - v_needed THEN
+        UPDATE expense_change_requests
+        SET status = 'REJECTED', resolved_at = NOW() WHERE id = p_request_id;
+        RETURN 'REJECTED';
+    END IF;
+
+    RETURN 'PENDING';
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.vote_on_expense_change(UUID, BOOLEAN) TO authenticated;
+
+CREATE OR REPLACE FUNCTION public.cancel_expense_change(p_request_id UUID)
+RETURNS TEXT
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_req expense_change_requests%ROWTYPE;
+BEGIN
+    SELECT * INTO v_req FROM expense_change_requests WHERE id = p_request_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'That request no longer exists';
+    END IF;
+    IF v_req.status <> 'PENDING' THEN
+        RETURN v_req.status;
+    END IF;
+    IF v_req.requested_by <> auth.uid() THEN
+        RAISE EXCEPTION 'Only the person who proposed this change can withdraw it';
+    END IF;
+
+    UPDATE expense_change_requests
+    SET status = 'CANCELLED', resolved_at = NOW() WHERE id = p_request_id;
+    RETURN 'CANCELLED';
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.cancel_expense_change(UUID) TO authenticated;
+
+-- What a screen needs to draw the badge: who asked, what for, how far along,
+-- and whether this particular reader still has to answer.
+CREATE OR REPLACE FUNCTION public.pending_changes_for_group(p_group_id UUID)
+RETURNS TABLE (
+    out_request_id  UUID,
+    out_expense_id  UUID,
+    out_kind        TEXT,
+    out_requested_by UUID,
+    out_requester   TEXT,
+    out_payload     JSONB,
+    out_reason      TEXT,
+    out_created_at  TIMESTAMPTZ,
+    out_approvals   INT,
+    out_needed      INT,
+    out_my_vote     BOOLEAN,
+    out_can_vote    BOOLEAN
+)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+    SELECT
+        r.id, r.expense_id, r.kind, r.requested_by,
+        COALESCE(u.display_name, 'Someone'),
+        r.payload, r.reason, r.created_at,
+        (SELECT COUNT(*)::INT FROM expense_change_votes v
+          WHERE v.request_id = r.id AND v.approved),
+        ((SELECT COUNT(*)::INT FROM public.change_affected(r.expense_id, r.requested_by)) / 2 + 1),
+        (SELECT v.approved FROM expense_change_votes v
+          WHERE v.request_id = r.id AND v.user_id = auth.uid()),
+        EXISTS (SELECT 1 FROM public.change_affected(r.expense_id, r.requested_by) a
+                 WHERE a.user_id = auth.uid())
+    FROM expense_change_requests r
+    JOIN expenses e ON e.id = r.expense_id
+    LEFT JOIN users u ON u.id = r.requested_by
+    WHERE e.group_id = p_group_id
+      AND r.status = 'PENDING'
+      AND public.is_group_member(p_group_id)
+    ORDER BY r.created_at;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.pending_changes_for_group(UUID) TO authenticated;
+
+-- Live, like everything else that moves under you.
+DO $rt_changes$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_publication_tables
+            WHERE pubname = 'supabase_realtime' AND schemaname = 'public'
+              AND tablename = 'expense_change_requests'
+        ) THEN
+            ALTER PUBLICATION supabase_realtime ADD TABLE public.expense_change_requests;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_publication_tables
+            WHERE pubname = 'supabase_realtime' AND schemaname = 'public'
+              AND tablename = 'expense_change_votes'
+        ) THEN
+            ALTER PUBLICATION supabase_realtime ADD TABLE public.expense_change_votes;
+        END IF;
+        ALTER TABLE public.expense_change_requests REPLICA IDENTITY FULL;
+        ALTER TABLE public.expense_change_votes    REPLICA IDENTITY FULL;
+    END IF;
+END
+$rt_changes$;
+
+-- The pair sheet needs the same answer the group screen gets: did that edit
+-- take effect, or is it waiting for the other person?
+DROP FUNCTION IF EXISTS public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN, TEXT, DECIMAL);
+
+CREATE OR REPLACE FUNCTION public.update_direct_expense(
+    p_expense_id  UUID,
+    p_amount      DECIMAL,
+    p_note        TEXT    DEFAULT '',
+    p_i_paid      BOOLEAN DEFAULT TRUE,
+    p_their_share DECIMAL DEFAULT NULL,
+    p_is_loan     BOOLEAN DEFAULT FALSE,
+    p_category    TEXT    DEFAULT 'OTHER',
+    p_my_payment  DECIMAL DEFAULT NULL
+)
+RETURNS TEXT
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_me       UUID := auth.uid();
+    v_group    UUID;
+    v_friend   UUID;
+    v_payer    UUID;
+    v_theirs   DECIMAL;
+    v_mine     DECIMAL;
+    v_i_put    DECIMAL;
+    v_they_put DECIMAL;
+    v_payers   JSONB;
+    v_title    TEXT;
+    v_cat      TEXT;
+    v_was_loan BOOLEAN;
+    v_outcome  TEXT;
+BEGIN
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+
+    SELECT group_id, COALESCE(is_loan, FALSE) INTO v_group, v_was_loan
+    FROM expenses WHERE id = p_expense_id;
+    IF v_group IS NULL THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM groups WHERE id = v_group AND is_direct) THEN
+        RAISE EXCEPTION 'That entry is not a direct record — edit it in its group';
+    END IF;
+    IF NOT public.is_group_member(v_group) THEN
+        RAISE EXCEPTION 'You are not part of this record';
+    END IF;
+
+    SELECT user_id INTO v_friend
+    FROM group_members WHERE group_id = v_group AND user_id <> v_me
+    LIMIT 1;
+
+    v_theirs := ROUND(COALESCE(p_their_share, p_amount / 2), 2);
+    IF v_theirs < 0 OR v_theirs > ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Their share must be between zero and the full amount';
+    END IF;
+
+    v_mine := ROUND(p_amount, 2) - v_theirs;
+
+    v_i_put := CASE
+        WHEN COALESCE(p_is_loan, FALSE) OR p_my_payment IS NULL
+            THEN CASE WHEN p_i_paid THEN ROUND(p_amount, 2) ELSE 0 END
+        ELSE ROUND(p_my_payment, 2)
+    END;
+
+    IF v_i_put < 0 OR v_i_put > ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'What you paid must be between zero and the full amount';
+    END IF;
+
+    v_they_put := ROUND(p_amount, 2) - v_i_put;
+
+    SELECT COALESCE(jsonb_agg(x), '[]'::jsonb) INTO v_payers FROM (
+        SELECT jsonb_build_object('user_id', v_me, 'amount', v_i_put) AS x WHERE v_i_put > 0
+        UNION ALL
+        SELECT jsonb_build_object('user_id', v_friend, 'amount', v_they_put) WHERE v_they_put > 0
+    ) parts;
+
+    v_payer := CASE WHEN v_i_put >= v_they_put THEN v_me ELSE v_friend END;
+    v_title := COALESCE(NULLIF(TRIM(p_note), ''),
+                        CASE WHEN p_is_loan THEN 'Loan' ELSE 'Shared expense' END);
+    v_cat   := CASE WHEN COALESCE(p_is_loan, FALSE) THEN 'OTHER' ELSE COALESCE(p_category, 'OTHER') END;
+
+    -- is_loan is set before the splits are rewritten because write_expense_rows
+    -- reads it off the row — but only once the edit is actually going through.
+    -- Flipping it on a proposal that is then rejected would change what the
+    -- record means with nobody having agreed to it.
+    UPDATE expenses SET is_loan = COALESCE(p_is_loan, FALSE) WHERE id = p_expense_id;
+
+    v_outcome := public.update_expense(
+        p_expense_id, v_title, p_amount, v_payer, v_cat,
+        CASE WHEN v_theirs * 2 = ROUND(p_amount, 2) THEN 'EQUAL' ELSE 'UNEQUAL' END,
+        COALESCE(p_note, ''),
+        jsonb_build_array(
+            jsonb_build_object('user_id', v_friend, 'amount', v_theirs, 'is_included', TRUE),
+            jsonb_build_object('user_id', v_me, 'amount', v_mine, 'is_included', TRUE)
+        ),
+        '[]'::jsonb,
+        v_payers
+    );
+
+    IF v_outcome <> 'APPLIED' THEN
+        UPDATE expenses SET is_loan = v_was_loan WHERE id = p_expense_id;
+    END IF;
+
+    RETURN v_outcome;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN, TEXT, DECIMAL) TO authenticated;
