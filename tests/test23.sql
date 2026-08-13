@@ -97,7 +97,7 @@ BEGIN
   -- ---- The new stats rule, seen from the analytics query's angle ----
   SELECT COUNT(*) INTO n
   FROM expense_splits s JOIN expenses e ON e.id=s.expense_id
-  WHERE s.user_id=BEN AND e.id=taxi AND s.is_included AND s.include_in_stats;
+  WHERE s.user_id=BEN AND e.id=taxi AND s.is_included AND NOT e.is_deleted AND NOT e.is_loan;
   RAISE NOTICE 'X13 a group share lands in the other member''s charts | pass=%', n=1;
   IF n<>1 THEN RAISE EXCEPTION 'X13 FAILED: group share not counted for Ben'; END IF;
 

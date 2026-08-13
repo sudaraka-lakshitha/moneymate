@@ -46,7 +46,7 @@ const members = [
 
 const expense = (id, group_id, title, amount, paid_by, payer, category, opts = {}) => ({
   id, group_id, title, amount, paid_by, created_by: paid_by, category,
-  split_method: 'EQUAL', notes: '', is_deleted: false, settled_at: null,
+  split_method: 'EQUAL', notes: '', is_deleted: false, settled_at: null, is_loan: false,
   created_at: today, updated_at: today, receipt_url: null, on_behalf_of: null,
   paid_by_user: payer,
   expense_splits: opts.splits ?? [],
@@ -84,32 +84,52 @@ const expenses = [
     ],
   }),
   expense('e6', DIRECT, 'Loan', 5000, ME, meU, 'OTHER', {
+    is_loan: true,
     splits: [
       { user_id: ME, amount: 0, is_included: false },
       { user_id: BEN, amount: 5000, is_included: true },
     ],
   }),
+  // A loan the other way, so the "a loan is not spending" rule is tested from
+  // the borrower's side — the side that would otherwise inflate my figures.
+  expense('e7', DIRECT, 'Borrowed', 3000, BEN, benU, 'OTHER', {
+    is_loan: true,
+    splits: [
+      { user_id: ME, amount: 3000, is_included: true },
+      { user_id: BEN, amount: 0, is_included: false },
+    ],
+  }),
 ];
+
+// What Stats should make of the fixtures above: my share of e1/e2/e3/e5 is
+// 1500 + 1100 + 800 + 600 = 4000, and the loan is not spending.
+const MY_SHARE = 4000;
 
 // Ledger consistent with the expenses above: I paid 4500 and owe 3400 of it,
 // Ben paid 3300 and owes 3400, Cara paid 2400 and owes 3400 — plus the pair
 // group where Ben owes me 5600.
+// reference_id points back at the expense, which is how Stats works out what
+// you actually fronted as opposed to what was your share.
 const ledger = [
-  { group_id: G1, user_id: ME, amount: 4500, entry_type: 'EXPENSE' },
-  { group_id: G1, user_id: ME, amount: -1500, entry_type: 'SPLIT' },
-  { group_id: G1, user_id: BEN, amount: -1500, entry_type: 'SPLIT' },
-  { group_id: G1, user_id: CARA, amount: -1500, entry_type: 'SPLIT' },
-  { group_id: G1, user_id: BEN, amount: 3300, entry_type: 'EXPENSE' },
-  { group_id: G1, user_id: ME, amount: -1100, entry_type: 'SPLIT' },
-  { group_id: G1, user_id: BEN, amount: -1100, entry_type: 'SPLIT' },
-  { group_id: G1, user_id: CARA, amount: -1100, entry_type: 'SPLIT' },
-  { group_id: G1, user_id: CARA, amount: 2400, entry_type: 'EXPENSE' },
-  { group_id: G1, user_id: ME, amount: -800, entry_type: 'SPLIT' },
-  { group_id: G1, user_id: BEN, amount: -800, entry_type: 'SPLIT' },
-  { group_id: G1, user_id: CARA, amount: -800, entry_type: 'SPLIT' },
-  { group_id: DIRECT, user_id: ME, amount: 6200, entry_type: 'EXPENSE' },
-  { group_id: DIRECT, user_id: ME, amount: -600, entry_type: 'SPLIT' },
-  { group_id: DIRECT, user_id: BEN, amount: -5600, entry_type: 'SPLIT' },
+  { group_id: G1, user_id: ME, amount: 4500, entry_type: 'EXPENSE', reference_id: 'e1' },
+  { group_id: G1, user_id: ME, amount: -1500, entry_type: 'SPLIT', reference_id: 'e1' },
+  { group_id: G1, user_id: BEN, amount: -1500, entry_type: 'SPLIT', reference_id: 'e1' },
+  { group_id: G1, user_id: CARA, amount: -1500, entry_type: 'SPLIT', reference_id: 'e1' },
+  { group_id: G1, user_id: BEN, amount: 3300, entry_type: 'EXPENSE', reference_id: 'e2' },
+  { group_id: G1, user_id: ME, amount: -1100, entry_type: 'SPLIT', reference_id: 'e2' },
+  { group_id: G1, user_id: BEN, amount: -1100, entry_type: 'SPLIT', reference_id: 'e2' },
+  { group_id: G1, user_id: CARA, amount: -1100, entry_type: 'SPLIT', reference_id: 'e2' },
+  { group_id: G1, user_id: CARA, amount: 2400, entry_type: 'EXPENSE', reference_id: 'e3' },
+  { group_id: G1, user_id: ME, amount: -800, entry_type: 'SPLIT', reference_id: 'e3' },
+  { group_id: G1, user_id: BEN, amount: -800, entry_type: 'SPLIT', reference_id: 'e3' },
+  { group_id: G1, user_id: CARA, amount: -800, entry_type: 'SPLIT', reference_id: 'e3' },
+  { group_id: DIRECT, user_id: ME, amount: 1200, entry_type: 'EXPENSE', reference_id: 'e5' },
+  { group_id: DIRECT, user_id: ME, amount: -600, entry_type: 'SPLIT', reference_id: 'e5' },
+  { group_id: DIRECT, user_id: BEN, amount: -600, entry_type: 'SPLIT', reference_id: 'e5' },
+  { group_id: DIRECT, user_id: ME, amount: 5000, entry_type: 'EXPENSE', reference_id: 'e6' },
+  { group_id: DIRECT, user_id: BEN, amount: -5000, entry_type: 'SPLIT', reference_id: 'e6' },
+  { group_id: DIRECT, user_id: BEN, amount: 3000, entry_type: 'EXPENSE', reference_id: 'e7' },
+  { group_id: DIRECT, user_id: ME, amount: -3000, entry_type: 'SPLIT', reference_id: 'e7' },
 ];
 
 const settlements = [
@@ -125,11 +145,13 @@ const friendRequests = [
 ];
 
 
+const byId = { [ME]: meU, [BEN]: benU, [CARA]: caraU };
 const splitsFlat = expenses.flatMap((e) =>
   (e.expense_splits ?? []).map((s) => ({
-    ...s, expense_id: e.id, percentage: 0, shares: 1, include_in_stats: true,
-    expenses: { title: e.title, category: e.category, created_at: e.created_at,
-                created_by: e.created_by, is_deleted: e.is_deleted, group_id: e.group_id,
+    ...s, expense_id: e.id, percentage: 0, shares: 1, users: byId[s.user_id],
+    expenses: { id: e.id, title: e.title, category: e.category, created_at: e.created_at,
+                created_by: e.created_by, is_deleted: e.is_deleted, is_loan: e.is_loan,
+                group_id: e.group_id,
                 groups: { name: groups.find((g) => g.id === e.group_id)?.name, is_direct: e.group_id === DIRECT } },
   }))
 );
@@ -249,7 +271,10 @@ const run = async () => {
       const matches = (row, key, expr) => {
         const [op, ...rest] = expr.split('.');
         const arg = rest.join('.');
-        const val = row[key];
+        // `expenses.is_loan` filters on the embedded resource, which is a real
+        // part of the query: skipping it would let a screen pass on rows it
+        // explicitly asked the server to leave out.
+        const val = key.split('.').reduce((acc, part) => (acc == null ? acc : acc[part]), row);
         switch (op) {
           case 'eq':  return String(val) === arg;
           case 'neq': return String(val) !== arg;
@@ -273,7 +298,6 @@ const run = async () => {
           }));
           continue;
         }
-        if (key.includes('.')) continue;   // filter on an embedded resource
         rows = rows.filter((r) => matches(r, key, value));
       }
 
@@ -446,9 +470,43 @@ const run = async () => {
   // ---------- Stats ----------
   await goTab('Stats');
   await visible('Stats', 'range switch', 'text=/30 days|Last 30/');
-  await visible('Stats', 'spending headline', 'text=/spending/');
+  await visible('Stats', 'headline is your share of shared spending', 'text=/Your share/');
+
+  // The headline figure is the arithmetic, on the page: my share of every bill
+  // I am on, with the loan left out. If a loan ever leaked in it would read
+  // 9,000 instead, so the number is worth asserting rather than the label.
+  const headlineText = await page.locator('.amount-xl').first().innerText();
+  const headline = (headlineText.match(/([\d,]+)\.\d{2}/)?.[1] ?? '').replace(/,/g, '');
+  check(
+    'Stats',
+    'the headline counts shares and not loans',
+    headline === String(MY_SHARE),
+    `reads ${headline}, want ${MY_SHARE}`
+  );
+
+  // What you put in is a different number from what was yours to pay, and the
+  // gap between them is the money you are waiting on.
+  await visible('Stats', 'what you fronted', 'text=You fronted');
+  await visible('Stats', 'average spending day', 'text=/Avg. spending day/');
+  await visible('Stats', 'category breakdown', 'text=Where it goes');
+  await visible('Stats', 'who you split with', 'text=Who you spend with');
+  await visible('Stats', 'which group', 'text=Which group');
+  await visible('Stats', 'the people are named', 'text=Ben Perera');
+
+  // Nothing is ever asked any more, so no approval queue may appear here.
+  const asked = await page
+    .locator('text=/count this|Include in stats|waiting for you|Approve all/i')
+    .count();
+  check('Stats', 'nothing is queued for approval', asked === 0, `${asked} prompts found`);
   await noOverflow('Stats');
   await shot('10-stats');
+
+  // The wider range keeps every section rather than emptying the screen.
+  await page.click('button:has-text("Last 90 days")');
+  await page.waitForTimeout(500);
+  await visible('Stats 90d', 'still charted over 90 days', 'text=/Your share · last 90 days/');
+  await noOverflow('Stats 90d');
+  await shot('10b-stats-90');
 
   // ---------- Settings ----------
   await goTab('You');

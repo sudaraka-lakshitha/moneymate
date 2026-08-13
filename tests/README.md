@@ -31,7 +31,6 @@ passes.
 | --- | --- |
 | `e2e_groups.sql` | Create a trip, join by code with approval, invite by email, keep outsiders out, split evenly and unevenly, exclude a member, edit twice, part-settle, archive, purge, delete |
 | `e2e_friends.sql` | Friend request and acceptance, lend, borrow, split directly, edit twice including flipping the payer, delete, part-pay, lender records the repayment — no group involved anywhere |
-| `e2e_own.sql` | Personal entries, edit and soft delete, input validation, budgets and their upsert, recurring posting exactly once, analytics inputs, and one user being unable to see or touch another's data |
 | `e2e_pair.sql` | The whole story between two people in the order it happens — strangers, friend request, lend, borrow, share a bill, pay a bill that was entirely theirs, have one of yours paid, part-settle, a real group on top, unfriend, leave, re-add. Every stage checks all three of money, statistics and visibility, because they can disagree and only the first is obvious |
 
 ## What the assertions are really guarding
@@ -71,17 +70,38 @@ Service workers are blocked in the harness: the PWA's worker takes over after
 the first load and its fetches leave the page context, so they would miss the
 stub and hit the network.
 
+## Do the screens and the schema agree?
+
+The browser harness answers a stub, and a stub answers whatever it is asked, so
+it cannot notice a screen requesting a column the database no longer has.
+TypeScript cannot either — table names, column names, function names and
+argument names are strings resolved by PostgREST at request time. A dropped
+column therefore compiles, passes the harness, and fails only when a real user
+opens the screen.
+
+```bash
+node tests/aligncheck.mjs
+```
+
+It loads `../supabase_schema.sql` into a scratch database, asks Postgres what
+exists, and holds every `.from`, `.select`, `.eq`, `.order`, `.rpc` and
+`useLiveRefresh` call in `src/` up against the answer — including embed hints
+that need a named constraint, RPCs granted to `authenticated`, and realtime
+subscriptions whose table must be in the publication. Run it after any schema
+change; it is the only check that catches this class.
+
 ## Regression files
 
 | File | Guards against |
 | --- | --- |
-| `test17.sql` | Personal-only statistics, per-split opt-in, removing a friend |
+| `test17.sql` | A group bill counting for everyone on it with nothing asked, the contribution figures behind the "who paid" chart, and removing a friend |
 | `test18.sql` | Inviting a friend straight into a group, deleting an account |
 | `test19.sql` | A member leaving or deleting their account while the group keeps going: the ledger still nets to zero, and the contribution chart still accounts for every rupee they spent |
-| `test20.sql` | Whose statistics decision is whose — your own entries are answered as you make them, and somebody else editing a bill never resets your answer |
+| `test20.sql` | What an edit does to the figures — both people move together, dropping somebody un-charges them, turning a record into a loan takes it back out — plus the door that stops a debt being posted against a stranger |
 | `test21.sql` | Removing a friend for good (the pair record must not outlive the friendship and drag them back onto the list), and clearing already-deleted records without moving a rupee |
-| `test22_setup.sql` + `test22_check.sql` | Run the setup, re-run `../supabase_schema.sql` over it, then run the check: a deliberate stats opt-out must survive the deploy step |
+| `test22_setup.sql` + `test22_check.sql` | Run the setup, re-run `../supabase_schema.sql` over it, then run the check: the deploy step must not rewrite anybody's records. The migration at risk guesses from shape whether an old pair record was a loan, and "I paid your phone bill" has a loan's exact shape without being one |
 | `test23.sql` | Who can see and do what on the newer functions — an outsider gets no contribution figures, no record counts and no splits; a plain member can read the other side's share, which is what the Friends screen lists |
 | `test24.sql` | Fuzz: 250 random add / edit / delete / settle operations by four people, with both invariants re-checked after every single one |
 | `test25.sql` | What realtime needs from the database: the tables published, and `REPLICA IDENTITY FULL` so an update or delete carries enough of the row for RLS to authorise sending it. Needs a `supabase_realtime` publication to exist — create an empty one locally, as Supabase provisions it |
-| `test26.sql` | Lending is never a question — neither side asked, nothing undecided, nothing counted, in both directions — while paying a bill that was entirely somebody else's still counts for whoever the bill belonged to, and a genuinely shared bill still asks |
+| `test26.sql` | What counts as your spending now that nothing is ever asked: every share you are on counts the moment it is saved, in a group or between two people; lending counts for nobody in either direction; a bill paid entirely for somebody else counts for them and not the payer; and the opt-in column is gone from the schema |
+| `test27.sql` | The Friends screen — a record between two people keeps the category it was given and refuses an invented one, a loan stays uncategorised, and the list predicate keeps anyone owed money while dropping an ex-friend you only share a settled group with |

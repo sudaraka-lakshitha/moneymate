@@ -25,21 +25,13 @@ END $s$;
 
 SET ROLE authenticated;
 
--- What the Stats screen counts as your spending.
+-- What the Stats screen counts as your spending: every share you are on that
+-- is not a loan. Nothing is asked and nothing waits.
 CREATE OR REPLACE FUNCTION pg_temp.spend(p_for UUID) RETURNS DECIMAL
 LANGUAGE sql STABLE AS $$
   SELECT COALESCE(SUM(s.amount), 0)
   FROM expense_splits s JOIN expenses e ON e.id = s.expense_id
-  WHERE s.user_id = p_for AND s.is_included AND s.include_in_stats AND NOT e.is_deleted;
-$$;
-
--- What the Stats screen puts in the confirmation queue.
-CREATE OR REPLACE FUNCTION pg_temp.queued(p_for UUID) RETURNS INT
-LANGUAGE sql STABLE AS $$
-  SELECT COUNT(*)::INT
-  FROM expense_splits s JOIN expenses e ON e.id = s.expense_id
-  WHERE s.user_id = p_for AND s.is_included AND s.include_in_stats IS NULL
-    AND NOT e.is_deleted AND e.created_by <> p_for;
+  WHERE s.user_id = p_for AND s.is_included AND NOT e.is_deleted AND NOT e.is_loan;
 $$;
 
 -- Whether the Friends screen would show them: a connection, a shared group, or
@@ -72,7 +64,7 @@ DECLARE
   ANN UUID:='e5000000-0000-0000-0000-00000000000a';
   BEN UUID:='e5000000-0000-0000-0000-00000000000b';
   CAR UUID:='e5000000-0000-0000-0000-00000000000c';
-  pair UUID; grp UUID; e UUID; other UUID; req UUID; st TEXT;
+  pair UUID; grp UUID; e UUID; other UUID; req UUID; st TEXT; cat TEXT;
   ba DECIMAL; bb DECIMAL; n INT; blocked BOOLEAN;
 
 BEGIN
@@ -129,10 +121,7 @@ RAISE NOTICE '--- 3. Ann lends Ben 5,000 ---';
     RAISE EXCEPTION 'stage 3 failed: lending counted as spending (Ann % Ben %)',
       pg_temp.spend(ANN), pg_temp.spend(BEN);
   END IF;
-  IF pg_temp.queued(BEN) <> 0 THEN
-    RAISE EXCEPTION 'stage 3 failed: the borrower was asked about a loan';
-  END IF;
-  RAISE NOTICE '  ✓ Ben owes 5,000; neither has spent anything; nobody asked';
+  RAISE NOTICE '  ✓ Ben owes 5,000; neither has spent anything';
 
 -- =====================================================================
 RAISE NOTICE '--- 4. Ann borrows 2,000 back from Ben ---';
@@ -149,34 +138,32 @@ RAISE NOTICE '--- 4. Ann borrows 2,000 back from Ben ---';
 -- =====================================================================
 RAISE NOTICE '--- 5. They share a 3,000 dinner, Ann pays ---';
 -- =====================================================================
-  e := add_direct_expense(BEN, 3000, 'Dinner', TRUE, 1500, FALSE);
+  e := add_direct_expense(BEN, 3000, 'Dinner', TRUE, 1500, FALSE, 'FOOD');
 
   ba := member_balance(pair, ANN);
   IF ba <> 4500 THEN RAISE EXCEPTION 'stage 5 failed: balance % (want 4500)', ba; END IF;
 
-  -- Ann answered in the form; Ben was not there, so Ben is asked.
+  -- A share is a share: both of them ate, so both of them spent, and neither
+  -- had to agree to be counted.
   IF pg_temp.spend(ANN) <> 1500 THEN
     RAISE EXCEPTION 'stage 5 failed: Ann''s share reads % (want 1500)', pg_temp.spend(ANN);
   END IF;
-  IF pg_temp.queued(BEN) <> 1 THEN
-    RAISE EXCEPTION 'stage 5 failed: Ben has % questions (want 1)', pg_temp.queued(BEN);
-  END IF;
-  IF pg_temp.spend(BEN) <> 0 THEN
-    RAISE EXCEPTION 'stage 5 failed: Ben counted before answering';
+  IF pg_temp.spend(BEN) <> 1500 THEN
+    RAISE EXCEPTION 'stage 5 failed: Ben''s share reads % (want 1500)', pg_temp.spend(BEN);
   END IF;
 
-  PERFORM set_config('request.jwt.claim.sub', BEN::TEXT, true);
-  PERFORM set_split_stats_choice(e, TRUE);
-  IF pg_temp.spend(BEN) <> 1500 THEN
-    RAISE EXCEPTION 'stage 5 failed: Ben''s answer did not take (%)', pg_temp.spend(BEN);
+  -- And the category the payer chose is the category it is filed under, so the
+  -- breakdown means something for people who mostly split with one friend.
+  SELECT category INTO cat FROM expenses WHERE id = e;
+  IF cat <> 'FOOD' THEN
+    RAISE EXCEPTION 'stage 5 failed: dinner filed under % (want FOOD)', cat;
   END IF;
-  PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
-  RAISE NOTICE '  ✓ 1,500 each; Ann counted at once, Ben asked first, then counted';
+  RAISE NOTICE '  ✓ 1,500 each, both counted at once, filed under FOOD';
 
 -- =====================================================================
 RAISE NOTICE '--- 6. Ann pays Ben''s 1,200 phone bill outright ---';
 -- =====================================================================
-  e := add_direct_expense(BEN, 1200, 'Ben''s phone bill', TRUE, 1200, FALSE);
+  e := add_direct_expense(BEN, 1200, 'Ben''s phone bill', TRUE, 1200, FALSE, 'UTILITIES');
 
   ba := member_balance(pair, ANN);
   IF ba <> 5700 THEN RAISE EXCEPTION 'stage 6 failed: balance % (want 5700)', ba; END IF;
@@ -186,38 +173,28 @@ RAISE NOTICE '--- 6. Ann pays Ben''s 1,200 phone bill outright ---';
     RAISE EXCEPTION 'stage 6 failed: the payer was charged for somebody else''s bill (%)',
       pg_temp.spend(ANN);
   END IF;
-  -- It was Ben's, and it exists nowhere else, so he is asked about it.
-  IF pg_temp.queued(BEN) <> 1 THEN
-    RAISE EXCEPTION 'stage 6 failed: Ben was not asked about his own bill (% queued)',
-      pg_temp.queued(BEN);
-  END IF;
-
-  PERFORM set_config('request.jwt.claim.sub', BEN::TEXT, true);
-  PERFORM set_split_stats_choice(e, TRUE);
+  -- It was Ben's bill and it exists nowhere else, so it is Ben's spending —
+  -- immediately, and whether or not he is looking.
   IF pg_temp.spend(BEN) <> 2700 THEN
     RAISE EXCEPTION 'stage 6 failed: Ben''s spending reads % (want 2700)', pg_temp.spend(BEN);
   END IF;
-  PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
   RAISE NOTICE '  ✓ Ben owes 1,200 more and it counts as his, not Ann''s';
 
 -- =====================================================================
 RAISE NOTICE '--- 7. Ben pays an 800 bill of Ann''s ---';
 -- =====================================================================
-  e := add_direct_expense(BEN, 800, 'Ann''s data top-up', FALSE, 0, FALSE);
+  e := add_direct_expense(BEN, 800, 'Ann''s data top-up', FALSE, 0, FALSE, 'UTILITIES');
 
   ba := member_balance(pair, ANN);
   IF ba <> 4900 THEN RAISE EXCEPTION 'stage 7 failed: balance % (want 4900)', ba; END IF;
 
-  -- Ann's own consumption, recorded by Ann, so no prompt for her.
+  -- Ann's own consumption, which a friend happened to pay for.
   IF pg_temp.spend(ANN) <> 2300 THEN
     RAISE EXCEPTION 'stage 7 failed: Ann''s spending reads % (want 2300)', pg_temp.spend(ANN);
   END IF;
   IF pg_temp.spend(BEN) <> 2700 THEN
     RAISE EXCEPTION 'stage 7 failed: Ben was charged for a bill that was not his (%)',
       pg_temp.spend(BEN);
-  END IF;
-  IF pg_temp.queued(BEN) <> 0 THEN
-    RAISE EXCEPTION 'stage 7 failed: Ben was asked about a bill he only fronted';
   END IF;
   RAISE NOTICE '  ✓ Ann owes 800 less and counts it; Ben fronted it and does not';
 
@@ -261,10 +238,6 @@ RAISE NOTICE '--- 9. A real group with Cara, on top of all that ---';
       jsonb_build_object('user_id',ANN,'amount',0,'is_included',false)),'[]'::jsonb);
   PERFORM set_config('request.jwt.claim.sub', ANN::TEXT, true);
 
-  IF pg_temp.queued(BEN) <> 0 OR pg_temp.queued(CAR) <> 0 THEN
-    RAISE EXCEPTION 'stage 9 failed: a group bill queued a question (Ben % Cara %)',
-      pg_temp.queued(BEN), pg_temp.queued(CAR);
-  END IF;
   IF pg_temp.spend(ANN) <> 2600 OR pg_temp.spend(BEN) <> 3100 OR pg_temp.spend(CAR) <> 400 THEN
     RAISE EXCEPTION 'stage 9 failed: group shares not counted (Ann % Ben % Cara %)',
       pg_temp.spend(ANN), pg_temp.spend(BEN), pg_temp.spend(CAR);

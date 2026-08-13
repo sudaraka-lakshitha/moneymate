@@ -5,42 +5,50 @@ import { ExpenseCategory, User } from '../types';
 import { formatLKR, roundMoney } from '../lib/currency';
 import { CATEGORIES, categoryMeta } from '../lib/categories';
 import { useTheme } from '../lib/theme';
-import { friendlyDate, lastNDays, toISODate } from '../lib/dates';
+import { lastNDays, toISODate } from '../lib/dates';
 import { friendlyDbError } from '../lib/authErrors';
-import { Alert, EmptyState, Skeleton, Spinner } from '../components/ui';
+import { Alert, Avatar, EmptyState, Skeleton } from '../components/ui';
 import { CategoryBars, CategoryDatum, TrendChart, TrendPoint } from '../components/Charts';
-import { HelpCircle, TrendingDown, TrendingUp } from 'lucide-react';
+import { TrendingDown, TrendingUp } from 'lucide-react';
 
 interface AnalyticsPageProps {
   user: User;
 }
 
 type Range = 30 | 90;
-type Source = 'all' | 'personal' | 'group';
 
-/** One spending fact, whatever it came from. */
+/**
+ * One share of one shared bill — the unit everything on this screen is built
+ * from, now that the app only records shared spending.
+ */
 interface SpendRow {
   date: string;
   category: ExpenseCategory;
+  /** What this bill charged you. */
   amount: number;
-  source: 'personal' | 'group';
+  /** What you actually put in for it, which is usually not the same. */
+  paid: number;
+  groupId: string;
+  groupName: string;
+  /** Everyone else on the bill. */
+  withIds: string[];
 }
 
-const SOURCE_LABELS: Record<Source, string> = {
-  all: 'Everything',
-  personal: 'Personal',
-  group: 'Group share',
-};
+/** A ranked breakdown row, used for both "who with" and "which group". */
+interface Ranked {
+  key: string;
+  label: string;
+  value: number;
+  user?: User;
+}
 
 export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
   const { resolved } = useTheme();
   const [rows, setRows] = useState<SpendRow[]>([]);
+  const [people, setPeople] = useState<Record<string, User>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [range, setRange] = useState<Range>(30);
-  const [source, setSource] = useState<Source>('all');
-  const [pending, setPending] = useState<any[]>([]);
-  const [deciding, setDeciding] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -48,69 +56,76 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
       // 190 days covers the 90-day range plus its comparison period.
       const since = toISODate(new Date(Date.now() - 190 * 24 * 3600 * 1000));
 
-      const [dailyRes, splitRes] = await Promise.all([
-        supabase
-          .from('daily_expenses')
-          .select('date, category, amount')
-          .eq('user_id', user.id)
-          .eq('is_deleted', false)
-          .gte('date', since),
-        // Shared spending counted as yours. Group shares are marked counted as
-        // they are written, so this is normally everything you were in; a record
-        // a friend made with you privately only lands here once you say so.
-        // TRUE, never merely unset — undecided is not consent.
-        supabase
-          .from('expense_splits')
-          .select('amount, include_in_stats, expenses!inner(category, created_at, is_deleted)')
-          .eq('user_id', user.id)
-          .eq('is_included', true)
-          .eq('include_in_stats', true)
-          .eq('expenses.is_deleted', false)
-          .gte('expenses.created_at', since),
-      ]);
-
-      if (dailyRes.error) throw dailyRes.error;
-      if (splitRes.error) throw splitRes.error;
-
-      // Shares somebody else's bill gave you that you have not ruled on yet.
-      // They are already real expenses and already affect what you owe; the only
-      // open question is whether they belong in your charts.
-      //
-      // Explicitly somebody else's: a bill you entered yourself carries your
-      // answer already, and being asked to confirm your own typing is noise.
-      const { data: pendingData } = await supabase
+      // Your share of every shared bill you were on. Lending is excluded here
+      // rather than filtered later: money moving between two people is a
+      // transfer, not spending, and counting it would double what you spent
+      // once the borrower records what they actually bought.
+      const { data, error: splitError } = await supabase
         .from('expense_splits')
         .select(
-          'expense_id, amount, expenses!inner(title, category, created_at, created_by, is_deleted, group_id, groups(name, is_direct))'
+          'amount, expense_id, expenses!inner(id, category, created_at, is_deleted, is_loan, group_id, groups(name, is_direct))'
         )
         .eq('user_id', user.id)
         .eq('is_included', true)
-        .is('include_in_stats', null)
         .eq('expenses.is_deleted', false)
-        .neq('expenses.created_by', user.id)
-        .order('expense_id')
-        .limit(50);
-      setPending(pendingData ?? []);
+        .eq('expenses.is_loan', false)
+        .gte('expenses.created_at', since);
+      if (splitError) throw splitError;
 
-      const personal: SpendRow[] = (dailyRes.data ?? []).map((row: any) => ({
-        date: row.date,
-        category: (row.category || 'OTHER') as ExpenseCategory,
-        amount: Number(row.amount),
-        source: 'personal',
-      }));
+      const mine = (data ?? []).filter((row: any) => row.expenses);
+      const expenseIds = mine.map((row: any) => row.expense_id);
 
-      const group: SpendRow[] = (splitRes.data ?? [])
-        .filter((row: any) => row.expenses)
-        .map((row: any) => ({
+      // Who else was on those bills, and what everyone put in. Two small
+      // follow-up queries rather than a deep embed, which PostgREST cannot
+      // express without ambiguity here.
+      const [othersRes, payersRes] = await Promise.all([
+        expenseIds.length > 0
+          ? supabase
+              .from('expense_splits')
+              .select('expense_id, user_id, users(*)')
+              .in('expense_id', expenseIds)
+              .eq('is_included', true)
+          : Promise.resolve({ data: [], error: null }),
+        expenseIds.length > 0
+          ? supabase
+              .from('ledger_entries')
+              .select('reference_id, amount')
+              .eq('user_id', user.id)
+              .eq('entry_type', 'EXPENSE')
+              .in('reference_id', expenseIds)
+          : Promise.resolve({ data: [], error: null }),
+      ]);
+
+      const withByExpense: Record<string, string[]> = {};
+      const seen: Record<string, User> = {};
+      for (const row of (othersRes.data ?? []) as any[]) {
+        if (row.user_id === user.id) continue;
+        (withByExpense[row.expense_id] ||= []).push(row.user_id);
+        if (row.users) seen[row.user_id] = row.users as User;
+      }
+      setPeople(seen);
+
+      const paidByExpense: Record<string, number> = {};
+      for (const row of (payersRes.data ?? []) as any[]) {
+        paidByExpense[row.reference_id] =
+          (paidByExpense[row.reference_id] ?? 0) + Number(row.amount);
+      }
+
+      setRows(
+        mine.map((row: any) => ({
           date: String(row.expenses.created_at).slice(0, 10),
           category: (row.expenses.category || 'OTHER') as ExpenseCategory,
           amount: Number(row.amount),
-          source: 'group',
-        }));
-
-      setRows([...personal, ...group]);
+          paid: paidByExpense[row.expense_id] ?? 0,
+          groupId: row.expenses.group_id,
+          groupName: row.expenses.groups?.is_direct
+            ? 'Just the two of you'
+            : (row.expenses.groups?.name ?? 'A group'),
+          withIds: withByExpense[row.expense_id] ?? [],
+        }))
+      );
     } catch (err) {
-      setError(friendlyDbError(err, 'Could not load your analytics.'));
+      setError(friendlyDbError(err, 'Could not load your stats.'));
     } finally {
       setLoading(false);
     }
@@ -120,51 +135,16 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
     void load();
   }, [load]);
 
-  // Somebody else adding a bill puts a decision in your queue; it should appear
-  // without you having to leave the screen and come back.
-  useLiveRefresh('analytics', ['expense_splits', 'expenses', 'daily_expenses'], load);
+  useLiveRefresh('analytics', ['expense_splits', 'expenses', 'ledger_entries'], load);
 
-  const decide = async (expenseId: string, include: boolean) => {
-    setDeciding(expenseId);
-    try {
-      const { error: rpcError } = await supabase.rpc('set_split_stats_choice', {
-        p_expense_id: expenseId,
-        p_include: include,
-      });
-      if (rpcError) throw rpcError;
-      await load();
-    } catch (err) {
-      setError(friendlyDbError(err, 'Could not save that choice.'));
-    } finally {
-      setDeciding(null);
-    }
-  };
-
-  const decideAll = async (include: boolean) => {
-    setDeciding('ALL');
-    try {
-      const { error: rpcError } = await supabase.rpc('set_all_pending_stats_choices', {
-        p_include: include,
-      });
-      if (rpcError) throw rpcError;
-      await load();
-    } catch (err) {
-      setError(friendlyDbError(err, 'Could not save those choices.'));
-    } finally {
-      setDeciding(null);
-    }
-  };
-
-  const visible = useMemo(
-    () => (source === 'all' ? rows : rows.filter((row) => row.source === source)),
-    [rows, source]
-  );
+  const windowDates = useMemo(() => new Set(lastNDays(range)), [range]);
+  const visible = useMemo(() => rows.filter((row) => windowDates.has(row.date)), [rows, windowDates]);
 
   const byDate = useMemo(() => {
     const map: Record<string, number> = {};
-    for (const row of visible) map[row.date] = roundMoney((map[row.date] ?? 0) + row.amount);
+    for (const row of rows) map[row.date] = roundMoney((map[row.date] ?? 0) + row.amount);
     return map;
-  }, [visible]);
+  }, [rows]);
 
   const trend = useMemo<TrendPoint[]>(
     () => lastNDays(range).map((date) => ({ date, value: byDate[date] ?? 0 })),
@@ -172,6 +152,12 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
   );
 
   const windowTotal = useMemo(() => roundMoney(trend.reduce((sum, p) => sum + p.value, 0)), [trend]);
+
+  /** What you actually put in over the window, which is rarely your share. */
+  const fronted = useMemo(
+    () => roundMoney(visible.reduce((sum, row) => sum + row.paid, 0)),
+    [visible]
+  );
 
   const previousTotal = useMemo(() => {
     const dates = lastNDays(range * 2).slice(0, range);
@@ -181,6 +167,7 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
   const changePercent = previousTotal > 0 ? ((windowTotal - previousTotal) / previousTotal) * 100 : null;
 
   const activeDays = trend.filter((p) => p.value > 0).length;
+
   /**
    * Averaged over the days you actually spent on, not every day in the window,
    * and never over more than the last 30. Dividing by the whole range answers
@@ -188,42 +175,28 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
    * people expect and drifts lower the wider the range gets — the useful figure
    * is what a spending day typically costs.
    */
-  const dailyAverage = useMemo(() => {
-    const window = Math.min(range, 30);
-    const from = lastNDays(window)[0];
-    const days = Object.entries(byDate).filter(([date, value]) => date >= from && value > 0);
-    if (days.length === 0) return 0;
-    const total = days.reduce((sum, [, value]) => sum + value, 0);
-    return roundMoney(total / days.length);
-  }, [byDate, range]);
-
   const averagedOverDays = useMemo(() => {
     const window = Math.min(range, 30);
     const from = lastNDays(window)[0];
     return Object.entries(byDate).filter(([date, value]) => date >= from && value > 0).length;
   }, [byDate, range]);
+
+  const dailyAverage = useMemo(() => {
+    const window = Math.min(range, 30);
+    const from = lastNDays(window)[0];
+    const days = Object.entries(byDate).filter(([date, value]) => date >= from && value > 0);
+    if (days.length === 0) return 0;
+    return roundMoney(days.reduce((sum, [, value]) => sum + value, 0) / days.length);
+  }, [byDate, range]);
+
   const busiest = trend.reduce<TrendPoint | null>(
     (top, point) => (point.value > (top?.value ?? 0) ? point : top),
     null
   );
 
-  const splitByOrigin = useMemo(() => {
-    const windowDates = new Set(lastNDays(range));
-    let personal = 0;
-    let group = 0;
-    for (const row of rows) {
-      if (!windowDates.has(row.date)) continue;
-      if (row.source === 'personal') personal += row.amount;
-      else group += row.amount;
-    }
-    return { personal: roundMoney(personal), group: roundMoney(group) };
-  }, [rows, range]);
-
   const categoryData = useMemo<CategoryDatum[]>(() => {
-    const windowDates = new Set(lastNDays(range));
     const totals: Record<string, number> = {};
     for (const row of visible) {
-      if (!windowDates.has(row.date)) continue;
       totals[row.category] = roundMoney((totals[row.category] ?? 0) + row.amount);
     }
     return CATEGORIES.filter((cat) => (totals[cat.id] ?? 0) > 0)
@@ -235,9 +208,41 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
         color: cat.color[resolved],
       }))
       .sort((a, b) => b.value - a.value);
-  }, [visible, range, resolved]);
+  }, [visible, resolved]);
 
   const topCategory = categoryData[0];
+
+  /**
+   * Who you spend with. A bill split three ways counts its whole share against
+   * each of the other two — the question is "how much of my spending happens
+   * around this person", not an apportionment, so it deliberately does not sum
+   * to the total.
+   */
+  const byPerson = useMemo<Ranked[]>(() => {
+    const totals: Record<string, number> = {};
+    for (const row of visible) {
+      for (const id of row.withIds) totals[id] = roundMoney((totals[id] ?? 0) + row.amount);
+    }
+    return Object.entries(totals)
+      .map(([id, value]) => ({
+        key: id,
+        label: people[id]?.display_name ?? 'Someone',
+        value,
+        user: people[id],
+      }))
+      .sort((a, b) => b.value - a.value);
+  }, [visible, people]);
+
+  const byGroup = useMemo<Ranked[]>(() => {
+    const totals: Record<string, { name: string; value: number }> = {};
+    for (const row of visible) {
+      const entry = (totals[row.groupId] ||= { name: row.groupName, value: 0 });
+      entry.value = roundMoney(entry.value + row.amount);
+    }
+    return Object.entries(totals)
+      .map(([id, { name, value }]) => ({ key: id, label: name, value }))
+      .sort((a, b) => b.value - a.value);
+  }, [visible]);
 
   if (loading) {
     return (
@@ -257,7 +262,7 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
       <header className="page-header">
         <div>
           <h1 className="page-title">Stats</h1>
-          <p className="page-subtitle">Personal tracker + your share of group bills</p>
+          <p className="page-subtitle">Your share of everything you have split</p>
         </div>
       </header>
 
@@ -267,7 +272,7 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
         </div>
       )}
 
-      <div className="chip-grid" style={{ gridTemplateColumns: 'repeat(2, 1fr)', marginBottom: 'var(--sp-2)' }}>
+      <div className="chip-grid" style={{ gridTemplateColumns: 'repeat(2, 1fr)', marginBottom: 'var(--sp-4)' }}>
         {([30, 90] as Range[]).map((option) => (
           <button
             key={option}
@@ -281,102 +286,8 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
         ))}
       </div>
 
-      {pending.length > 0 && (
-        <section className="card" style={{ borderColor: 'var(--warning)', marginBottom: 'var(--sp-4)' }}>
-          <span className="row" style={{ gap: 8, marginBottom: 6 }}>
-            <HelpCircle size={16} color="var(--warning)" />
-            <span style={{ fontWeight: 700, fontSize: '0.93rem' }}>
-              {pending.length} shared {pending.length === 1 ? 'record' : 'records'} with a friend
-            </span>
-          </span>
-          <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
-            A friend recorded these straight with you, outside any group. Group spending counts
-            automatically; this asks only because you were never at the form. They already count toward
-            what you owe — this is only about the charts below.
-          </p>
-
-          <div className="stack-sm">
-            {pending.map((row: any) => (
-              <div key={row.expense_id} className="card row">
-                <span className="grow" style={{ minWidth: 0 }}>
-                  <span
-                    className="truncate"
-                    style={{ display: 'block', fontSize: '0.88rem', fontWeight: 600 }}
-                  >
-                    {row.expenses?.title ?? 'Expense'}
-                  </span>
-                  <span className="hint">
-                    {friendlyDate(String(row.expenses?.created_at ?? '').slice(0, 10))}
-                    {row.expenses?.groups && !row.expenses.groups.is_direct
-                      ? ` · ${row.expenses.groups.name}`
-                      : ''}
-                    {' · your share '}
-                    {formatLKR(Number(row.amount))}
-                  </span>
-                </span>
-                <span className="row" style={{ gap: 6, flexShrink: 0 }}>
-                  <button
-                    type="button"
-                    className="btn btn-ghost btn-sm"
-                    onClick={() => decide(row.expense_id, false)}
-                    disabled={deciding !== null}
-                  >
-                    Skip
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-primary btn-sm"
-                    onClick={() => decide(row.expense_id, true)}
-                    disabled={deciding !== null}
-                  >
-                    {deciding === row.expense_id ? <Spinner /> : 'Count it'}
-                  </button>
-                </span>
-              </div>
-            ))}
-          </div>
-
-          {pending.length > 1 && (
-            <div className="row" style={{ marginTop: 'var(--sp-3)' }}>
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm grow"
-                onClick={() => decideAll(false)}
-                disabled={deciding !== null}
-              >
-                Skip all
-              </button>
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm grow"
-                onClick={() => decideAll(true)}
-                disabled={deciding !== null}
-              >
-                Count all
-              </button>
-            </div>
-          )}
-        </section>
-      )}
-
-      <div className="chip-grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)', marginBottom: 'var(--sp-4)' }}>
-        {(['all', 'personal', 'group'] as Source[]).map((option) => (
-          <button
-            key={option}
-            type="button"
-            className={`chip ${source === option ? 'is-selected' : ''}`}
-            style={{ display: 'flex', justifyContent: 'center' }}
-            onClick={() => setSource(option)}
-          >
-            {SOURCE_LABELS[option]}
-          </button>
-        ))}
-      </div>
-
       <section className="card-hero is-neutral" style={{ marginBottom: 'var(--sp-5)' }}>
-        <span className="label">
-          {SOURCE_LABELS[source]} spending · last {range} days
-        </span>
+        <span className="label">Your share · last {range} days</span>
         <div className="amount-xl" style={{ margin: '6px 0 4px' }}>
           {formatLKR(windowTotal)}
         </div>
@@ -393,8 +304,14 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
 
         <div
           className="row card-divider"
-          style={{ gap: 'var(--sp-6)', marginTop: 'var(--sp-4)', paddingTop: 'var(--sp-4)' }}
+          style={{ gap: 'var(--sp-5)', marginTop: 'var(--sp-4)', paddingTop: 'var(--sp-4)' }}
         >
+          <div>
+            {/* What you put in versus what was yours to pay. The gap between
+                the two is the money you are waiting on. */}
+            <div className="label">You fronted</div>
+            <div className="amount-md tabular">{formatLKR(fronted)}</div>
+          </div>
           <div>
             <div className="label">Avg. spending day</div>
             <div className="amount-md tabular">{formatLKR(dailyAverage)}</div>
@@ -414,58 +331,92 @@ export const AnalyticsPage: React.FC<AnalyticsPageProps> = ({ user }) => {
         </div>
       </section>
 
-      {source === 'all' && (splitByOrigin.personal > 0 || splitByOrigin.group > 0) && (
-        <div className="card row-between" style={{ marginBottom: 'var(--sp-5)' }}>
-          <div>
-            <span className="label">Own spending</span>
-            <div className="amount-md tabular">{formatLKR(splitByOrigin.personal)}</div>
-          </div>
-          <div style={{ textAlign: 'right' }}>
-            <span className="label">Share of group bills</span>
-            <div className="amount-md tabular">{formatLKR(splitByOrigin.group)}</div>
-          </div>
-        </div>
-      )}
-
-      <h2 className="section-title" style={{ marginTop: 0 }}>
-        Daily spending
-      </h2>
-      <div className="card" style={{ marginBottom: 'var(--sp-2)' }}>
-        <TrendChart data={trend} />
-      </div>
-      {busiest && busiest.value > 0 && (
-        <p className="hint" style={{ marginBottom: 'var(--sp-5)' }}>
-          Highest day: {formatLKR(busiest.value)} on{' '}
-          {new Date(busiest.date + 'T00:00:00').toLocaleDateString(undefined, {
-            day: 'numeric',
-            month: 'long',
-          })}
-          .
-        </p>
-      )}
-
-      <h2 className="section-title" style={{ marginTop: 0 }}>
-        Where it goes
-      </h2>
-      {topCategory && windowTotal > 0 && (
-        <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
-          {categoryMeta(topCategory.key).name} is your biggest category at{' '}
-          {((topCategory.value / windowTotal) * 100).toFixed(0)}% of spending.
-        </p>
-      )}
-
-      {categoryData.length === 0 ? (
+      {windowTotal === 0 ? (
         <EmptyState
           icon="📊"
-          title="No data yet"
-          text={
-            source === 'group'
-              ? 'Add a group expense and your share will be broken down here by category.'
-              : 'Log a few expenses in the Tracker and your breakdown and trends will appear here.'
-          }
+          title="Nothing split yet"
+          text="Add a bill to a group, or record something with a friend, and your share will be charted here."
         />
       ) : (
-        <CategoryBars data={categoryData} total={windowTotal} />
+        <>
+          <h2 className="section-title" style={{ marginTop: 0 }}>
+            Daily spending
+          </h2>
+          <div className="card" style={{ marginBottom: 'var(--sp-2)' }}>
+            <TrendChart data={trend} />
+          </div>
+          {busiest && busiest.value > 0 && (
+            <p className="hint" style={{ marginBottom: 'var(--sp-5)' }}>
+              Highest day: {formatLKR(busiest.value)} on{' '}
+              {new Date(busiest.date + 'T00:00:00').toLocaleDateString(undefined, {
+                day: 'numeric',
+                month: 'long',
+              })}
+              .
+            </p>
+          )}
+
+          <h2 className="section-title" style={{ marginTop: 0 }}>
+            Where it goes
+          </h2>
+          {topCategory && (
+            <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+              {categoryMeta(topCategory.key).name} is your biggest category at{' '}
+              {((topCategory.value / windowTotal) * 100).toFixed(0)}% of your share.
+            </p>
+          )}
+          <CategoryBars data={categoryData} total={windowTotal} />
+
+          {byPerson.length > 0 && (
+            <>
+              <h2 className="section-title">Who you spend with</h2>
+              <p className="hint" style={{ marginBottom: 'var(--sp-3)' }}>
+                How much of your spending happens around each person. A bill you split three ways counts
+                against both of the others, so these do not add up to the total.
+              </p>
+              <div className="stack-sm">
+                {byPerson.map((row) => (
+                  <div key={row.key} className="card row">
+                    <Avatar name={row.label} url={row.user?.avatar_url} size={32} />
+                    <span className="grow truncate" style={{ fontSize: '0.88rem', fontWeight: 600 }}>
+                      {row.label}
+                    </span>
+                    <span className="amount-md tabular" style={{ flexShrink: 0 }}>
+                      {formatLKR(row.value)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          {byGroup.length > 0 && (
+            <>
+              <h2 className="section-title">Which group</h2>
+              <div className="stack-sm">
+                {byGroup.map((row) => {
+                  const pct = Math.round((row.value / windowTotal) * 100);
+                  return (
+                    <div key={row.key} className="card row">
+                      <span className="grow" style={{ minWidth: 0 }}>
+                        <span
+                          className="truncate"
+                          style={{ display: 'block', fontSize: '0.88rem', fontWeight: 600 }}
+                        >
+                          {row.label}
+                        </span>
+                        <span className="hint">{pct}% of your share</span>
+                      </span>
+                      <span className="amount-md tabular" style={{ flexShrink: 0 }}>
+                        {formatLKR(row.value)}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </>
       )}
     </div>
   );

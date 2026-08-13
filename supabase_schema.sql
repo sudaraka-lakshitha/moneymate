@@ -4283,3 +4283,193 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN, TEXT) TO authenticated;
+
+-- ========================================
+-- STATISTICS WITHOUT THE QUESTIONS
+-- ========================================
+-- The per-expense "does this count in my statistics?" prompt existed because
+-- personal and shared spending shared one chart, and letting somebody else's
+-- entry into your personal totals needed consent. There is no personal half any
+-- more: everything the app records is shared, and your share of a shared bill is
+-- simply what you spent.
+--
+-- So the question goes, and with it the column that stored the answer, the two
+-- functions that set it and the queue that surfaced it. What counts is now
+-- derived, and the one real distinction survives as a rule rather than a prompt:
+-- a loan is a transfer, not spending, and is excluded by is_loan.
+DROP FUNCTION IF EXISTS public.set_split_stats_choice(UUID, BOOLEAN);
+DROP FUNCTION IF EXISTS public.set_all_pending_stats_choices(BOOLEAN);
+
+DROP INDEX IF EXISTS idx_splits_stats_pending;
+ALTER TABLE expense_splits DROP COLUMN IF EXISTS include_in_stats;
+
+-- write_expense_rows without the stats bookkeeping.
+CREATE OR REPLACE FUNCTION public.write_expense_rows(
+    p_expense_id UUID,
+    p_group_id   UUID,
+    p_title      TEXT,
+    p_amount     DECIMAL,
+    p_paid_by    UUID,
+    p_splits     JSONB,
+    p_items      JSONB
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_item        JSONB;
+    v_split_total DECIMAL(14,2) := 0;
+    v_negatives   INT := 0;
+BEGIN
+    SELECT COUNT(*) INTO v_negatives
+    FROM jsonb_array_elements(p_splits) s
+    WHERE COALESCE((s->>'amount')::DECIMAL, 0) < 0;
+
+    IF v_negatives > 0 THEN
+        RAISE EXCEPTION 'A split cannot be a negative amount';
+    END IF;
+
+    SELECT COALESCE(SUM((s->>'amount')::DECIMAL), 0) INTO v_split_total
+    FROM jsonb_array_elements(p_splits) s
+    WHERE (s->>'is_included')::BOOLEAN;
+
+    IF ROUND(v_split_total, 2) <> ROUND(p_amount, 2) THEN
+        RAISE EXCEPTION 'Split total (%) does not equal the expense amount (%)', v_split_total, p_amount;
+    END IF;
+
+    INSERT INTO expense_splits (expense_id, user_id, is_included, amount, percentage, shares)
+    SELECT
+        p_expense_id,
+        (s->>'user_id')::UUID,
+        COALESCE((s->>'is_included')::BOOLEAN, TRUE),
+        COALESCE((s->>'amount')::DECIMAL, 0),
+        COALESCE((s->>'percentage')::DECIMAL, 0),
+        COALESCE((s->>'shares')::INT, 1)
+    FROM jsonb_array_elements(p_splits) s;
+
+    IF jsonb_array_length(COALESCE(p_items, '[]'::jsonb)) > 0 THEN
+        FOR v_item IN SELECT * FROM jsonb_array_elements(p_items) LOOP
+            INSERT INTO expense_items (expense_id, name, amount, shared_by)
+            VALUES (
+                p_expense_id,
+                v_item->>'name',
+                COALESCE((v_item->>'amount')::DECIMAL, 0),
+                ARRAY(SELECT jsonb_array_elements_text(COALESCE(v_item->'shared_by', '[]'::jsonb)))::UUID[]
+            );
+        END LOOP;
+    END IF;
+
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    VALUES (p_group_id, p_paid_by, 'EXPENSE', p_amount, p_expense_id, 'Paid for ' || p_title);
+
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    SELECT p_group_id, (s->>'user_id')::UUID, 'SPLIT',
+           -COALESCE((s->>'amount')::DECIMAL, 0), p_expense_id, 'Share of ' || p_title
+    FROM jsonb_array_elements(p_splits) s
+    WHERE COALESCE((s->>'is_included')::BOOLEAN, TRUE)
+      AND COALESCE((s->>'amount')::DECIMAL, 0) > 0;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.write_expense_rows(UUID, UUID, TEXT, DECIMAL, UUID, JSONB, JSONB) TO authenticated;
+
+-- update_expense loses the snapshot-and-restore that carried everyone else's
+-- answers across a rewrite. There are no answers to carry.
+CREATE OR REPLACE FUNCTION public.update_expense(
+    p_expense_id   UUID,
+    p_title        TEXT,
+    p_amount       DECIMAL,
+    p_paid_by      UUID,
+    p_category     TEXT,
+    p_split_method TEXT,
+    p_notes        TEXT,
+    p_splits       JSONB,
+    p_items        JSONB DEFAULT '[]'::jsonb
+)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_old      expenses%ROWTYPE;
+    v_old_snap JSONB;
+    v_new_snap JSONB;
+    v_summary  TEXT := '';
+BEGIN
+    SELECT * INTO v_old FROM expenses WHERE id = p_expense_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Expense not found';
+    END IF;
+    IF v_old.is_deleted THEN
+        RAISE EXCEPTION 'This expense has been deleted';
+    END IF;
+    IF v_old.created_by <> auth.uid() AND NOT public.is_group_admin(v_old.group_id) THEN
+        RAISE EXCEPTION 'Only the person who added this expense, or a group admin, can edit it';
+    END IF;
+    IF public.expense_is_locked(p_expense_id) THEN
+        RAISE EXCEPTION 'This expense has already been settled and cannot be changed. Add a new expense to correct it.';
+    END IF;
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION 'Amount must be greater than zero';
+    END IF;
+
+    v_old_snap := jsonb_build_object(
+        'title', v_old.title, 'amount', v_old.amount, 'paid_by', v_old.paid_by,
+        'category', v_old.category, 'split_method', v_old.split_method, 'notes', v_old.notes,
+        'splits', (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                       'user_id', user_id, 'amount', amount, 'is_included', is_included)), '[]'::jsonb)
+                   FROM expense_splits WHERE expense_id = p_expense_id)
+    );
+
+    IF v_old.title <> p_title THEN
+        v_summary := v_summary || format('title "%s" → "%s"; ', v_old.title, p_title);
+    END IF;
+    IF ROUND(v_old.amount, 2) <> ROUND(p_amount, 2) THEN
+        v_summary := v_summary || format('amount %s → %s; ', v_old.amount, p_amount);
+    END IF;
+    IF v_old.paid_by IS DISTINCT FROM p_paid_by THEN
+        v_summary := v_summary || 'payer changed; ';
+    END IF;
+    IF v_old.split_method <> p_split_method THEN
+        v_summary := v_summary || format('split %s → %s; ', v_old.split_method, p_split_method);
+    END IF;
+    IF v_summary = '' THEN
+        v_summary := 'splits adjusted';
+    END IF;
+
+    -- Zero out whatever this expense currently contributes, however many edits
+    -- it has already been through. Nothing is deleted: the ledger stays
+    -- append-only and auditable.
+    INSERT INTO ledger_entries (group_id, user_id, entry_type, amount, reference_id, description)
+    SELECT group_id, user_id, 'EDIT_REVERSAL', -SUM(amount), p_expense_id,
+           'Reversal for edit of ' || v_old.title
+    FROM ledger_entries
+    WHERE reference_id = p_expense_id
+    GROUP BY group_id, user_id
+    HAVING SUM(amount) <> 0;
+
+    DELETE FROM expense_splits WHERE expense_id = p_expense_id;
+    DELETE FROM expense_items  WHERE expense_id = p_expense_id;
+
+    UPDATE expenses
+    SET title = p_title, amount = p_amount, paid_by = p_paid_by,
+        on_behalf_of = CASE WHEN p_paid_by <> auth.uid() THEN p_paid_by END,
+        category = COALESCE(p_category, 'OTHER'),
+        split_method = COALESCE(p_split_method, 'EQUAL'),
+        notes = COALESCE(p_notes, ''),
+        updated_at = NOW()
+    WHERE id = p_expense_id;
+
+    PERFORM public.write_expense_rows(p_expense_id, v_old.group_id, p_title, p_amount, p_paid_by, p_splits, p_items);
+
+    v_new_snap := jsonb_build_object(
+        'title', p_title, 'amount', p_amount, 'paid_by', p_paid_by,
+        'category', p_category, 'split_method', p_split_method, 'notes', p_notes,
+        'splits', p_splits
+    );
+
+    INSERT INTO expense_edits (expense_id, edited_by, old_snapshot, new_snapshot, change_summary)
+    VALUES (p_expense_id, auth.uid(), v_old_snap, v_new_snap, RTRIM(v_summary, '; '));
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.update_expense(UUID, TEXT, DECIMAL, UUID, TEXT, TEXT, TEXT, JSONB, JSONB) TO authenticated;

@@ -122,7 +122,7 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
     void (async () => {
       const { data, error: splitError } = await supabase
         .from('expense_splits')
-        .select('user_id, is_included, amount, percentage, shares, include_in_stats')
+        .select('user_id, is_included, amount, percentage, shares')
         .eq('expense_id', expense.id);
 
       if (!active) return;
