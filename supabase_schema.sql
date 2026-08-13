@@ -5959,3 +5959,64 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION public.update_direct_expense(UUID, DECIMAL, TEXT, BOOLEAN, DECIMAL, BOOLEAN, TEXT, DECIMAL) TO authenticated;
+
+-- ========================================
+-- STARTING A GROUP WITH THE PEOPLE ALREADY IN IT
+-- ========================================
+-- Creating a group used to leave you alone in it, holding a code to send round.
+-- For the usual case — a trip with three friends you already have on the app —
+-- that is a round trip through invitations for people you have already vouched
+-- for by adding them as friends.
+--
+-- Friends only, checked here rather than trusted from the client: friendship is
+-- the consent boundary the rest of the app already uses. add_direct_expense
+-- posts a shared bill against a friend on the same grounds. Anyone else still
+-- comes in by invitation or by code, which they have to accept.
+CREATE OR REPLACE FUNCTION public.create_group_with_friends(
+    p_name        TEXT,
+    p_description TEXT DEFAULT '',
+    p_icon_emoji  TEXT DEFAULT '💰',
+    p_friend_ids  UUID[] DEFAULT '{}'
+)
+RETURNS groups
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_group    groups%ROWTYPE;
+    v_me       UUID := auth.uid();
+    v_stranger UUID;
+BEGIN
+    v_group := public.create_group(p_name, p_description, p_icon_emoji);
+
+    IF p_friend_ids IS NULL OR array_length(p_friend_ids, 1) IS NULL THEN
+        RETURN v_group;
+    END IF;
+
+    -- One unconnected id refuses the whole thing rather than quietly seating
+    -- the rest: a half-made group is harder to notice than a refusal.
+    SELECT f INTO v_stranger
+    FROM unnest(p_friend_ids) f
+    WHERE f <> v_me
+      AND NOT EXISTS (
+        SELECT 1 FROM friend_requests fr
+        WHERE fr.status = 'ACCEPTED'
+          AND ((fr.requester_id = v_me AND fr.addressee_id = f)
+            OR (fr.requester_id = f AND fr.addressee_id = v_me))
+      )
+    LIMIT 1;
+
+    IF v_stranger IS NOT NULL THEN
+        RAISE EXCEPTION 'You can only start a group with people on your Friends list';
+    END IF;
+
+    INSERT INTO group_members (group_id, user_id, role)
+    SELECT v_group.id, f, 'MEMBER'
+    FROM unnest(p_friend_ids) f
+    WHERE f <> v_me
+    ON CONFLICT (group_id, user_id) DO NOTHING;
+
+    RETURN v_group;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.create_group_with_friends(TEXT, TEXT, TEXT, UUID[]) TO authenticated;

@@ -434,6 +434,34 @@ const run = async () => {
   await noOverflow('Groups');
   await shot('02-groups');
 
+  // ---------- Starting a group with the people already in it ----------
+  await page.click('button.btn-primary:has-text("New")');
+  await page.waitForTimeout(700);
+  await visible('New group', 'friends can be picked', 'div[aria-label="Add your friends"]');
+  await visible('New group', 'a friend is offered', 'text=Ben Perera');
+
+  await page.fill('input[placeholder*="Group name"]', 'Trip to Ella');
+  await page.click('div[aria-label="Add your friends"] >> text=Ben Perera');
+  await page.waitForTimeout(300);
+
+  // A group is for three or more. Two people already have their own shared
+  // record under Friends, and a second place for the same two people's money
+  // is a way to lose track of it — so one pick says so rather than blocking.
+  await visible('New group', 'one friend is steered to the pair record', 'text=/Just the two of you/');
+  const oneBtn = await page.locator('button:has-text("Create with 1 friend")').count();
+  check('New group', 'and can still be created anyway', oneBtn === 1);
+
+  await page.click('div[aria-label="Add your friends"] >> text=Evan Silva');
+  await page.waitForTimeout(300);
+  const twoBtn = await page.locator('button:has-text("Create with 2 friends")').count();
+  check('New group', 'the count follows what is ticked', twoBtn === 1);
+  const stillSteering = await page.locator('text=/Just the two of you/').count();
+  check('New group', 'and the steer goes once it is a real group', stillSteering === 0);
+  await noOverflow('New group');
+  await shot('02b-new-group');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(400);
+
   // ---------- Group detail ----------
   await page.click('text=Boarding Expenses');
   await page.waitForTimeout(1200);
