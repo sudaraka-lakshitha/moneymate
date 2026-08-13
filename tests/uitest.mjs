@@ -24,6 +24,9 @@ const DANA = '44444444-4444-4444-4444-444444444444';
 const EVAN = '55555555-5555-5555-5555-555555555555';
 const G1 = 'aaaaaaaa-0000-0000-0000-000000000001';
 const DIRECT = 'aaaaaaaa-0000-0000-0000-000000000002';
+// A second one-to-one ledger, with a different friend. One is not enough to
+// notice that every pair record used to render under the same label.
+const DIRECT2 = 'aaaaaaaa-0000-0000-0000-000000000003';
 
 const user = (id, name, email) => ({ id, display_name: name, email, avatar_url: null });
 const meU = user(ME, 'Sudaraka Lakshitha', 'me@t.lk');
@@ -42,6 +45,11 @@ const groups = [
   { id: DIRECT, name: 'Between you and Ben Perera', description: '', icon_emoji: '🤝',
     created_by: ME, invite_code: 'DIR001', invite_code_expires_at: today,
     is_direct: true, archived_at: null, status: 'ACTIVE', created_at: today, updated_at: today },
+  // Named from Evan's side on purpose: the stored name is written by whoever
+  // opened the ledger, so it reads wrong for the other person every time.
+  { id: DIRECT2, name: 'Between you and Sudaraka Lakshitha', description: '', icon_emoji: '🤝',
+    created_by: EVAN, invite_code: 'DIR002', invite_code_expires_at: today,
+    is_direct: true, archived_at: null, status: 'ACTIVE', created_at: today, updated_at: today },
 ];
 
 const members = [
@@ -51,6 +59,8 @@ const members = [
   { group_id: G1, user_id: DANA, role: 'MEMBER', users: danaU, user: danaU, groups: groups[0] },
   { group_id: DIRECT, user_id: ME, role: 'ADMIN', users: meU, user: meU, groups: groups[1] },
   { group_id: DIRECT, user_id: BEN, role: 'ADMIN', users: benU, user: benU, groups: groups[1] },
+  { group_id: DIRECT2, user_id: ME, role: 'ADMIN', users: meU, user: meU, groups: groups[2] },
+  { group_id: DIRECT2, user_id: EVAN, role: 'ADMIN', users: evanU, user: evanU, groups: groups[2] },
 ];
 
 const expense = (id, group_id, title, amount, paid_by, payer, category, opts = {}) => ({
@@ -108,11 +118,19 @@ const expenses = [
       { user_id: BEN, amount: 0, is_included: false },
     ],
   }),
+  // A shared bill in the second pair ledger, so Stats has two one-to-one rows
+  // to tell apart.
+  expense('e8', DIRECT2, 'Concert tickets', 800, EVAN, evanU, 'ENTERTAINMENT', {
+    splits: [
+      { user_id: ME, amount: 400, is_included: true },
+      { user_id: EVAN, amount: 400, is_included: true },
+    ],
+  }),
 ];
 
-// What Stats should make of the fixtures above: my share of e1/e2/e3/e5 is
-// 1500 + 1100 + 800 + 600 = 4000, and the loan is not spending.
-const MY_SHARE = 4000;
+// What Stats should make of the fixtures above: my share of e1/e2/e3/e5/e8 is
+// 1500 + 1100 + 800 + 600 + 400 = 4400, and neither loan is spending.
+const MY_SHARE = 4400;
 
 // Ledger consistent with the expenses above: I paid 4500 and owe 3400 of it,
 // Ben paid 3300 and owes 3400, Cara paid 2400 and owes 3400 — plus the pair
@@ -139,6 +157,9 @@ const ledger = [
   { group_id: DIRECT, user_id: BEN, amount: -5000, entry_type: 'SPLIT', reference_id: 'e6' },
   { group_id: DIRECT, user_id: BEN, amount: 3000, entry_type: 'EXPENSE', reference_id: 'e7' },
   { group_id: DIRECT, user_id: ME, amount: -3000, entry_type: 'SPLIT', reference_id: 'e7' },
+  { group_id: DIRECT2, user_id: EVAN, amount: 800, entry_type: 'EXPENSE', reference_id: 'e8' },
+  { group_id: DIRECT2, user_id: ME, amount: -400, entry_type: 'SPLIT', reference_id: 'e8' },
+  { group_id: DIRECT2, user_id: EVAN, amount: -400, entry_type: 'SPLIT', reference_id: 'e8' },
 ];
 
 const settlements = [
@@ -163,7 +184,8 @@ const splitsFlat = expenses.flatMap((e) =>
     expenses: { id: e.id, title: e.title, category: e.category, created_at: e.created_at,
                 created_by: e.created_by, is_deleted: e.is_deleted, is_loan: e.is_loan,
                 group_id: e.group_id,
-                groups: { name: groups.find((g) => g.id === e.group_id)?.name, is_direct: e.group_id === DIRECT } },
+                groups: { name: groups.find((g) => g.id === e.group_id)?.name,
+                          is_direct: Boolean(groups.find((g) => g.id === e.group_id)?.is_direct) } },
   }))
 );
 
@@ -194,6 +216,7 @@ const TABLES = {
     { expense_id: 'e5', user_id: ME, amount: 1200 },
     { expense_id: 'e6', user_id: ME, amount: 5000 },
     { expense_id: 'e7', user_id: BEN, amount: 3000 },
+    { expense_id: 'e8', user_id: EVAN, amount: 800 },
   ],
 };
 
@@ -710,8 +733,29 @@ const run = async () => {
   await visible('Stats', 'average spending day', 'text=/Avg. spending day/');
   await visible('Stats', 'category breakdown', 'text=Where it goes');
   await visible('Stats', 'who you split with', 'text=Who you spend with');
-  await visible('Stats', 'which group', 'text=Which group');
+  await visible('Stats', 'where you split it', 'text=Where you split it');
   await visible('Stats', 'the people are named', 'text=Ben Perera');
+
+  // Every one-to-one ledger used to render as "Just the two of you", so two
+  // different friends produced two identical rows and neither could be told
+  // from the other. They are named after the person now.
+  const generic = await page.locator('h2:has-text("Where you split it") ~ * >> text=/^Just the two of you$/').count();
+  check('Stats', 'no two rows share one generic label', generic === 0, `${generic} generic rows`);
+  const labels = (
+    await page.locator('h2:has-text("Where you split it") ~ div.stack-sm .card .truncate').allInnerTexts()
+  ).map((t) => t.trim());
+  check(
+    'Stats',
+    'each row is named for its group or its friend',
+    new Set(labels).size === labels.length && labels.length >= 3,
+    labels.join(' | ')
+  );
+  check(
+    'Stats',
+    'and a one-to-one row names the person',
+    labels.includes('Ben Perera') && labels.includes('Evan Silva'),
+    labels.join(' | ')
+  );
 
   // Nothing is ever asked any more, so no approval queue may appear here.
   const asked = await page
