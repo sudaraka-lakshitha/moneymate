@@ -83,6 +83,7 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
   const [inviteEmailError, setInviteEmailError] = useState<string | null>(null);
   const [cancellingInvite, setCancellingInvite] = useState<string | null>(null);
   const [friends, setFriends] = useState<User[]>([]);
+  const [friendsError, setFriendsError] = useState<string | null>(null);
   const [invitingFriend, setInvitingFriend] = useState<string | null>(null);
 
   const [showStats, setShowStats] = useState(false);
@@ -170,12 +171,16 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
       setPendingChanges((changeData ?? []) as PendingChange[]);
 
       // Your connections, so inviting somebody you already know does not mean
-      // retyping an address the app already has.
-      const { data: friendData } = await supabase
+      // retyping an address the app already has. An error here used to be
+      // discarded, which made a broken query look exactly like having no
+      // friends — and the section that lists them then rendered nothing at all.
+      const { data: friendData, error: friendError } = await supabase
         .from('friend_requests')
         .select('requester:users!friend_requests_requester_id_fkey(*), addressee:users!friend_requests_addressee_id_fkey(*), requester_id, addressee_id')
         .or(`requester_id.eq.${user.id},addressee_id.eq.${user.id}`)
         .eq('status', 'ACCEPTED');
+      if (friendError) console.error('Friends failed to load:', friendError);
+      setFriendsError(friendError ? friendlyDbError(friendError, 'Could not load your friends.') : null);
       setFriends(
         (friendData ?? [])
           .map((row: any) => (row.requester_id === user.id ? row.addressee : row.requester))
@@ -1674,8 +1679,67 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
       {showInvite && group && (
         <Sheet title="Invite to group" onClose={() => setShowInvite(false)}>
           <div className="stack" style={{ textAlign: 'center' }}>
+            {/* Adding somebody you already know is the common case, so it comes
+                first. It used to sit third, below two blocks about the invite
+                code, and disappeared entirely whenever the list was empty —
+                which reads as a feature the app does not have. */}
+            {isAdmin && (
+              <div style={{ textAlign: 'left' }}>
+                <span className="label label-block">Add a friend</span>
+                {friendsError ? (
+                  <Alert variant="error">{friendsError}</Alert>
+                ) : (() => {
+                  const memberIds = new Set(members.map((m) => m.user_id));
+                  const invitedIds = new Set(invitations.map((i) => i.invited_user_id).filter(Boolean));
+                  const available = friends.filter(
+                    (f) => !memberIds.has(f.id) && !invitedIds.has(f.id)
+                  );
+
+                  if (available.length > 0) {
+                    return (
+                      <div className="stack-sm">
+                        {available.map((f) => (
+                          <div key={f.id} className="card row">
+                            <Avatar name={f.display_name} url={f.avatar_url} size={32} />
+                            <span className="grow truncate" style={{ fontSize: '0.88rem', fontWeight: 600 }}>
+                              {f.display_name}
+                            </span>
+                            <button
+                              type="button"
+                              className="btn btn-primary btn-sm"
+                              onClick={() => handleInviteFriend(f)}
+                              disabled={invitingFriend === f.id}
+                            >
+                              {invitingFriend === f.id ? <Spinner /> : 'Invite'}
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  }
+
+                  // Say which kind of empty this is. "Nothing here" leaves
+                  // people wondering whether the feature exists at all.
+                  return (
+                    <span className="hint" style={{ display: 'block' }}>
+                      {friends.length === 0
+                        ? 'Nobody on your Friends list yet. Add people there and you can drop them straight into a group from here.'
+                        : 'Everyone on your Friends list is already in this group or has been invited.'}
+                    </span>
+                  );
+                })()}
+
+                <div className="row" style={{ margin: 'var(--sp-4) 0 var(--sp-2)' }}>
+                  <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
+                  <span className="hint">or, for anyone else</span>
+                  <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
+                </div>
+              </div>
+            )}
+
             <p className="text-muted" style={{ fontSize: '0.87rem' }}>
-              Share this code so friends can request to join "{group.name}". You approve each request.
+              Share this code with anyone not on your Friends list. They request to join "{group.name}"
+              and you approve it.
             </p>
 
             <div className="card-hero is-neutral">
@@ -1719,46 +1783,9 @@ export const GroupDetailPage: React.FC<GroupDetailPageProps> = ({ groupId, user,
               <>
                 <div className="row" style={{ margin: 'var(--sp-2) 0' }}>
                   <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
-                  <span className="hint">or invite directly</span>
+                  <span className="hint">or by email</span>
                   <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
                 </div>
-
-                {(() => {
-                  const memberIds = new Set(members.map((m) => m.user_id));
-                  const invitedIds = new Set(invitations.map((i) => i.invited_user_id).filter(Boolean));
-                  const available = friends.filter(
-                    (f) => !memberIds.has(f.id) && !invitedIds.has(f.id)
-                  );
-                  if (available.length === 0) return null;
-                  return (
-                    <div style={{ textAlign: 'left' }}>
-                      <span className="label label-block">Your friends</span>
-                      <div className="stack-sm">
-                        {available.map((f) => (
-                          <div key={f.id} className="card row">
-                            <Avatar name={f.display_name} url={f.avatar_url} size={32} />
-                            <span className="grow truncate" style={{ fontSize: '0.88rem', fontWeight: 600 }}>
-                              {f.display_name}
-                            </span>
-                            <button
-                              type="button"
-                              className="btn btn-primary btn-sm"
-                              onClick={() => handleInviteFriend(f)}
-                              disabled={invitingFriend === f.id}
-                            >
-                              {invitingFriend === f.id ? <Spinner /> : 'Invite'}
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                      <div className="row" style={{ margin: 'var(--sp-3) 0' }}>
-                        <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
-                        <span className="hint">or by email</span>
-                        <div style={{ flex: 1, height: 1, background: 'var(--card-border)' }} />
-                      </div>
-                    </div>
-                  );
-                })()}
 
                 <form onSubmit={handleInviteByEmail} className="stack" style={{ textAlign: 'left' }}>
                   <div className="input-prefixed">
